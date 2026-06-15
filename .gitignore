@@ -1,0 +1,31 @@
+# python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.ipynb_checkpoints/
+
+# backups
+*.bak
+*.orig
+*_BACKUP_*.tar.gz
+
+# meson / C 확장 빌드 산출물
+build/
+builddir/
+*.so
+*.o
+.mesonpy-*/
+
+# 환경
+.venv/
+.env
+!*.example.env
+
+# 비공개 데이터 (CLAUDE.md 원칙: 데이터/h5ad는 repo에 넣지 않는다)
+*.h5ad
+*.npz
+*.zarr/
+data/
+
+# OS
+.DS_Store

@@ -1,0 +1,73 @@
+[build-system]
+requires = [
+    "meson-python>=0.15.0",
+    "meson>=1.2.0",
+    "ninja",
+    "numpy>=1.26.4,<=2.0.2",
+]
+build-backend = "mesonpy"
+
+[project]
+name = "cellman"
+version = "0.1.0"
+description = "CeLLMan — agentic KG-based cell-type annotation + segmentation-free spatial cell-type mapping"
+readme = "README.md"
+license = {text = "AGPL-3.0-or-later"}
+requires-python = ">=3.9"
+keywords = ["spatial-transcriptomics", "cell-type", "kde", "ssam"]
+classifiers = [
+    "Intended Audience :: Science/Research",
+    "Operating System :: POSIX",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: C++",
+    "Topic :: Scientific/Engineering :: Bio-Informatics",
+]
+# 버전 하한은 cellularspace/.venv(충돌 없음 확인된 환경) 기준.
+dependencies = [
+    "numpy>=1.26.4,<=2.0.2",       # numba/C-ext 호환 위해 상한 유지
+    "scipy>=1.16.3",
+    "pandas>=2.3.3",
+    "scikit-learn>=1.7.2",
+    "scikit-image>=0.25.2",
+    "matplotlib>=3.10.7",
+    "seaborn>=0.13.2",
+    "opencv-python-headless>=4.12.0.88",    # cv2 — otsu thresholding (_analysis.py); headless = libGL 불필요(서버)
+    "zarr>=3.1.6",
+    "numcodecs>=0.15.1",
+    "dask[array]>=2026.1.1",
+    "xarray>=2026.4.0",            # _dataset.py 이미지 저장
+    "python-igraph>=1.0.0",
+    "leidenalg>=0.11.0",
+    "psutil>=7.1.3",
+    "packaging>=25.0",
+    "tqdm>=4.67.1",
+    "anndata>=0.12.6",
+    "scanpy>=1.11.5",
+    "spatialdata>=0.7.3",
+    "spatialdata-io>=0.5.1",       # 플랫폼 raw 로더 (워크플로 Step 1)
+    "spatialdata-plot>=0.2.13",    # _dataset.py .pl 시각화 accessor
+]
+
+[project.optional-dependencies]
+# GPU 가속: downsample_vector(KDE) + cluster_vectors(rapids leiden) + map_celltypes_gpu.
+# 주의: CUDA 버전별 wheel — 일반 PyPI 불가. 설치 시 인덱스 추가 필요:
+#   uv pip install '.[gpu]' --index-strategy unsafe-best-match \
+#       --extra-index-url https://pypi.nvidia.com \
+#       --extra-index-url https://download.pytorch.org/whl/cu128
+#   (이 .venv 기준 CUDA13. cuml/cugraph/cuvs는 rapids-singlecell이 hard-dep으로 안 끌어와 직접 명시.)
+gpu = [
+    "rapids-singlecell>=0.13.4",
+    "cuml-cu13>=26.2.0",
+    "cugraph-cu13>=26.2.0",
+    "cuvs-cu13>=26.2.0",
+    "cupy-cuda13x>=14.0.1",
+    "torch>=2.10.0",
+    "triton>=3.6.0",
+]
+dev = [
+    "pytest>=6.0",
+    "build",
+]
+
+[tool.meson-python.args]
+setup = ["-Dbuildtype=release"]

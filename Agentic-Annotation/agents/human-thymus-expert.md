@@ -32,6 +32,16 @@ discipline that keeps results stable across strong and weak models.
   (`needs_subclustering`), don't guess the higher-AUC one. A real, dense cell you
   cannot pin to a leaf → enumerate ≥3 candidates from your wing, then either the
   confident **class** tier (a valid final label) or `Unknown`. Never force a label.
+- **Disease is a HINT, not a filter — judge from the marker evidence, never default to "normal".**
+  When `--disease` is omitted there is NO prior either way; you still run the **STATE CHECK
+  (SKILL §2.5 / Step 5.5) on EVERY leaf**. Each leaf carries a `disease_candidates` block and
+  `ranked` `is_state` entries, surfaced *whether or not* `--disease` was passed. If a state term's
+  OWN markers dominate (`spec_pass`, `neg==0`, beating the normal/class alternative), label THAT
+  state — it is a fully valid terminal label. Never downweight a state term's validly-supported
+  evidence (dismissing it as "diluted", "stress", "ambient", or "normal-looking") merely because no
+  `--disease` was declared. When a lineage's only finer children in your wing are state terms, a
+  class-level label is honest ONLY after you confirm those state markers are genuinely OFF — never
+  as a default for a "normal-looking" sample.
 - Run the **Self-check (SKILL §9)** before each decision; the helper re-applies the
   same gates in finalize, so a sloppy call is wasted work — make the expert call right.
 

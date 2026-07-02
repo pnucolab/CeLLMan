@@ -18,7 +18,7 @@ groups vectors into post-merge clusters using the annotate decision metadata:
 
 Backward compatible: if the h5ad lacks `decision`/`subclass_resolved`/
 `celltype_term_id`, falls back to the legacy behavior (group by
-`celltype_annotation` string, excluding Background/Unknown/needs_subclustering).
+`cellman_annotation` string, excluding Background/Unknown/needs_subclustering).
 
 Then assigns new contiguous integer labels, recomputes centroids/centroids_stdev,
 overwrites the zarr arrays, and writes `merged_annotation.csv`.
@@ -26,8 +26,23 @@ overwrites the zarr arrays, and writes `merged_annotation.csv`.
 WARNING — NOT idempotent (shrinks zarr arrays). Aborts if the CSV exists unless
 --force. Use --dry-run to preview.
 
+Store layout (current): --store-dir is the SSAMDataset zarr root, which holds the
+zarr arrays at its top level and the annotate-mode output under `annotation_out/`:
+
+    <DATASET>/cellman_spatial/            <- pass this as --store-dir
+        cluster_labels/ normalized_vectors/ downsampled_vectors/ centroids/ ...
+        ssam_clusters.h5ad
+        annotation_out/
+            ssam_clusters_annotated.h5ad          (obs: leiden, cellman_annotation)
+            annotation_artifacts.tar.gz           (_annotate_state.json, _annotate_decisions.json, ...)
+
+The annotated h5ad and the decision/cluster_path metadata are auto-resolved from
+`annotation_out/` (loose files or inside annotation_artifacts.tar.gz); no extra
+flags are needed. Override with --h5ad-name / --annotate-out if your layout differs.
+
 Usage:
-    .venv/bin/python scripts/merge_clusters.py --store-dir test/<DATASET>
+    .venv/bin/python scripts/merge_clusters.py \
+        --store-dir <DATASET>/cellman_spatial --dry-run
 """
 import argparse
 import json
@@ -72,10 +87,10 @@ def parse_args():
     p.add_argument('--annotate-out', default=None,
                    help='Annotate-mode output dir. Used to recover per-cell cluster_path '
                         '(_annotate_state.json) and decision metadata (_annotate_decisions.json) '
-                        'when the h5ad obs lacks them (finalize wrote only celltype_annotation). '
+                        'when the h5ad obs lacks them (finalize wrote only cellman_annotation). '
                         'Reads loose JSONs, or extracts them from .annotate_trace.tar.gz.')
     p.add_argument('--legacy', action='store_true',
-                   help='Force LEGACY merge: group purely by celltype_annotation string '
+                   help='Force LEGACY merge: group purely by cellman_annotation string '
                         '(every named celltype -> one cluster; Background/Unknown/needs_subclustering '
                         'dropped). Ignores decision/subclass_resolved metadata even if present.')
     return p.parse_args()
@@ -88,25 +103,44 @@ def _load_annotate_json(annotate_out, name):
     if os.path.isfile(loose):
         with open(loose) as fh:
             return json.load(fh)
-    tar = os.path.join(annotate_out, '.annotate_trace.tar.gz')
-    if os.path.isfile(tar):
-        with tarfile.open(tar) as tf:
-            members = [m for m in tf.getnames() if m.endswith(name)]
-            if members:
-                return json.load(tf.extractfile(members[0]))
-    sys.exit(f'[error] {name} not found in {annotate_out} (loose or in .annotate_trace.tar.gz)')
+    for tarname in ('annotation_artifacts.tar.gz', '.annotate_trace.tar.gz'):
+        tar = os.path.join(annotate_out, tarname)
+        if os.path.isfile(tar):
+            with tarfile.open(tar) as tf:
+                members = [m for m in tf.getnames() if m.endswith(name)]
+                if members:
+                    return json.load(tf.extractfile(members[0]))
+    sys.exit(f'[error] {name} not found in {annotate_out} '
+             '(loose, or inside annotation_artifacts.tar.gz / .annotate_trace.tar.gz)')
 
 
 def main():
     args = parse_args()
     store_dir = os.path.abspath(args.store_dir)
-    h5ad_path = os.path.join(store_dir, args.h5ad_name)
     out_csv = os.path.join(store_dir, args.out_csv_name)
 
     if not os.path.isdir(store_dir):
         sys.exit(f'[error] store dir not found: {store_dir}')
+
+    # Annotate-mode writes the annotated h5ad + trace into an `annotation_out/`
+    # subdir of the zarr store root (store_dir = .../cellman_spatial). Resolve the
+    # h5ad at the store root first, then fall back to that subdir.
+    h5ad_path = os.path.join(store_dir, args.h5ad_name)
     if not os.path.isfile(h5ad_path):
-        sys.exit(f'[error] h5ad not found: {h5ad_path}')
+        alt = os.path.join(store_dir, 'annotation_out', args.h5ad_name)
+        if os.path.isfile(alt):
+            h5ad_path = alt
+    if not os.path.isfile(h5ad_path):
+        sys.exit(f'[error] h5ad not found: {os.path.join(store_dir, args.h5ad_name)} '
+                 f'(also tried annotation_out/{args.h5ad_name})')
+
+    # Default --annotate-out to the standard annotation_out/ subdir when present,
+    # so cluster_path / decision metadata can be recovered without an explicit flag
+    # (finalize writes only cellman_annotation into the h5ad obs).
+    if args.annotate_out is None:
+        default_ao = os.path.join(store_dir, 'annotation_out')
+        if os.path.isdir(default_ao):
+            args.annotate_out = default_ao
     if os.path.exists(out_csv) and not args.force and not args.dry_run:
         sys.exit(f'[error] {out_csv} already exists. Not idempotent — use --force or --dry-run.')
 
@@ -125,7 +159,7 @@ def main():
     print(f'[cluster-merger] alignment OK; n_vectors={n_total}')
 
     obs = adata.obs
-    celltype = obs['celltype_annotation'].astype(str).values
+    celltype = obs['cellman_annotation'].astype(str).values
 
     # --- per-cell cluster_path: from obs, else recovered from annotate-out state ---
     if 'cluster_path' in obs.columns:
@@ -152,7 +186,7 @@ def main():
         decision = np.array(['celltype'] * n_total)
         subclass_resolved = np.ones(n_total, dtype=bool)
         term_id = celltype  # legacy: group by label string via term_id slot
-        print('[cluster-merger] mode: LEGACY (--legacy; group by celltype_annotation string, '
+        print('[cluster-merger] mode: LEGACY (--legacy; group by cellman_annotation string, '
               'every named celltype -> one cluster)')
     elif has_dec:
         decision = obs['decision'].astype(str).values
@@ -174,7 +208,7 @@ def main():
         decision = np.array(['celltype'] * n_total)
         subclass_resolved = np.ones(n_total, dtype=bool)
         term_id = celltype  # legacy: group by label string via term_id slot
-        print('[cluster-merger] mode: LEGACY (no decision columns; group by celltype_annotation string)')
+        print('[cluster-merger] mode: LEGACY (no decision columns; group by cellman_annotation string)')
 
     # --- 1. one record per cluster_path leaf (consistency-checked) ---
     cp_info = {}  # cp -> dict(ct, dec, sr, tid)

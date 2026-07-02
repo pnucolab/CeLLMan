@@ -172,6 +172,12 @@ class SSAMDataset(object):
                     matrix = t.to_affine_matrix(input_axes=('x', 'y'), output_axes=('x', 'y'))
                     self.x_scale = matrix[0, 0]
                     self.y_scale = matrix[1, 1]
+                    # Keep the full element→global affine (2x3) so the overlay can
+                    # apply translation/rotation, not just the diagonal scale.
+                    # Some platforms (e.g. MERSCOPE) carry a non-zero translation
+                    # (y-shift) on the transcripts transform; dropping it offsets
+                    # the downsampled-vector scatter from the morphology image.
+                    self._global_affine = np.asarray(matrix[:2, :], dtype=np.float64)
                     return (self.x_scale, self.y_scale)
             
             print(f"Warning: Points element '{element_name}' not found in SpatialData.")
@@ -783,6 +789,12 @@ class SSAMDataset(object):
                 **kwargs,
             )
             ax.set_aspect(aspect)
+            # spatialdata-plot renders the image onto ``ax`` but also appends a
+            # colorbar axes and leaves *that* as the current axes. A subsequent
+            # ``plot_downsampled_vector`` (plt.scatter) would then land on the
+            # colorbar instead of the image and appear to vanish. Restore the
+            # image axes as current so the overlay scatters onto the image.
+            plt.sca(ax)
             return
 
         plt.imshow(he_img, extent=extent, aspect=aspect, **kwargs)
@@ -817,9 +829,20 @@ class SSAMDataset(object):
         if plot_coords is None:
             raise ValueError('downsampled_vectors not set. Run downsample_vector() first.')
 
-        x_scale = self.x_scale if self.x_scale is not None else 1.0
-        y_scale = self.y_scale if self.y_scale is not None else 1.0
-
         x_coords, y_coords = plot_coords[0], plot_coords[1]
-        plt.scatter(x_coords * x_scale, y_coords * y_scale,
-                    s=s, c=c, alpha=alpha, **kwargs)
+
+        # Map sampled coords (element/raw frame) into the global frame the
+        # morphology image is drawn in. Prefer the full element→global affine
+        # (scale + translation + rotation) captured by extract_spatialdata_scale;
+        # fall back to the diagonal scale (legacy behaviour) when it is absent.
+        M = getattr(self, '_global_affine', None)
+        if M is not None:
+            px = M[0, 0] * x_coords + M[0, 1] * y_coords + M[0, 2]
+            py = M[1, 0] * x_coords + M[1, 1] * y_coords + M[1, 2]
+        else:
+            x_scale = self.x_scale if self.x_scale is not None else 1.0
+            y_scale = self.y_scale if self.y_scale is not None else 1.0
+            px = x_coords * x_scale
+            py = y_coords * y_scale
+
+        plt.scatter(px, py, s=s, c=c, alpha=alpha, **kwargs)

@@ -47,10 +47,11 @@ def parse_args():
         help="SpatialData coordinate system to use (default: 'global').",
     )
     p.add_argument(
-        '--he-key', default=None,
-        help='H&E (or morphology) image key to keep. If set, all other image '
-             'elements are dropped from each tile. Useful when only the H&E '
-             'image is needed downstream (e.g. ssam.downsample_vector).',
+        '--image-key', default=None,
+        help='Staining / morphology image key to keep (e.g. H&E or polyT). '
+             'If set, all other image elements are dropped from each tile. '
+             'Useful when only the staining image is needed downstream '
+             '(e.g. ssam.downsample_vector).',
     )
     p.add_argument(
         '--keep-points', nargs='*', default=None,
@@ -181,12 +182,12 @@ def points_count(p):
             return 0
 
 
-def slim_cropped(cropped, he_key=None, keep_points=None,
+def slim_cropped(cropped, image_key=None, keep_points=None,
                  drop_labels=False, drop_shapes=False, drop_tables=False):
     """Drop unused elements from a cropped SpatialData in-place.
 
     Used to reduce per-tile zarr footprint when the downstream consumer
-    only needs a subset of elements (e.g. images[he_key] + points for
+    only needs a subset of elements (e.g. images[image_key] + points for
     ssam.downsample_vector).
     """
     if drop_labels:
@@ -198,14 +199,14 @@ def slim_cropped(cropped, he_key=None, keep_points=None,
     if drop_tables:
         for k in list(cropped.tables.keys()):
             del cropped.tables[k]
-    if he_key is not None:
-        if he_key not in cropped.images:
+    if image_key is not None:
+        if image_key not in cropped.images:
             raise KeyError(
-                f"--he-key '{he_key}' not found after crop. "
+                f"--image-key '{image_key}' not found after crop. "
                 f"Available images: {list(cropped.images.keys())}"
             )
         for k in list(cropped.images.keys()):
-            if k != he_key:
+            if k != image_key:
                 del cropped.images[k]
     if keep_points is not None:
         keep_set = set(keep_points)
@@ -394,7 +395,7 @@ def main():
 
             slim_cropped(
                 cropped,
-                he_key=args.he_key,
+                image_key=args.image_key,
                 keep_points=args.keep_points,
                 drop_labels=args.drop_labels,
                 drop_shapes=args.drop_shapes,

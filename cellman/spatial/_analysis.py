@@ -76,6 +76,32 @@ except ImportError:
     _SPATIALDATA_AVAILABLE = False
     SpatialData = None
 
+
+def _binary_fill_holes_fast(mask):
+    """``scipy.ndimage.binary_fill_holes`` with an optional CuPy backend.
+
+    The GPU path (``cupyx.scipy.ndimage.binary_fill_holes``) uses the same
+    default connectivity-1 structuring element as SciPy and is a purely
+    boolean morphological operation, so the result is bit-identical to the
+    CPU path. Any failure (CuPy missing, no CUDA device, out of memory)
+    falls back transparently to SciPy. Set ``CELLMAN_DISABLE_GPU=1`` to
+    force the CPU path.
+    """
+    if os.environ.get("CELLMAN_DISABLE_GPU"):
+        return ndimage.binary_fill_holes(mask)
+    try:
+        import cupy as cp
+        from cupyx.scipy.ndimage import binary_fill_holes as _gpu_fill
+        d_mask = cp.asarray(mask)
+        d_out = _gpu_fill(d_mask)
+        out = cp.asnumpy(d_out)
+        del d_mask, d_out
+        cp.get_default_memory_pool().free_all_blocks()
+        return out
+    except Exception:
+        # CuPy unavailable / no GPU / OOM -> identical CPU result.
+        return ndimage.binary_fill_holes(mask)
+
 if check_avx512f():
     from .utils import corr, calc_ctmap
 else:
@@ -615,7 +641,7 @@ class SSAMAnalysis(object):
 
     def cluster_vectors(self, method="leiden", pca_dims=-1, min_cluster_size=2, max_correlation=1.0, metric="correlation",
                         outlier_detection_method='medoid-correlation', outlier_detection_kwargs={}, random_state=0,
-                        auto_gpu=True, scale_for_clustering=False, cluster_gene_subset=None, **kwargs):
+                        auto_gpu=True, scale_for_clustering=False, cluster_gene_subset=None, marker_weights=None, **kwargs):
         """
         Cluster the given vectors using the specified clustering method.
         
@@ -651,6 +677,16 @@ class SSAMAnalysis(object):
             for whole-transcriptome data). Centroids and the saved h5ad X still use the full
             gene set, so downstream subclustering / map_celltypes keep the broad panel.
         :type cluster_gene_subset: list[str] or None
+        :param marker_weights: Optional {gene_name: weight} dict for MARKER-SPECIFICITY weighting
+            of the clustering feature (rare-cell recovery). Applied AFTER the per-gene z-score
+            (so requires scale_for_clustering=True to be meaningful), multiplying each gene column
+            by its weight. Use higher weights for cell-type-specific markers (e.g. C1qa, Pvalb)
+            and lower for broad/shared markers (e.g. Gad1, Slc17a7) — e.g. the KG region_share
+            specificity. This stops KDE-smeared abundant-cell genes from dominating the PCA, so
+            small/sparse cell types (microglia, Pvalb/Vip interneurons, endothelium, SMC) separate
+            into their own clusters instead of being absorbed into oligo/astro. Genes not in the
+            dict default to weight 1.0. None ⇒ no weighting (current behavior, fully backward-compatible).
+        :type marker_weights: dict[str, float] or None
         """
         
         def get_scaled_vectors():
@@ -694,6 +730,21 @@ class SSAMAnalysis(object):
                 mu = base.mean(axis=0)
                 sigma = base.std(axis=0)
                 base = np.clip(np.nan_to_num((base - mu) / sigma), -10, 10)
+
+            # MARKER-SPECIFICITY weighting (rare-cell recovery): multiply each gene column by its
+            # specificity weight so broad/abundant smeared genes don't dominate the PCA. Applied to
+            # the clustering feature only (centroids/X unchanged). None ⇒ no-op (backward-compatible).
+            if marker_weights is not None:
+                all_genes = getattr(self.dataset, 'genes', None)
+                if all_genes is None:
+                    store_path = self.dataset._zarr_store_path(self.dataset.zarr_store)
+                    all_genes = list(zarr.open(os.path.join(store_path, 'genes'), mode='r')[:])
+                    self.dataset.genes = all_genes
+                all_genes = [g.decode() if isinstance(g, bytes) else str(g) for g in all_genes]
+                col_genes = all_genes if sub_idx is None else [all_genes[i] for i in sub_idx]
+                w = np.array([float(marker_weights.get(g, 1.0)) for g in col_genes], dtype=np.float32)
+                base = base * w[None, :]
+                self._m(f"cluster_vectors: applied marker_weights ({int((w != 1.0).sum())}/{len(w)} genes reweighted)")
 
             if pca_dims < 0 :
                 return base, None, sub_idx
@@ -1114,12 +1165,20 @@ class SSAMAnalysis(object):
     # H&E downsampling helpers
     # -------------------------------------------------------------------------
 
-    def _he_array_from_sdata(self, sdata, he_key='he'):
-        """Extract an (H, W, 3) uint8 RGB ndarray from ``sdata.images[he_key]``.
+    def _he_array_from_sdata(self, sdata, image_key='he'):
+        """Extract an (H, W, 3) uint8 RGB ndarray from ``sdata.images[image_key]``.
 
         Handles both single-scale (``DataArray``) and multiscale
         (``DataTree``) representations as written by spatialdata-io / NGFF.
         For multiscale, the highest-resolution level is returned.
+
+        RGB(A) images stored channel-first ``(c, y, x)`` are transposed to
+        ``(y, x, c)``. Single-channel images — e.g. a fluorescence morphology
+        MIP stored as ``(1, y, x)`` or ``(y, x, 1)`` — are squeezed to 2-D and
+        replicated across 3 channels. Higher-bit-depth integer images (e.g.
+        uint16 fluorescence) are contrast-stretched per image to 0-255 (99.9th
+        percentile → 255) rather than clipped, so tissue spans the dynamic
+        range instead of saturating; uint8 RGB (H&E) is returned unchanged.
 
         The caller is responsible for ensuring that the H&E element in
         ``sdata`` already spatially corresponds to the morphology image
@@ -1127,19 +1186,19 @@ class SSAMAnalysis(object):
         axis-aligned grid). This function does not apply any
         coordinate-system transform.
         """
-        if he_key not in sdata.images:
+        if image_key not in sdata.images:
             raise KeyError(
-                f"sdata.images does not contain key '{he_key}'. "
+                f"sdata.images does not contain key '{image_key}'. "
                 f"Available: {list(sdata.images.keys())}"
             )
-        node = sdata.images[he_key]
+        node = sdata.images[image_key]
 
         # Multiscale (DataTree): pick the full-resolution leaf
         if not hasattr(node, 'values') or hasattr(node, 'children'):
             scale_keys = list(node.keys())
             if not scale_keys:
                 raise RuntimeError(
-                    f"H&E multiscale image at images['{he_key}'] has no scales."
+                    f"H&E multiscale image at images['{image_key}'] has no scales."
                 )
             leaf = node[scale_keys[0]]
             if hasattr(leaf, 'image'):
@@ -1154,27 +1213,65 @@ class SSAMAnalysis(object):
         else:
             arr = node.values
 
-        # spatialdata stores images as (c, y, x); convert to (y, x, c)
+        # ---- Collapse the channel axis to (y, x) or (y, x, 3/4) ----
+        # spatialdata stores images channel-first as (c, y, x). RGB(A) -> move
+        # channels last; single-channel (1, y, x) or (y, x, 1) -> squeeze to 2-D
+        # (handled below by the grayscale replication). Without the single-
+        # channel case a (1, y, x) morphology MIP would slip past moveaxis and
+        # get sliced along x by ``arr[:, :, :3]`` into a (1, y, 3) garbage array.
+        # Multi-channel fluorescence morphology (e.g. MERSCOPE Cellbound stores
+        # 2 stain channels as (2, y, x)) matches none of the RGB(A)/single
+        # branches; without an explicit case the channel axis is never moved and
+        # the final ``arr[:, :, :3]`` slices along x into a (c, y, 3) strip
+        # (observed: (2, 20000, 3)), which the bbox crop then pads to an almost
+        # entirely blank tile. Collapse such stacks to a tissue-bright (y, x)
+        # intensity via a max projection over the channel axis.
         if arr.ndim == 3 and arr.shape[0] in (3, 4) and arr.shape[-1] not in (3, 4):
-            arr = np.moveaxis(arr, 0, -1)
+            arr = np.moveaxis(arr, 0, -1)        # (3|4, y, x) -> (y, x, 3|4)
+        elif arr.ndim == 3 and arr.shape[0] == 1:
+            arr = arr[0]                          # (1, y, x) -> (y, x)
+        elif arr.ndim == 3 and arr.shape[-1] == 1:
+            arr = arr[..., 0]                     # (y, x, 1) -> (y, x)
+        elif arr.ndim == 3 and arr.shape[0] < arr.shape[-1] and arr.shape[0] not in (3, 4):
+            # channel-first multi-channel (c, y, x), c not 1/3/4 -> max-project
+            arr = arr.max(axis=0)                 # (c, y, x) -> (y, x)
+        elif arr.ndim == 3 and arr.shape[-1] not in (3, 4) and arr.shape[-1] < arr.shape[0]:
+            # channel-last multi-channel (y, x, c), c not 1/3/4 -> max-project
+            arr = arr.max(axis=-1)                # (y, x, c) -> (y, x)
+
+        # ---- Cast to uint8 on the 2-D/RGB array (before grayscale stacking) ----
+        if arr.dtype != np.uint8:
+            if np.issubdtype(arr.dtype, np.floating) and arr.max() <= 1.0:
+                # float image already normalised to [0, 1]
+                arr = (arr.astype(np.float32) * 255.0)
+            else:
+                # Higher-bit-depth integer (e.g. uint16 fluorescence) or float
+                # beyond [0, 1]: contrast-stretch per image to 0-255 using the
+                # 99.9th percentile (robust to hot pixels) instead of clipping
+                # to 255, which would saturate tissue and collapse the Otsu
+                # histogram. Percentile is computed on a strided subsample.
+                sub = arr[::8, ::8]
+                hi = float(np.percentile(sub, 99.9))
+                if hi <= 0.0:
+                    hi = float(arr.max())
+                scale = (255.0 / hi) if hi > 255.0 else 1.0
+                arr = arr.astype(np.float32) * scale
+            arr = np.clip(arr, 0, 255).astype(np.uint8)
+
+        # ---- Replicate single channel to RGB ----
         if arr.ndim == 2:
             arr = np.stack([arr, arr, arr], axis=-1)
         if arr.ndim != 3 or arr.shape[-1] < 3:
             raise RuntimeError(
-                f"H&E image at images['{he_key}'] has unsupported shape {arr.shape}."
+                f"image at images['{image_key}'] has unsupported shape {arr.shape}."
             )
         arr = arr[:, :, :3]
-
-        if arr.dtype != np.uint8:
-            if np.issubdtype(arr.dtype, np.floating) and arr.max() <= 1.0:
-                arr = (arr * 255).astype(np.uint8)
-            else:
-                arr = np.clip(arr, 0, 255).astype(np.uint8)
         return arr
 
-    def _he_array_axis_aligned(self, sdata, he_key='he',
+    def _he_array_axis_aligned(self, sdata, image_key='he',
                                element_name=None, sampling_distance=1.0,
-                               target_um_per_px=None, pad=True):
+                               target_um_per_px=None, pad=True,
+                               revert_image=True):
         """Return an H&E ndarray axis-aligned in the global coordinate
         system **and cropped/padded so its pixel grid spans exactly the
         transcripts global bounding box**.
@@ -1195,23 +1292,31 @@ class SSAMAnalysis(object):
         target_um_per_px : float, optional
             Only used by the rasterize fallback (non-90° rotation case).
             If ``None``, the native pixel size is auto-detected.
+        revert_image : bool, default True
+            Background polarity of the staining image. ``True`` for
+            bright-background / dark-tissue images (e.g. H&E); the bbox
+            padding is filled with white (255) so it reads as background.
+            ``False`` for dark-background / bright-tissue images (e.g.
+            polyT); padding is filled with black (0) so it reads as
+            background. Must match the value passed to the otsu / mask
+            steps so padding is never mistaken for tissue.
         """
         from spatialdata.transformations import get_transformation as _get_tf
         from spatialdata import get_extent as _get_extent
 
-        if he_key not in sdata.images:
+        if image_key not in sdata.images:
             raise KeyError(
-                f"sdata.images does not contain key '{he_key}'. "
+                f"sdata.images does not contain key '{image_key}'. "
                 f"Available: {list(sdata.images.keys())}"
             )
 
         # Pull the underlying array at native H&E pixel resolution
-        arr = self._he_array_from_sdata(sdata, he_key=he_key)  # (H, W, 3) uint8
+        arr = self._he_array_from_sdata(sdata, image_key=image_key)  # (H, W, 3) uint8
         H, W = arr.shape[:2]
 
         # Inspect the affine: image-pixel → global
         try:
-            tf = _get_tf(sdata.images[he_key], to_coordinate_system='global')
+            tf = _get_tf(sdata.images[image_key], to_coordinate_system='global')
             M = np.asarray(tf.to_affine_matrix(
                 input_axes=('x', 'y'), output_axes=('x', 'y')
             ))
@@ -1302,14 +1407,18 @@ class SSAMAnalysis(object):
             pad_right  = max(0, col_end - Wr)
             pad_bottom = max(0, row_end - Hr)
             if pad_left or pad_top or pad_right or pad_bottom:
-                # Pad with WHITE (255), not black. H&E background is white, and
+                # Pad with the BACKGROUND colour so padding never masquerades
+                # as tissue. revert_image=True (H&E): background is white, and
                 # the otsu/mask path detects tissue via he_inv = 255 - gray, so
                 # black padding (he_inv=255) would masquerade as max foreground
-                # and inflate the Otsu threshold for padded tiles.
+                # and inflate the Otsu threshold. revert_image=False (polyT):
+                # background is dark, the mask uses he_inv = gray directly, so
+                # pad with black (0) for the same reason.
+                pad_value = 255 if revert_image else 0
                 arr_rot = np.pad(
                     arr_rot,
                     ((pad_top, pad_bottom), (pad_left, pad_right), (0, 0)),
-                    mode='constant', constant_values=255,
+                    mode='constant', constant_values=pad_value,
                 )
                 col_start += pad_left
                 col_end   += pad_left
@@ -1335,7 +1444,7 @@ class SSAMAnalysis(object):
         target_unit_to_pixels = 1.0 / float(target_um_per_px)
 
         raster = _rasterize(
-            sdata.images[he_key],
+            sdata.images[image_key],
             axes=('x', 'y'),
             min_coordinate=[tx_min, ty_min],
             max_coordinate=[tx_max, ty_max],
@@ -1357,13 +1466,63 @@ class SSAMAnalysis(object):
                 arr = np.clip(arr, 0, 255).astype(np.uint8)
         return arr
 
-    def _otsu_thresholding(self, he_imgs):
+    @staticmethod
+    def _rgb_to_intensity(img, intensity='luminance'):
+        """Collapse an (H, W, 3) RGB image to a single-channel intensity.
+
+        ``intensity='luminance'`` uses the BT.601 perceptual weighting
+        (``0.299 R + 0.587 G + 0.114 B``) — correct for brightfield / H&E
+        photographs where the channels are correlated. ``intensity='max'``
+        uses the per-pixel channel maximum — correct for fluorescence
+        composite images (e.g. CosMx CellComposite), where the tissue
+        signal may live almost entirely in one channel (e.g. blue DAPI
+        nuclei) and the luminance weighting would crush it (blue is only
+        weighted 0.114, so a blue-dominant composite would be discarded).
+
+        Parameters
+        ----------
+        img : ndarray (H, W, 3)
+        intensity : {'luminance', 'max'}, default 'luminance'
+
+        Returns
+        -------
+        gray : ndarray (H, W) float
+        """
+        rgb = img[:, :, :3].astype(np.float64)
+        if intensity == 'max':
+            return rgb.max(axis=-1)
+        if intensity == 'luminance':
+            return (0.299 * rgb[:, :, 0]
+                    + 0.587 * rgb[:, :, 1]
+                    + 0.114 * rgb[:, :, 2])
+        raise ValueError(
+            f"intensity must be 'luminance' or 'max', got {intensity!r}.")
+
+    def _otsu_thresholding(self, he_imgs, revert_image=True,
+                           intensity='luminance'):
         """
         Compute per-image Otsu threshold and return the median.
+
+        The threshold is computed on a tissue-bright intensity image so the
+        downstream mask (``_select_vectors``) keeps high-signal pixels.
+        ``revert_image=True`` inverts a bright-background image (H&E) to make
+        the tissue bright; ``revert_image=False`` uses the grayscale directly
+        for an already tissue-bright image (polyT). The same ``revert_image``
+        MUST be used in :meth:`_select_vectors` so the threshold and mask
+        operate on the same representation.
 
         Parameters
         ----------
         he_imgs : list of ndarray (H, W, 3)  RGB images
+        revert_image : bool, default True
+            ``True``  → invert (bright background, dark tissue; e.g. H&E).
+            ``False`` → no inversion (dark background, bright tissue; e.g. polyT).
+        intensity : {'luminance', 'max'}, default 'luminance'
+            How RGB is collapsed to intensity (see :meth:`_rgb_to_intensity`).
+            ``'luminance'`` for brightfield/H&E; ``'max'`` for fluorescence
+            composites (e.g. CosMx CellComposite) so a single-channel signal
+            such as blue DAPI is not crushed. MUST match the value used in
+            :meth:`_select_vectors`.
 
         Returns
         -------
@@ -1374,10 +1533,8 @@ class SSAMAnalysis(object):
 
         otsu_vals = []
         for img in he_imgs:
-            gray = (0.299 * img[:, :, 0]
-                    + 0.587 * img[:, :, 1]
-                    + 0.114 * img[:, :, 2])
-            inv = (255.0 - gray).astype(np.uint8)
+            gray = self._rgb_to_intensity(img, intensity=intensity)
+            inv = ((255.0 - gray) if revert_image else gray).astype(np.uint8)
             val, _ = cv2.threshold(inv, 0, 255,
                                    cv2.THRESH_BINARY + cv2.THRESH_OTSU)
             otsu_vals.append(float(val))
@@ -1389,6 +1546,7 @@ class SSAMAnalysis(object):
                         prune_coefficient=4.3, size_after_normalization=10,
                         log_transform=True, n_samples=5, block_um=10,
                         seed=42, filter_is_gene=True, genes=None,
+                        revert_image=True, intensity='luminance',
 ):
         """
         Mask → position selection → KDE → normalization for a single image/sdata.
@@ -1416,10 +1574,13 @@ class SSAMAnalysis(object):
         H_he, W_he = he_img.shape[:2]
 
         # ---- 1. H&E → binary mask ----
-        he_gray = (0.299 * he_img[:, :, 0]
-                   + 0.587 * he_img[:, :, 1]
-                   + 0.114 * he_img[:, :, 2])
-        he_inv = 255.0 - he_gray
+        # he_inv is the tissue-bright intensity. revert_image=True inverts a
+        # bright-background image (H&E); revert_image=False uses the grayscale
+        # directly for an already tissue-bright image (polyT). Must match the
+        # revert_image / intensity passed to _otsu_thresholding for the
+        # threshold to apply to the same representation.
+        he_gray = self._rgb_to_intensity(he_img, intensity=intensity)
+        he_inv = (255.0 - he_gray) if revert_image else he_gray
         he_sub = np.clip(he_inv - otsu_threshold, 0.0, None)
         he_mask = (np.log1p(he_sub) > 0).astype(np.uint8)
         n_mask_pixels = int(he_mask.sum())
@@ -1591,7 +1752,23 @@ class SSAMAnalysis(object):
             Torch device string, e.g. ``'cuda'``, ``'cuda:0'``, ``'cuda:1'``.
         **kwargs
             All other ``downsample_vector`` parameters (chunked, sdata_dir,
-            n_samples, block_um, bandwidth, sampling_distance, ...).
+            n_samples, block_um, bandwidth, sampling_distance,
+            revert_image, ...).
+
+            revert_image : bool, default True
+                Background polarity of the staining image used for the tissue
+                mask. ``True`` for bright-background / dark-tissue images such
+                as H&E (the image is inverted before Otsu thresholding).
+                ``False`` for dark-background / bright-tissue images such as
+                polyT (the grayscale is thresholded directly, no inversion).
+            intensity : {'luminance', 'max'}, default 'luminance'
+                How the RGB staining image is collapsed to a single-channel
+                intensity for the tissue mask. ``'luminance'`` (BT.601
+                weighting) suits brightfield / H&E photographs. ``'max'``
+                (per-pixel channel maximum) suits fluorescence composites
+                such as CosMx CellComposite, where the tissue signal can sit
+                almost entirely in one channel (e.g. blue DAPI nuclei) and
+                luminance would crush it (blue weighted only 0.114).
         """
         from contextlib import nullcontext as _nullcontext
         if auto_gpu:
@@ -1611,7 +1788,8 @@ class SSAMAnalysis(object):
                          n_samples=5, block_um=10, seed=42,
                          filter_is_gene=True, genes=None,
                          chunked=False, sdata_dir=None,
-                         he_key='he', otsu_threshold=None):
+                         image_key='he', otsu_threshold=None,
+                         revert_image=True, intensity='luminance'):
         """
         Select representative vectors from H&E-intensity-guided positions.
 
@@ -1620,7 +1798,7 @@ class SSAMAnalysis(object):
         ``n_select = int(n_mask_pixels / block_px * n_samples)``
         where ``block_px = (block_um * x_scale) * (block_um * y_scale)``.
 
-        The H&E image is now read directly from ``sdata.images[he_key]``;
+        The H&E image is now read directly from ``sdata.images[image_key]``;
         the caller is responsible for ensuring it has been cropped to the
         sequenced region and rasterized onto a grid that spatially
         corresponds to the morphology image.
@@ -1631,16 +1809,30 @@ class SSAMAnalysis(object):
         Parameters
         ----------
         sdata : spatialdata.SpatialData
-            Used when ``chunked=False``. Must contain ``images[he_key]``.
+            Used when ``chunked=False``. Must contain ``images[image_key]``.
         sdata_dir : str or pathlib.Path
             Used when ``chunked=True``. Directory containing one or more
-            ``*.zarr`` SpatialData stores; each must contain ``images[he_key]``.
-        he_key : str, default 'he'
-            Key under which the H&E image is stored in ``sdata.images``.
+            ``*.zarr`` SpatialData stores; each must contain ``images[image_key]``.
+        image_key : str, default 'he'
+            Key under which the staining / morphology image (e.g. H&E or
+            polyT) is stored in ``sdata.images``.
         n_samples : int
             Number of voxels to sample per ``block_um × block_um`` µm block.
         block_um : float
             Block size in µm used to determine sampling density.
+        revert_image : bool, default True
+            Background polarity of the staining image used to build the
+            tissue mask (Otsu + mask + bbox padding).
+            ``True``  → bright background, dark tissue (e.g. H&E); the image
+            is inverted (``255 - gray``) before thresholding.
+            ``False`` → dark background, bright tissue (e.g. polyT); the
+            grayscale is used directly with no inversion.
+        intensity : {'luminance', 'max'}, default 'luminance'
+            How the RGB staining image is collapsed to intensity for the
+            tissue mask. ``'luminance'`` (BT.601) for brightfield / H&E;
+            ``'max'`` (per-pixel channel maximum) for fluorescence composites
+            (e.g. CosMx CellComposite) so a single-channel signal such as blue
+            DAPI is not crushed by the luminance weighting.
 
         Returns
         -------
@@ -1657,28 +1849,31 @@ class SSAMAnalysis(object):
             log_transform=log_transform,
             n_samples=n_samples, block_um=block_um, seed=seed,
             filter_is_gene=filter_is_gene, genes=genes,
+            revert_image=revert_image, intensity=intensity,
         )
 
         if not chunked:
             # ================================================================
-            # chunked=False : sdata 하나 (H&E는 sdata.images[he_key])
+            # chunked=False : sdata 하나 (H&E는 sdata.images[image_key])
             # ================================================================
             if sdata is None:
                 raise ValueError('chunked=False requires sdata.')
 
             he_img = self._he_array_axis_aligned(
-                sdata, he_key=he_key,
+                sdata, image_key=image_key,
                 element_name=element_name, sampling_distance=sampling_distance,
+                revert_image=revert_image,
             )
             if otsu_threshold is None:
-                # Otsu on the un-padded real H&E pixels (pad=False); the white
-                # padding in he_img is only for mask/grid alignment.
+                # Otsu on the un-padded real H&E pixels (pad=False); the
+                # background padding in he_img is only for mask/grid alignment.
                 otsu_img = self._he_array_axis_aligned(
-                    sdata, he_key=he_key,
+                    sdata, image_key=image_key,
                     element_name=element_name, sampling_distance=sampling_distance,
-                    pad=False,
+                    pad=False, revert_image=revert_image,
                 )
-                otsu_threshold, _ = self._otsu_thresholding([otsu_img])
+                otsu_threshold, _ = self._otsu_thresholding(
+                    [otsu_img], revert_image=revert_image, intensity=intensity)
 
             # _select_vectors 호출 (ds.shape 초기화 포함)
             self.dataset.shape = None
@@ -1691,7 +1886,7 @@ class SSAMAnalysis(object):
                     f"{sample_stats.get('n_mask_pixels', 0)}, "
                     f"otsu_threshold={otsu_threshold}). "
                     f"The H&E mask is empty after thresholding. Check "
-                    f"n_samples / block_um, or verify that images[{he_key!r}] "
+                    f"n_samples / block_um, or verify that images[{image_key!r}] "
                     f"contains tissue signal."
                 )
 
@@ -1705,7 +1900,7 @@ class SSAMAnalysis(object):
 
         else:
             # ================================================================
-            # chunked=True : sdata_dir의 *.zarr 각각에서 images[he_key] 사용
+            # chunked=True : sdata_dir의 *.zarr 각각에서 images[image_key] 사용
             # ================================================================
             if sdata_dir is None:
                 raise ValueError('chunked=True requires sdata_dir.')
@@ -1732,9 +1927,10 @@ class SSAMAnalysis(object):
             otsu_vals = []
             for zp in zarr_paths:
                 s = _sd.read_zarr(zp)
-                arr = self._he_array_from_sdata(s, he_key=he_key)   # (H, W, 3) raw, no crop/rot
+                arr = self._he_array_from_sdata(s, image_key=image_key)   # (H, W, 3) raw, no crop/rot
                 otsu_img = arr[::_OTSU_STRIDE, ::_OTSU_STRIDE, :]
-                _, single_vals = self._otsu_thresholding([otsu_img])
+                _, single_vals = self._otsu_thresholding(
+                    [otsu_img], revert_image=revert_image, intensity=intensity)
                 otsu_vals.append(single_vals[0])
                 del s, arr, otsu_img
             otsu_threshold = float(np.median(otsu_vals))
@@ -1765,8 +1961,9 @@ class SSAMAnalysis(object):
 
                 chunk_sdata = _sd.read_zarr(zp)
                 he_img = self._he_array_axis_aligned(
-                    chunk_sdata, he_key=he_key,
+                    chunk_sdata, image_key=image_key,
                     element_name=element_name, sampling_distance=sampling_distance,
+                    revert_image=revert_image,
                 )
 
                 # 각 청크마다 ds.shape를 초기화해서 _prepare_grid가 재실행되도록 함
@@ -1819,7 +2016,7 @@ class SSAMAnalysis(object):
                     f'All {len(zarr_paths)} chunks were blank after otsu '
                     f'thresholding (otsu_threshold={otsu_threshold}). No '
                     f'vectors were sampled. Check the H&E key '
-                    f'({he_key!r}) and whether the image contains signal.'
+                    f'({image_key!r}) and whether the image contains signal.'
                 )
 
             # ---- Step 3: local voxel 좌표 → global voxel 좌표 ----
@@ -1841,6 +2038,26 @@ class SSAMAnalysis(object):
             gx_he = np.concatenate(gx_he_list)
             gy_he = np.concatenate(gy_he_list)
             gz_he = np.concatenate(gz_he_list)
+
+            # Correct the global coordinate metadata. Each chunk's _prepare_grid
+            # persisted *its own* offset/bounds to zarr, so the LAST chunk's
+            # (single-tile) values were left behind — wrong for the merged grid.
+            # Recompute the global extent from the merged grid so that the saved
+            # metadata, a reload from zarr, and every consumer of
+            # original_coordinate_bounds (plot extents, etc.) see the full map.
+            gx_max_um = global_x_min + float(gx_he.max()) * sampling_distance
+            gy_max_um = global_y_min + float(gy_he.max()) * sampling_distance
+            gz_max_um = global_z_min + float(gz_he.max()) * sampling_distance
+            self.dataset.coordinate_bounds = [
+                gx_max_um - global_x_min,
+                gy_max_um - global_y_min,
+                gz_max_um - global_z_min,
+            ]
+            self.dataset.original_coordinate_bounds = [
+                [global_x_min, gx_max_um],
+                [global_y_min, gy_max_um],
+                [global_z_min, gz_max_um],
+            ]
 
             # --- 수정 후 삭제됨 ---
             # normalized_vectors = np.concatenate(all_nvecs, axis=0)
@@ -1900,6 +2117,7 @@ class SSAMAnalysis(object):
         self.dataset.normalized_vectors = normalized_vectors
         self.dataset.downsampled_vf_norm = vf_norm_all
         self.dataset.coordinate_offset = coordinate_offset
+        self.dataset.sampling_distance = sampling_distance
         self.dataset.genes = genes
 
         for key in ('downsampled_vectors', 'normalized_vectors',
@@ -1912,6 +2130,18 @@ class SSAMAnalysis(object):
         # per-vector local KDE density, row-aligned with normalized_vectors
         self.dataset.zarr_group['downsampled_vf_norm'] = vf_norm_all
         self.dataset.zarr_group['genes'] = np.array(genes)
+
+        # Persist the (corrected) coordinate metadata. In chunked mode the merge
+        # above fixed coordinate_offset / bounds to global values; re-write them
+        # so the store no longer holds the last chunk's single-tile metadata.
+        for key in ('coordinate_offset', 'coordinate_bounds',
+                    'original_coordinate_bounds'):
+            value = getattr(self.dataset, key, None)
+            if value is None:
+                continue
+            if key in self.dataset.zarr_group:
+                del self.dataset.zarr_group[key]
+            self.dataset.zarr_group[key] = np.array(value)
 
         return sample_stats
 
@@ -2281,6 +2511,12 @@ class SSAMAnalysis(object):
             # a voxel is kept iff it has a (non-background) cell type whose
             # score and vector-field norm both pass their thresholds.
             vf_norm = np.asarray(self.dataset.vf_norm)
+            # vf_norm is stored 2D as (n_R, n_C) while score_vol / celltype_maps
+            # are (n_C, n_R, 1). Without aligning orientation+ndim, the elementwise
+            # `&` below broadcasts to (n_C, n_R, n_C) -- O(n_C^2 * n_R), ~125GB on
+            # large maps (minutes + swap, wrong-shaped mask). Align to match.
+            if vf_norm.ndim == 2 and score_vol.ndim == 3:
+                vf_norm = vf_norm.T[..., None]
             mask = (vf_norm > min_norm) & (score_vol > r_thr) & (celltype_maps != -1)
 
         # Blob post-processing — run ONCE on the final mask instead of once per
@@ -2296,8 +2532,9 @@ class SSAMAnalysis(object):
                     minx, miny, minz, maxx, maxy, maxz = bp.bbox
                     mask[minx:maxx, miny:maxy, minz:maxz] |= bp.image_filled
         elif fill_blobs:
-            # Fill enclosed holes in one optimized pass.
-            mask = ndimage.binary_fill_holes(mask)
+            # Fill enclosed holes in one optimized pass (GPU when available;
+            # bit-identical boolean morphology, auto CPU fallback).
+            mask = _binary_fill_holes_fast(mask)
 
         filtered_ctmaps = np.array(celltype_maps, copy=True)
         filtered_ctmaps[mask == False] = -1

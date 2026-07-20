@@ -95,12 +95,11 @@ The cluster→cell-type labeling is done by **your LLM** following the
 `annotate-mode` skill, using the ontology server. You don't hand-label clusters.
 
 **a. Make the expert for your tissue** (if not already shipped). The two seed
-examples are `mouse:whole_brain` and `human:lung`; generate others from the
-server manifest:
-```bash
-python Agentic-Annotation/tools/generate_annotate_experts.py \
-    --server $CELLONTO_SERVER_URL --wing mouse:whole_brain
-```
+examples are `mouse:whole_brain` and `human:lung`; mint any other wing on demand
+with the **`build-expert` skill** (`Agentic-Annotation/skills/build-expert/`) — e.g.
+tell your LLM *"use build-expert to make the mouse-pancreas expert agent"*. It writes
+`Agentic-Annotation/agents/{species}-{organ}-expert.md` for any wing the KG server covers
+(and the agent auto-loads that organ's knowledge dossier if one has been built).
 
 **b. Tell your LLM (the caller) to annotate.** Two ways:
 

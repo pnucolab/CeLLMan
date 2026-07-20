@@ -17,8 +17,9 @@ import dask.array as da
 # Try to import xarray and SpatialData for image saving
 try:
     import xarray as xr
-    from spatialdata.models import Image2DModel
-    from spatialdata.transformations.operations import get_transformation
+    from spatialdata.models import Image2DModel, Labels2DModel, TableModel
+    from spatialdata.transformations import Affine
+    from spatialdata.transformations.operations import get_transformation, set_transformation
     _SPATIALDATA_AVAILABLE = True
 except ImportError:
     _SPATIALDATA_AVAILABLE = False
@@ -381,10 +382,14 @@ class SSAMDataset(object):
         sctmap[empty_mask] = (0, 0, 0, 0)
 
         if set_alpha:
-            alpha = np.array(self.max_correlations[..., z].T, copy=True)
-            alpha[alpha < 0] = 0 # drop negative correlations
-            alpha = min_r + alpha / (np.max(alpha) / (1.0 - min_r))
-            sctmap[..., 3] = alpha
+            # per-voxel score = correlation (corr path) or softmax prob (tsvm path)
+            score = self.max_correlations if getattr(self, "max_correlations", None) is not None \
+                else getattr(self, "max_probabilities", None)
+            if score is not None:
+                alpha = np.array(score[..., z].T, copy=True)
+                alpha[alpha < 0] = 0 # drop negative correlations
+                alpha = min_r + alpha / (np.max(alpha) / (1.0 - min_r))
+                sctmap[..., 3] = alpha
 
         if rotate == 1 or rotate == 3:
             sctmap = sctmap.swapaxes(0, 1)
@@ -535,126 +540,145 @@ class SSAMDataset(object):
 
         return
 
-    def _save_celltype_map_to_spatialdata(self, data, background="black", centroid_indices=[], colors=None, cmap='jet', rotate=0, min_r=0.6, set_alpha=False, z=None, image_name="celltype_map"):
-        """
-        Save the celltype map to SpatialData images.
+    def write_celltype_map(self, sdata=None, *, colors=None, cmap='jet',
+                           background="black", z=None, min_r=0.6, set_alpha=False,
+                           annotation_csv=None,
+                           labels_key="cellman_celltype_map",
+                           image_key="cellman_celltype_map_rgb",
+                           table_key="cellman_celltype"):
+        """Write the filtered cell-type map into ``sdata`` as three aligned elements.
 
-        This method generates the celltype map array and saves it to the SpatialData object's images
-        using xarray DataArray and Image2DModel.parse.
+        * ``labels[labels_key]`` — integer raster; pixel value = ``cluster index +
+          1`` (0 = background / Unknown). This is the idiomatic categorical
+          (Labels2DModel) representation of the segmentation-free cell-type map.
+        * ``images[image_key]`` — an RGB rendering (same colours as
+          :meth:`plot_celltypes_map`) for quick visual inspection. (SpatialData
+          keys are globally unique across element types, so the RGB image cannot
+          share the labels' key; it takes the ``…_rgb`` suffix by default.)
+        * ``tables[table_key]`` — annotates the labels: instance id → cell-type
+          name (+ colour), built from ``annotation_csv`` when given.
 
-        :param image_name: Name to use for the image in SpatialData.images
-        :type image_name: str
+        All three carry the SAME ``Scale(sampling_distance) + Translation(origin)``
+        affine into the shared ``'global'`` µm coordinate system, so the map
+        overlays the input table / points / staining image exactly.
+
+        ``sdata`` defaults to the SpatialData that was fed to ``compute_vf`` /
+        ``downsample_vector`` (remembered as ``_original_input_data``). Returns it.
         """
+        if not _SPATIALDATA_AVAILABLE:
+            raise ImportError("spatialdata not available — cannot write celltype map")
+        sdata = sdata if sdata is not None else getattr(self, "_original_input_data", None)
+        if sdata is None:
+            raise ValueError("no SpatialData given; pass sdata= or run compute_vf "
+                             "with a SpatialData input so it is remembered")
+
+        data = self.filtered_celltype_maps
+        if z is None:
+            z = int(self.shape[2] / 2)
+        lab2d = np.asarray(data[..., z].T)               # (vx=col,vy=row) → (y,x); -1 = bg
+        K = int(lab2d.max()) + 1 if (lab2d.size and lab2d.max() >= 0) else 0
+
+        # ---- labels: -1 → 0 background, clusters → 1..K ----
+        labels_arr = (lab2d + 1).astype(np.int32)
+
+        # ---- RGB rendering (same colours as plot_celltypes_map) ----
+        if colors is None:
+            cmap_internal = plt.get_cmap(cmap)
+            colors = cmap_internal([float(i) / max(K - 1, 1) for i in range(max(K, 1))])
+        lut = ListedColormap([to_rgba(c) for c in colors]) if K else ListedColormap(["black"])
+        rgba = lut(np.clip(lab2d, 0, None))
+        rgba[lab2d == -1] = (0, 0, 0, 0)
+        _score = self.max_correlations if getattr(self, "max_correlations", None) is not None \
+            else getattr(self, "max_probabilities", None)
+        if set_alpha and _score is not None:
+            a = np.asarray(_score[..., z].T, dtype=float); a[a < 0] = 0
+            if a.max() > 0:
+                rgba[..., 3] = min_r + a / (a.max() / (1.0 - min_r))
+        rgb = (rgba[..., :3] * rgba[..., 3:4] * 255).astype(np.uint8)     # premultiply on black
+        cyx = np.moveaxis(rgb, -1, 0)                                     # (c, y, x)
+
+        # ---- transform: raster index (x=col, y=row) → world µm ----
+        zg = self.zarr_group
+        sd_um = float(zg.attrs.get("sampling_distance",
+                      (zg["vf_params"][0] if "vf_params" in zg else 1.0)))
+        ox, oy = self._celltype_map_origin(sdata)
+        # count platforms: x_scale=y_scale=1 → exact Scale(sd)+Translation(origin).
+        # transcript platforms fold in the points' world scale (extract_spatialdata_scale).
+        xs = float(getattr(self, "x_scale", 1.0) or 1.0)
+        ys = float(getattr(self, "y_scale", 1.0) or 1.0)
+        mat = np.array([[sd_um * xs, 0.0, ox], [0.0, sd_um * ys, oy], [0.0, 0.0, 1.0]])
+        tf = Affine(mat, input_axes=("x", "y"), output_axes=("x", "y"))
+
+        sdata.labels[labels_key] = Labels2DModel.parse(
+            labels_arr, dims=("y", "x"), transformations={"global": tf})
+        sdata.images[image_key] = Image2DModel.parse(
+            cyx, dims=("c", "y", "x"), transformations={"global": tf})
+        if annotation_csv is not None:
+            self._write_celltype_table(sdata, K, colors, annotation_csv,
+                                       labels_key, table_key)
+        print(f"[write_celltype_map] labels['{labels_key}'] {labels_arr.shape} "
+              f"+ images['{image_key}'] + "
+              f"{'tables['+table_key+']' if annotation_csv else 'no table'} "
+              f"@ {sd_um}µm/px, origin=({ox:.1f},{oy:.1f})")
+        return sdata
+
+    def _celltype_map_origin(self, sdata):
+        """World-µm origin ``(x0, y0)`` of the vf grid: count platforms store it in
+        the count table's ``uns['cellman']['origin']``; otherwise fall back to the
+        dataset ``coordinate_offset``; otherwise ``(0, 0)``."""
         try:
-            if z is None:
-                z = int(self.shape[2] / 2)
+            for t in sdata.tables.values():
+                cm = t.uns.get("cellman", {})
+                if "origin" in cm:
+                    o = cm["origin"]; return float(o[0]), float(o[1])
+        except Exception:  # noqa: BLE001
+            pass
+        off = getattr(self, "coordinate_offset", None)
+        if off is not None and len(off) >= 2:
+            return float(off[0]), float(off[1])
+        return 0.0, 0.0
 
-            num_ctmaps = np.max(data) + 1
+    def _write_celltype_table(self, sdata, K, colors, annotation_csv,
+                              labels_key, table_key):
+        """Build the labels-annotating table: instance id (cluster+1) → celltype."""
+        import pandas as pd
+        from anndata import AnnData
+        from matplotlib.colors import to_hex
+        names = {}
+        try:
+            ann = pd.read_csv(annotation_csv)
+            if {"cluster", "celltype"}.issubset(ann.columns):
+                for _, r in ann.sort_values("cluster").iterrows():
+                    names[int(r["cluster"])] = str(r["celltype"])
+        except Exception as e:  # noqa: BLE001
+            print(f"Warning: could not read annotation_csv ({e}); using cluster ids")
+        if K <= 0:
+            return
+        obs = pd.DataFrame({
+            "instance_id": np.arange(1, K + 1, dtype=np.int64),
+            "region": pd.Categorical([labels_key] * K),
+            "celltype": [names.get(i, f"cluster_{i}") for i in range(K)],
+            "color": [to_hex(to_rgba(colors[i])) for i in range(K)],
+        })
+        tab = AnnData(obs=obs)
+        sdata.tables[table_key] = TableModel.parse(
+            tab, region=labels_key, region_key="region", instance_key="instance_id")
 
-            if len(centroid_indices) == 0:
-                centroid_indices = list(range(num_ctmaps))
-
-            if colors is None:
-                cmap_internal = plt.get_cmap(cmap)
-                colors = cmap_internal([float(i) / (num_ctmaps - 1) for i in range(num_ctmaps)])
-
-            all_colors = [background if not j in centroid_indices else colors[i] for i, j in enumerate(range(num_ctmaps))]
-            cmap_internal = ListedColormap(all_colors)
-
-            celltype_maps_internal = np.array(data[..., z].T, copy=True)
-            empty_mask = celltype_maps_internal == -1
-            celltype_maps_internal[empty_mask] = 0
-            sctmap = cmap_internal(celltype_maps_internal)
-            sctmap[empty_mask] = (0, 0, 0, 0)
-
-            if set_alpha:
-                alpha = np.array(self.max_correlations[..., z].T, copy=True)
-                alpha[alpha < 0] = 0  # drop negative correlations
-                alpha = min_r + alpha / (np.max(alpha) / (1.0 - min_r))
-                sctmap[..., 3] = alpha
-
-            if rotate == 1 or rotate == 3:
-                sctmap = sctmap.swapaxes(0, 1)
-
-            # Additional rotations (same as in _plot_celltypes_map)
-            if rotate == 2:
-                sctmap = np.flip(sctmap, axis=(0, 1))
-            elif rotate == 1:
-                sctmap = np.flip(sctmap, axis=0)
-            elif rotate == 3:
-                sctmap = np.flip(sctmap, axis=1)
-
-            # Convert RGBA to RGB by blending with background
-            # This ensures compatibility with standard image formats
-            rgb_array = np.zeros((*sctmap.shape[:2], 3), dtype=np.float32)
-            alpha_channel = sctmap[..., 3]
-
-            for i in range(3):
-                rgb_array[..., i] = (sctmap[..., i] * alpha_channel +
-                                   (1 - alpha_channel) * (0 if background == "black" else 1))
-
-            # Convert to uint8 for standard image format
-            rgb_array = (rgb_array * 255).astype(np.uint8)
-
-            # Get extent information for proper coordinate mapping
-            extent = self._get_plot_extent()
-
-            if extent:
-                extent[0] *= self.x_scale
-                extent[1] *= self.x_scale
-                extent[2] *= self.y_scale
-                extent[3] *= self.y_scale
-
-            # Create coordinate arrays based on extent if available
-            if extent and hasattr(self, 'original_coordinate_bounds'):
-
-                x_coords = np.linspace(extent[0], extent[1], rgb_array.shape[1])
-                y_coords = np.linspace(extent[3], extent[2], rgb_array.shape[0])  # Note: y is flipped
-            else:
-                # Fallback to grid coordinates
-                x_coords = np.arange(rgb_array.shape[1])
-                y_coords = np.arange(rgb_array.shape[0])
-
-            # Create xarray DataArray with proper coordinates
-            celltype_map_da = xr.DataArray(
-                rgb_array,
-                dims=["y", "x", "c"],
-                coords={
-                    "y": y_coords,
-                    "x": x_coords,
-                    "c": ["r", "g", "b"]
-                },
-                attrs={
-                    "ssam_metadata": {
-                        "background": background,
-                        "centroid_indices": centroid_indices,
-                        "cmap": cmap if isinstance(cmap, str) else "custom",
-                        "rotate": rotate,
-                        "min_r": min_r,
-                        "set_alpha": set_alpha,
-                        "z_slice": z,
-                        "original_shape": list(data.shape),
-                        "extent": extent if extent else None,
-                        "coordinate_system": "physical" if extent else "grid",
-                        "processing_date": np.datetime64('now').astype(str)
-                    }
-                }
-            )
-
-            # Parse as Image2DModel and add to SpatialData
-            celltype_map_image = Image2DModel.parse(celltype_map_da)
-            self._original_input_data.images[image_name] = celltype_map_image
-
-            print(f"Celltype map successfully saved to SpatialData images with key '{image_name}'")
-            print(f"Image shape: {rgb_array.shape}")
-            print(f"Z-slice used: {z}")
-
-        except Exception as e:
+    def _save_celltype_map_to_spatialdata(self, data, background="black",
+                                          centroid_indices=[], colors=None, cmap='jet',
+                                          rotate=0, min_r=0.6, set_alpha=False, z=None,
+                                          image_name="cellman_celltype_map"):
+        """Back-compat shim: ``plot_celltypes_map(save_to_spatialdata=True)`` routes
+        here → :meth:`write_celltype_map` (labels + RGB image + annotating table)."""
+        try:
+            self.write_celltype_map(colors=colors, cmap=cmap, background=background,
+                                    z=z, min_r=min_r, set_alpha=set_alpha)
+        except Exception as e:  # noqa: BLE001
             print(f"Warning: Failed to save celltype map to SpatialData: {e}")
 
-    def plot_he(self, source, image_key='he', aspect='equal', **kwargs):
+    def plot_image(self, source, image_key='he', aspect='equal', **kwargs):
         """
-        Display an H&E (or morphology) image in global µm coordinates.
+        Display an H&E / morphology / staining image in global µm coordinates.
 
         Call this before :meth:`plot_downsampled_vector` in the same code
         cell so the two plots overlay on the same axes (matplotlib uses
@@ -798,6 +822,10 @@ class SSAMDataset(object):
             return
 
         plt.imshow(he_img, extent=extent, aspect=aspect, **kwargs)
+
+    # Backward-compat alias: the method was renamed plot_he → plot_image
+    # (it renders any morphology/staining image, not just H&E).
+    plot_he = plot_image
 
     def plot_downsampled_vector(self, c='red', s=0.3, alpha=0.45, **kwargs):
         """

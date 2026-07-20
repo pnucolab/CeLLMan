@@ -158,3 +158,17 @@ def _pearson_corr_gpu(centroids_t, data_t):
     cn = torch.clamp(torch.linalg.norm(c, dim=1), min=1e-12)
     dn = torch.clamp(torch.linalg.norm(d, dim=1), min=1e-12)
     return (c @ d.T) / (cn[:, None] * dn[None, :])
+
+
+def _pearson_max_gpu(centroids_t, data_t):
+    """Shared mapping kernel: best-centroid label + Pearson score per row.
+
+    ``centroids_t`` (k, g) and ``data_t`` (n, g) → ``(best_idx (n,), best_corr
+    (n,))`` on the same device. This is the single consumer used by BOTH the
+    count path (field read from the stored ``vf_normalized``) and the transcript
+    path (KDE field streamed chunk-by-chunk) — identical Pearson-max so results
+    do not depend on how the field was produced. Returns int32 idx, float32 corr.
+    """
+    corr = _pearson_corr_gpu(centroids_t, data_t)          # (k, n)
+    best_corr, best_idx = corr.max(dim=0)
+    return best_idx.to(torch.int32), best_corr.to(torch.float32)

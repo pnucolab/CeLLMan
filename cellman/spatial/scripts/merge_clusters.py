@@ -1,5 +1,12 @@
 """Cluster-merger: decision-aware merge of SSAM clusters.
 
+DEPRECATED — use ``build_mapping_inputs.py`` instead. It produces the same
+centroids/labels from the same grouping rules, but computes them once after
+annotation (the pre-merge centroids were always discarded here anyway) and never
+slices ``normalized_vectors`` / ``downsampled_vectors``, so it is idempotent and
+needs no ``finish_partial_merge.py`` repair path. Kept only for stores already
+merged with it.
+
 Reads the annotated h5ad (from `{species}-{organ}-expert` annotate mode) and
 groups vectors into post-merge clusters using the annotate decision metadata:
 
@@ -78,6 +85,12 @@ def parse_args():
                    help='SSAMDataset zarr root (contains ssam_clusters_annotated.h5ad + zarr arrays).')
     p.add_argument('--h5ad-name', default='ssam_clusters_annotated.h5ad',
                    help='Annotated h5ad filename inside --store-dir (default: %(default)s).')
+    p.add_argument('--column', default='cellman_annotation',
+                   help='obs column holding the cell-type label to merge on (default: %(default)s). '
+                        'Use cellman_free_annotation to merge the interactive/free-phase result instead '
+                        'of the standard annotation. NOTE: term_id/decision metadata describes the '
+                        'STANDARD labels only, so a non-default column is meant for --legacy '
+                        '(group by label string); decision-aware mode still merges by the standard term_id.')
     p.add_argument('--out-csv-name', default='merged_annotation.csv',
                    help='Output CSV filename inside --store-dir (default: %(default)s).')
     p.add_argument('--force', action='store_true',
@@ -122,18 +135,6 @@ def main():
     if not os.path.isdir(store_dir):
         sys.exit(f'[error] store dir not found: {store_dir}')
 
-    # Annotate-mode writes the annotated h5ad + trace into an `annotation_out/`
-    # subdir of the zarr store root (store_dir = .../cellman_spatial). Resolve the
-    # h5ad at the store root first, then fall back to that subdir.
-    h5ad_path = os.path.join(store_dir, args.h5ad_name)
-    if not os.path.isfile(h5ad_path):
-        alt = os.path.join(store_dir, 'annotation_out', args.h5ad_name)
-        if os.path.isfile(alt):
-            h5ad_path = alt
-    if not os.path.isfile(h5ad_path):
-        sys.exit(f'[error] h5ad not found: {os.path.join(store_dir, args.h5ad_name)} '
-                 f'(also tried annotation_out/{args.h5ad_name})')
-
     # Default --annotate-out to the standard annotation_out/ subdir when present,
     # so cluster_path / decision metadata can be recovered without an explicit flag
     # (finalize writes only cellman_annotation into the h5ad obs).
@@ -141,6 +142,35 @@ def main():
         default_ao = os.path.join(store_dir, 'annotation_out')
         if os.path.isdir(default_ao):
             args.annotate_out = default_ao
+
+    # Annotate-mode writes the annotated h5ad into the annotate-out dir (finalize
+    # names it after the INPUT, e.g. `mouse_brain_cls_annotated.h5ad`, not the
+    # default `ssam_clusters_annotated.h5ad`). Resolve it by searching, in order,
+    # the annotate-out dir then the store root: first the exact --h5ad-name, then —
+    # if unset by name — auto-discover a lone `*_annotated.h5ad`.
+    search_dirs = [d for d in (args.annotate_out, store_dir,
+                               os.path.join(store_dir, 'annotation_out')) if d]
+    h5ad_path = None
+    for d in search_dirs:
+        cand = os.path.join(d, args.h5ad_name)
+        if os.path.isfile(cand):
+            h5ad_path = cand
+            break
+    if h5ad_path is None:                       # named file absent → glob *_annotated.h5ad
+        import glob as _glob
+        for d in search_dirs:
+            hits = sorted(_glob.glob(os.path.join(d, '*_annotated.h5ad')))
+            if len(hits) == 1:
+                h5ad_path = hits[0]
+                print(f'[cluster-merger] auto-discovered annotated h5ad: {os.path.basename(h5ad_path)}')
+                break
+            if len(hits) > 1:
+                sys.exit(f'[error] multiple *_annotated.h5ad in {d}: {[os.path.basename(h) for h in hits]}. '
+                         'Disambiguate with --h5ad-name.')
+    if h5ad_path is None:
+        sys.exit(f'[error] annotated h5ad not found. Looked for {args.h5ad_name!r} and '
+                 f'*_annotated.h5ad in: {search_dirs}')
+
     if os.path.exists(out_csv) and not args.force and not args.dry_run:
         sys.exit(f'[error] {out_csv} already exists. Not idempotent — use --force or --dry-run.')
 
@@ -159,7 +189,10 @@ def main():
     print(f'[cluster-merger] alignment OK; n_vectors={n_total}')
 
     obs = adata.obs
-    celltype = obs['cellman_annotation'].astype(str).values
+    if args.column not in obs.columns:
+        sys.exit(f'[error] --column {args.column!r} not in h5ad obs (have: {list(obs.columns)})')
+    print(f'[cluster-merger] label col : {args.column}')
+    celltype = obs[args.column].astype(str).values
 
     # --- per-cell cluster_path: from obs, else recovered from annotate-out state ---
     if 'cluster_path' in obs.columns:

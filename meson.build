@@ -74,4 +74,16 @@ py.install_sources([
   'cellman/spatial/_dataset.py',
   'cellman/spatial/_kde_gpu.py',
   'cellman/spatial/_mapping_gpu.py',
+  # count-based (blur) backend
+  'cellman/spatial/_griddataset.py',
+  'cellman/spatial/_panel.py',
+  'cellman/spatial/_count.py',
+  'cellman/spatial/_tsvm.py',
 ], subdir: 'cellman/spatial')
+
+# count-based loaders subpackage
+py.install_sources([
+  'cellman/spatial/_io/__init__.py',
+  'cellman/spatial/_io/_grid.py',
+  'cellman/spatial/_io/_loaders.py',
+], subdir: 'cellman/spatial/_io')

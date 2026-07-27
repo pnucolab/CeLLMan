@@ -1,8 +1,15 @@
 """TSVM-based celltype mapping for CeLLMan spatial (notebook-level, no package edits).
 
 Drop-in alternative to ``map_celltypes_correlation`` (centroid-Pearson template
-matching) that replaces the mapping step with a **linear multiclass Transductive
-SVM** trained in a PCA latent space, then applied inductively over the field.
+matching) that replaces the mapping step with a **multiclass Transductive SVM**
+trained in a PCA latent space, then applied inductively over the field.
+
+Kernel: **RBF by default** (``kernel='rbf'``), realized as an explicit Random
+Fourier Feature map on the PCA-50 coords -- so the machine below stays the same
+linear Crammer-Singer solver on lifted features and the field cache stays small
+and valid. ``kernel='linear'`` restores the original behaviour. Full-gene mode
+(``n_components=None``) is linear-only. See the RFF section for why an explicit
+feature map is used instead of an exact kernel SVM.
 
 Why not plain centroid-correlation
 ----------------------------------
@@ -117,6 +124,67 @@ def project(X, mean, comps):
 
 
 # ----------------------------------------------------------------------------
+# RBF kernel via Random Fourier Features (Rahimi & Recht 2007)
+# ----------------------------------------------------------------------------
+# WHY RFF AND NOT AN EXACT KERNEL SVM. This whole pipeline is "map a voxel to a
+# small feature vector, then one compact GEMM (k, d), streamed over a field of
+# ~1e7 voxels". An exact kernel machine's decision function is a sum over SUPPORT
+# VECTORS, f(x) = sum_i a_i K(x, x_i) + b, so the model stops being a compact
+# (k, d) matrix and every apply needs K(field, SVs) -- which would force a rewrite
+# of all three apply paths, the field cache and the transductive terms.
+#
+# An EXPLICIT RBF feature map avoids all of that: z(x) = sqrt(2/D) cos(W x + beta)
+# with W ~ N(0, 2*gamma*I) satisfies z(x).z(y) ~= exp(-gamma ||x-y||^2), so the
+# RBF classifier is just the SAME linear machine on lifted features. train_tsvm,
+# the Crammer-Singer hinge, the entropy / class-balancing terms, the abstention
+# and the field PCA cache are all unchanged -- only the feature width grows d->D.
+# Cost is negligible where it matters: the field sweep is bound by zstd
+# decompression, not the GPU (see map_celltypes_tsvm), so the extra GEMM is free.
+#
+# gamma is data-derived (median heuristic) rather than guessed, and Omega/beta are
+# drawn from a CPU generator so the map is byte-identical across devices/runs --
+# the same reproducibility discipline the persisted PCA basis follows.
+def rff_gamma_median(Z, n_sample=4096, seed=0):
+    """Median heuristic for the RBF bandwidth: gamma = 1 / (2 * median_dist^2).
+
+    Computed on a subsample of the LABELED PCA coords, i.e. in exactly the space
+    the classifier sees. Scale matters far more for RBF than for a linear model
+    (the kernel is distance-based), so this must never be a hardcoded constant.
+    """
+    n = Z.shape[0]
+    if n > n_sample:
+        g = torch.Generator(device="cpu").manual_seed(int(seed))
+        idx = torch.randperm(n, generator=g)[:n_sample].to(Z.device)
+        S = Z[idx]
+    else:
+        S = Z
+    m = S.shape[0]
+    D = torch.cdist(S.float(), S.float())
+    iu = torch.triu_indices(m, m, offset=1, device=D.device)
+    med = float(D[iu[0], iu[1]].median())
+    if not np.isfinite(med) or med <= 0:
+        med = 1.0
+    return 1.0 / (2.0 * med * med)
+
+
+def rff_params(d, n_features, gamma, seed=0, device="cuda"):
+    """Draw the RFF projection. Returns (Omega (D, d), beta (D,)) on ``device``.
+
+    Sampled from a CPU generator so the feature map is reproducible across CUDA
+    devices (matching the persisted-PCA-basis policy).
+    """
+    g = torch.Generator(device="cpu").manual_seed(int(seed))
+    Omega = torch.randn(n_features, d, generator=g) * float(np.sqrt(2.0 * gamma))
+    beta = torch.rand(n_features, generator=g) * float(2.0 * np.pi)
+    return Omega.to(device).float(), beta.to(device).float()
+
+
+def rff_apply(Z, Omega, beta):
+    """(n, d) -> (n, D) RBF feature map. z(x) = sqrt(2/D) cos(Omega x + beta)."""
+    return float(np.sqrt(2.0 / Omega.shape[0])) * torch.cos(Z @ Omega.T + beta)
+
+
+# ----------------------------------------------------------------------------
 # Unlabeled field subsampling (the transductive pool)
 # ----------------------------------------------------------------------------
 def sample_unlabeled_field(ds, mean, comps, *, vf_norm_threshold,
@@ -196,6 +264,10 @@ def train_tsvm(Zl, yl, k, Zu=None, *, W_init=None,
                verbose=True):
     """Train a linear multiclass TSVM on GPU.
 
+    "Linear" is in the FEATURE SPACE it is handed: with ``kernel='rbf'`` the caller
+    passes RFF-lifted coords (see ``rff_apply``), which makes this exact solver an
+    RBF-kernel SVM. Nothing here changes between the two kernels.
+
     Objective (f(z) = W z + b, k classes):
         mean_i max(0, 1 + max_{c != y_i} f_c(z_i) - f_{y_i}(z_i))   [Crammer-Singer hinge]
       + 0.5*lam*||W||^2
@@ -257,7 +329,8 @@ def fit_celltype_tsvm(ds, *, n_components=50, n_unlabeled=200_000,
                       anneal_steps=4, inner_iters=200, lr=0.1,
                       device="cuda", seed=0, use_centroid_init=True,
                       use_unlabeled=True, unlabeled_source="cache",
-                      abstain_q=0.15, chunk_h=128):
+                      abstain_q=0.15, chunk_h=128,
+                      kernel="rbf", rff_dim=1024, gamma=None, rff_seed=0):
     """Fit PCA + multiclass TSVM from the store's labeled vectors and field pool.
 
     Returns a model dict and caches it on ``ds._tsvm_model``.
@@ -271,11 +344,34 @@ def fit_celltype_tsvm(ds, *, n_components=50, n_unlabeled=200_000,
     Parameters
     ----------
     n_components : int or None
-        PCA latent dim. ``None`` -> **full-gene mode**: no PCA, the linear classifier
-        is trained on the row-normalized full-gene vectors. PCA-50 caps training
-        fidelity to the labels at ~0.88 (it drops low-variance class-discriminative
+        PCA latent dim (default 50). ``None`` -> **full-gene mode**: no PCA, a LINEAR
+        classifier on the row-normalized full-gene vectors (``kernel='rbf'`` is not
+        supported there -- see ``kernel``). PCA-50 + *linear* caps training fidelity
+        to the labels at ~0.88 (it drops low-variance class-discriminative
         directions); full genes restore it to ~0.95. Trade-off: the field can't be
         pre-projected into a small cache, so mapping STREAMS the field per apply.
+    kernel : {'rbf', 'linear'}
+        ``'rbf'`` (default) lifts the PCA coords through an explicit Random Fourier
+        Feature map, making the Crammer-Singer machine a **kernel** SVM while every
+        downstream step (training, transduction, streaming apply, abstention, the
+        field PCA cache) stays byte-for-byte the same shape of computation.
+        This is the intended way to beat the PCA-50 *linear* 0.88 ceiling while
+        KEEPING the small cacheable PCA field representation -- i.e. a cheap stand-in
+        for full-gene mode, which reaches ~0.95 only by streaming the field.
+        NOTE the measured caveat: full-gene *linear* already matches the **kNN**
+        ceiling (~0.95), and kNN is strongly non-linear -- so the residual error
+        looks like label noise / genuine ambiguity, not a linearity limit. Expect
+        RBF to help in PCA space, not to push past that ceiling.
+    rff_dim : int
+        Number of random features D (default 1024). Higher = closer to the exact RBF
+        kernel; training memory is O(L*D), the apply cost is hidden by field I/O.
+    gamma : float or None
+        RBF bandwidth in ``exp(-gamma||x-y||^2)``. ``None`` -> median heuristic on the
+        labeled PCA coords. Tune WITH ``ent``: a large gamma plus entropy
+        minimization is the classic low-density-separation collapse mode (the
+        class-balancing term guards it, but they interact).
+    rff_seed : int
+        Seed for the RFF draw; the map is reproducible across devices.
     use_unlabeled : bool
         False -> supervised (no-transduction) variant.
     unlabeled_source : {'cache', 'field'}
@@ -287,6 +383,15 @@ def fit_celltype_tsvm(ds, *, n_components=50, n_unlabeled=200_000,
         confidence is below the ``abstain_q`` quantile of labeled confidences
         (0.10 = medium: more ambiguous than the least-confident ~10% of labels).
     """
+    kernel = str(kernel).lower()
+    if kernel not in ("linear", "rbf"):
+        raise ValueError("kernel must be 'rbf' or 'linear'")
+    if kernel == "rbf" and n_components is None:
+        raise ValueError(
+            "kernel='rbf' requires PCA mode (n_components=int, e.g. 50). Full-gene mode "
+            "is linear-only: lifting thousands of genes through RFF would defeat the "
+            "point (full-gene already reaches the kNN ceiling, and its field cannot be "
+            "cached). Use n_components=50 with kernel='rbf'.")
     zg = ds.zarr_group
     X = np.asarray(zg["normalized_vectors"][:])          # (L, g)
     y = np.asarray(zg["cluster_labels"][:])              # (L,) merged celltype idx
@@ -389,10 +494,39 @@ def fit_celltype_tsvm(ds, *, n_components=50, n_unlabeled=200_000,
             raise ValueError("unlabeled_source must be 'cache' or 'field'")
         print(f"[fit] unlabeled pool={tuple(Zu.shape)}  source={unlabeled_source}")
 
+    # ---- RBF: lift the PCA coords into RFF space; everything below is unchanged ----
+    omega = beta_rff = None
+    if kernel == "rbf":
+        if gamma is None:
+            gamma = rff_gamma_median(Zl, seed=rff_seed)
+            print(f"[fit] gamma (median heuristic) = {gamma:.6g}")
+        omega, beta_rff = rff_params(Zl.shape[1], rff_dim, gamma, seed=rff_seed, device=device)
+        # Persist the draw so a re-map reproduces the identical feature map (same
+        # policy as the persisted PCA basis). Small: (D, d) floats.
+        for kk, arr in (("tsvm_rff_omega", omega), ("tsvm_rff_beta", beta_rff)):
+            if kk in zg:
+                del zg[kk]
+            zg[kk] = arr.cpu().numpy().astype(np.float32)
+        zg.attrs["tsvm_kernel"] = "rbf"
+        zg.attrs["tsvm_rff_gamma"] = float(gamma)
+        zg.attrs["tsvm_rff_dim"] = int(rff_dim)
+        zg.attrs["tsvm_rff_seed"] = int(rff_seed)
+        Zl = rff_apply(Zl, omega, beta_rff)              # (L, D)
+        if Zu is not None:
+            Zu = rff_apply(Zu, omega, beta_rff)
+        print(f"[fit] RBF via RFF: d={omega.shape[1]} -> D={rff_dim}  "
+              f"labeled={tuple(Zl.shape)}")
+    else:
+        zg.attrs["tsvm_kernel"] = "linear"
+
     W_init = None
     if use_centroid_init:
         cents = np.asarray(zg["centroids"][:])           # (k, g)
         Wc = project(cents, mean, comps)                 # (k, d)
+        if kernel == "rbf":
+            # matched filter per class in RFF space -- same intent as the linear case
+            # (start near the correlation solution), just in the lifted features.
+            Wc = rff_apply(Wc, omega, beta_rff)          # (k, D)
         Wc = Wc / torch.clamp(Wc.norm(dim=1, keepdim=True), min=1e-12)
         W_init = Wc * 0.1
 
@@ -406,7 +540,10 @@ def fit_celltype_tsvm(ds, *, n_components=50, n_unlabeled=200_000,
     print(f"[fit] abstain_q={abstain_q} (Unknown = most-ambiguous {abstain_q:.0%} of field)")
     model = dict(W=W, b=b, mean=mean, comps=comps, k=k,
                  vf_norm_threshold=float(vf_norm_threshold), n_components=n_components,
-                 abstain_q=float(abstain_q))
+                 abstain_q=float(abstain_q),
+                 kernel=kernel, rff_omega=omega, rff_beta=beta_rff,
+                 gamma=(float(gamma) if kernel == "rbf" else None),
+                 rff_dim=(int(rff_dim) if kernel == "rbf" else None))
     ds._tsvm_model = model
     return model
 
@@ -534,6 +671,21 @@ def map_celltypes_tsvm(ds, model=None, *, tau_conf=None, chunk_h=128, device="cu
     k = model["k"]
     thr = model["vf_norm_threshold"]
     abstain_q = float(model.get("abstain_q", 0.15))
+    # RBF (RFF) feature map, if the model was fitted with kernel='rbf'. The lift is
+    # applied at scoring time only -- the field PCA cache still stores d-dim coords,
+    # so it stays valid and small.
+    omega = model.get("rff_omega")
+    beta_rff = model.get("rff_beta")
+    is_rbf = omega is not None and beta_rff is not None
+    if is_rbf:
+        omega, beta_rff = omega.to(device), beta_rff.to(device)
+        if full_gene:
+            raise ValueError("kernel='rbf' is not supported in full-gene mode")
+        print(f"[map] kernel=rbf (RFF D={omega.shape[0]}, gamma={model.get('gamma')})")
+
+    def _score(Z):
+        """(n, d) PCA coords -> (n, k) logits, lifting through RFF when kernel='rbf'."""
+        return (rff_apply(Z, omega, beta_rff) if is_rbf else Z) @ W.T + b
 
     zg = ds.zarr_group
     n_G, n_R, n_C = zg["vf_normalized"].shape
@@ -543,11 +695,24 @@ def map_celltypes_tsvm(ds, model=None, *, tau_conf=None, chunk_h=128, device="cu
     if full_gene:
         use_cache = False                                 # no PCA cache in full-gene mode
 
-    def _classify(Z_all):
-        """Z_all (n_R*n_C, d) on GPU -> (M, conf, tc) ; abstain by field quantile."""
-        p = torch.softmax(Z_all @ W.T + b, dim=1)         # (N, k)
-        conf, best = p.max(dim=1)
-        best = best.to(torch.int32)
+    def _classify(Z_all, score_chunk=1_000_000):
+        """Z_all (n_R*n_C, d) on GPU -> (M, conf, tc) ; abstain by field quantile.
+
+        Scored in ROW-CHUNKS: with kernel='rbf' the lifted (N, D) matrix would be
+        D/d times the cached field (~40 GB at N=1e7, D=1024), so the lift happens
+        per chunk and only the (N,) conf/best survive. Numerically identical to the
+        one-shot form for the linear path.
+        """
+        N = Z_all.shape[0]
+        conf = torch.empty(N, device=Z_all.device, dtype=torch.float32)
+        best = torch.empty(N, device=Z_all.device, dtype=torch.int32)
+        for s in range(0, N, score_chunk):
+            e = min(s + score_chunk, N)
+            p = torch.softmax(_score(Z_all[s:e]), dim=1)   # (n, k)
+            c, bi = p.max(dim=1)
+            conf[s:e] = c
+            best[s:e] = bi.to(torch.int32)
+            del p, c, bi
         # confidence threshold = abstain_q quantile over SIGNAL field voxels
         if tau_conf is not None:
             tc = float(tau_conf)
@@ -635,7 +800,7 @@ def map_celltypes_tsvm(ds, model=None, *, tau_conf=None, chunk_h=128, device="cu
             gb = torch.as_tensor(block, device=device)
             sm = torch.as_tensor(sig.reshape(-1), device=device)
             Z = (_row_normalize(gb.T[sm]) - mean) @ comps.T  # (n_sig, d)
-            p = torch.softmax(Z @ W.T + b, dim=1)
+            p = torch.softmax(_score(Z), dim=1)              # RFF lift when kernel='rbf'
             conf, best = p.max(dim=1)
             best = best.to(torch.int32)
             best[conf < tc] = -1
@@ -684,15 +849,19 @@ def map_celltypes_tsvm(ds, model=None, *, tau_conf=None, chunk_h=128, device="cu
 # ----------------------------------------------------------------------------
 # Package wrapper: fit + apply in one call, for SSAMAnalysis.map_celltypes(method='tsvm')
 # ----------------------------------------------------------------------------
-def map_tsvm(analysis, *, n_components=None, device="cuda", overwrite=True,
+def map_tsvm(analysis, *, n_components=50, device="cuda", overwrite=True,
              fit_kwargs=None, apply_kwargs=None):
     """Fit a TSVM on the store's labeled vectors and map the whole field.
 
     Thin wrapper over :func:`fit_celltype_tsvm` + :func:`map_celltypes_tsvm`,
-    operating on ``analysis.dataset``. ``n_components=None`` = full-gene mode
-    (highest label fidelity; streams the field). Returns
-    ``(celltype_maps, max_probabilities)``; the score volume is the top-class
-    softmax probability, thresholded downstream by ``filter_celltypemaps(min_p=…)``.
+    operating on ``analysis.dataset``. Returns ``(celltype_maps, max_probabilities)``;
+    the score volume is the top-class softmax probability, thresholded downstream by
+    ``filter_celltypemaps(min_p=…)``.
+
+    Default = **PCA-50 + RBF kernel** (RFF): the small cacheable field representation
+    with a non-linear boundary. ``n_components=None`` selects full-gene mode, which is
+    LINEAR-only and streams the field per apply -- pass
+    ``fit_kwargs={'kernel': 'linear'}`` with it.
     """
     ds = analysis.dataset
     # tsvm consumes the stored 3D count field (n_G, R, C). The transcript KDE
@@ -708,6 +877,8 @@ def map_tsvm(analysis, *, n_components=None, device="cuda", overwrite=True,
     # map_celltypes() has no n_components parameter of its own, so accept it inside
     # fit_kwargs (otherwise it collides with the explicit keyword below).
     n_components = fit_kwargs.pop("n_components", n_components)
+    if n_components is None:
+        fit_kwargs.setdefault("kernel", "linear")   # full-gene mode is linear-only
     fit_kwargs.setdefault("device", device)
     apply_kwargs.setdefault("device", device)
     apply_kwargs.setdefault("overwrite", overwrite)

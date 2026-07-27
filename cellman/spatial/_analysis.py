@@ -2269,7 +2269,11 @@ class SSAMAnalysis(object):
             Mapping algorithm (count regime only; transcript is always 'corr').
             ``'corr'`` writes the per-voxel score to ``max_correlations``
             (filtered by ``min_r``); ``'tsvm'`` writes the softmax probability to
-            ``max_probabilities`` (filtered by ``min_p``).
+            ``max_probabilities`` (filtered by ``min_p``). ``'tsvm'`` defaults to
+            **PCA-50 + RBF kernel** (random Fourier features) and, unlike ``'corr'``,
+            can **abstain**: a low-confidence voxel is left Unknown (-1). Override via
+            ``map_kwargs={'fit_kwargs': {...}}`` (e.g. ``{'kernel': 'linear'}``, or
+            ``{'n_components': None, 'kernel': 'linear'}`` for full-gene mode).
         map_kwargs : dict, optional
             Extra kwargs forwarded to the count mapper
             (:func:`cellman.spatial._count.map_corr` /

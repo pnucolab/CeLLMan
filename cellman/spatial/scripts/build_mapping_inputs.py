@@ -290,9 +290,10 @@ def main():
     print(f'[build-mapping] label col : {args.column}   (n_vectors={n_total})')
 
     if args.leiden_column in obs.columns:
-        # Coerced, not cast: the process layer (neuropil / fiber tract) is clustered
-        # separately and leaves this column empty for its cells. Those celltypes get a
-        # sentinel id so they simply sort after the cell-layer ones.
+        # Coerced, not cast: this column is whatever the user clustered with, so it need
+        # not be numeric (string cluster names, or empty for vectors the clustering left
+        # out). Non-numeric values get a sentinel id so they simply sort last. Used ONLY
+        # to order the output celltype ids -- never for grouping.
         leiden = pd.to_numeric(obs[args.leiden_column].astype(str), errors='coerce') \
                    .fillna(1 << 30).astype(np.int64).values
     else:

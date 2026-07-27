@@ -95,7 +95,7 @@ class GridDataset:
         Physical scale of ``image`` (µm per pixel), at the resolution stored.
     species : str
     organ : str
-        Cell-Ontology wing name (e.g. ``'whole_brain'``, ``'breast'``). Used to
+        Cell-Ontology module name (e.g. ``'whole_brain'``, ``'breast'``). Used to
         fetch marker genes for the gene panel.
     platform : str
         ``'stereoseq'`` | ``'visiumhd'`` | ``'strata'`` (informational).

@@ -1,0 +1,28 @@
+cff-version: 1.2.0
+message: "If you use CeLLMan, please cite it as below."
+title: "CeLLMan: AI agentic cell-type annotation on a gene knowledge graph, with segmentation-free spatial mapping"
+abstract: >-
+  CeLLMan replaces manual cluster labeling with an agentic annotator: an LLM reasons
+  against a curated Cell-Ontology knowledge graph (celltype to marker genes, hierarchy,
+  confusion pairs, negative markers), applying one explicit identity test per cluster and
+  refusing to force-fit unsupported labels. It ships with a segmentation-free, multi-platform
+  spatial cell-type mapping workflow (cellman.spatial).
+type: software
+version: 0.1.0
+license: AGPL-3.0-or-later
+repository-code: "https://github.com/<ORG>/CeLLMan"
+# TODO before release: fill in real author names/affiliations/ORCIDs and the DOI (e.g. Zenodo),
+# and set the release date. Placeholders below must be replaced.
+authors:
+  - name: "The CeLLMan authors"
+    # - family-names: ""
+    #   given-names: ""
+    #   affiliation: "PNU Colab"
+    #   orcid: "https://orcid.org/0000-0000-0000-0000"
+keywords:
+  - cell-type annotation
+  - knowledge graph
+  - spatial transcriptomics
+  - single-cell RNA-seq
+  - large language models
+  - cell ontology

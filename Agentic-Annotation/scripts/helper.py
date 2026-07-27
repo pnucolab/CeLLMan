@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
-# NOTE: helper_v2.py is a STANDALONE build — the helper.py engine is INLINED below,
-#       plus the annotate-mode-v2 marker-axis split (subcluster/descend). Do NOT edit
-#       helper.py expecting changes here; regenerate via scratchpad/build_helper_v2.py.
+# NOTE: helper.py is a STANDALONE build — the helper.py engine is INLINED below,
+#       plus the annotate-mode marker-axis split (subcluster/descend). Do NOT edit
+#       helper.py expecting changes here; regenerate via scratchpad/build_helper.py.
 """UNNAMED annotate helper — in-memory recursive subclustering + ontology-aware profiling.
 
 cellularspace `_annotate_helper.py`를 계승하되 UNNAMED 변경 반영:
@@ -23,10 +23,10 @@ from scipy.stats import rankdata
 from scipy.sparse import csr_matrix
 
 # ===================================================================== ontology
-# 우리가 배포하는 단일 Cell-Ontology 서버. 사용자는 보통 아무것도 안 줘도 여기로 자동 연결된다.
+# 우리가 배포하는 단일 Cell-Ontology 서버(공개, 읽기 전용). 사용자는 보통 아무것도 안 줘도 여기로 자동 연결된다.
 # 우선순위: --server-url 플래그 > 환경변수 CELLONTO_SERVER_URL > 이 기본값.
-# (배포 시 이 상수를 공개 서버 URL로 교체.)
-DEFAULT_ONTOLOGY_SERVER = "http://localhost:8088"
+# 내부(랩) 개발자는 CELLONTO_SERVER_URL로 사설 주소(예: http://192.168.101.31:8088)를 덮어쓴다.
+DEFAULT_ONTOLOGY_SERVER = "https://cellman.pnucolab.com"
 def _resolve_server(server_url=None):
     return (server_url or os.environ.get("CELLONTO_SERVER_URL") or DEFAULT_ONTOLOGY_SERVER).rstrip("/")
 
@@ -54,8 +54,8 @@ def _fetch_slim_index(out, ontology_url=None, ontology_file=None):
                 idx = json.loads(r.read().decode())
         except urllib.error.HTTPError as e:
             if e.code == 404:
-                sys.exit(f"[init][ERROR:WING_NOT_FOUND] 서버에 해당 wing이 없습니다 ({ontology_url}, HTTP 404). "
-                         f"(species, organ)을 확인하거나 그 wing의 빌드를 요청하세요. → caller는 사용자에게 "
+                sys.exit(f"[init][ERROR:MODULE_NOT_FOUND] 서버에 해당 module이 없습니다 ({ontology_url}, HTTP 404). "
+                         f"(species, organ)을 확인하거나 그 module의 빌드를 요청하세요. → caller는 사용자에게 "
                          f"'요청한 조직(species/organ)의 온톨로지가 서버에 없어 annotation을 진행할 수 없습니다'라고 알릴 것.")
             sys.exit(f"[init][ERROR:SERVER_HTTP_{e.code}] 온톨로지 서버가 오류 {e.code}를 반환했습니다 ({ontology_url}).")
         except urllib.error.URLError as e:
@@ -63,8 +63,8 @@ def _fetch_slim_index(out, ontology_url=None, ontology_file=None):
                      f"서버 기동 여부와 CELLONTO_SERVER_URL을 확인하세요. → caller는 사용자에게 "
                      f"'온톨로지 서버에 연결할 수 없습니다(서버 다운 또는 주소 오류)'라고 알릴 것.")
         if not idx or not idx.get("terms"):
-            sys.exit(f"[init][ERROR:WING_EMPTY] wing은 응답했으나 term이 비어 있습니다 ({ontology_url}). "
-                     f"그 wing의 빌드가 필요합니다. → caller는 사용자에게 '해당 조직의 온톨로지가 비어 있어 진행 불가'라고 알릴 것.")
+            sys.exit(f"[init][ERROR:MODULE_EMPTY] module은 응답했으나 term이 비어 있습니다 ({ontology_url}). "
+                     f"그 module의 빌드가 필요합니다. → caller는 사용자에게 '해당 조직의 온톨로지가 비어 있어 진행 불가'라고 알릴 것.")
         idx = _dedup_parents(idx)                       # P 중복 부모 정리(허위 형제 그룹 방지)
         with open(dst, "w") as f: json.dump(idx, f, separators=(",", ":"))
         print(f"[ontology] fetched slim-index from server -> {dst} ({len(idx.get('terms',{}))} terms)", flush=True)
@@ -138,30 +138,6 @@ def _panel_clean(g):
     """marker 심볼을 var_names에 맞게 정규화(-/_ suffix 제거) — _panel._clean과 동일."""
     return str(g).split("-")[0].split("_")[0]
 
-def _load_wing_idx(out=None, ontology_file=None, species=None, organ=None):
-    """slim-index dict 반환(실패 시 None, graceful). **파이프라인이 이미 받아온 wing을 재사용**한다:
-    process-profile/init이 `{out}/_ontology_index.json`에 저장하므로 그걸 먼저 읽는다.
-    우선순위: {out}/_ontology_index.json > --ontology 로컬파일 > (없을 때만) 기본 서버에서 fetch.
-    server-url을 따로 받지 않는다 — 파이프라인이 쓰는 서버(_resolve_server: env/기본)만 폴백에 사용."""
-    if out:
-        p=os.path.join(out,"_ontology_index.json")
-        if os.path.exists(p):
-            try: return json.load(open(p))
-            except Exception: pass
-    if ontology_file:
-        try: return json.load(open(ontology_file))
-        except Exception as e:
-            print(f"[process-cluster][WARN] ontology 파일 로드 실패({ontology_file}): {e}", flush=True)
-    if species and organ:
-        url=f"{_resolve_server()}/wing/{species}/{organ}/slim-index"
-        import urllib.request
-        try:
-            with urllib.request.urlopen(url, timeout=60) as r:
-                return json.loads(r.read().decode())
-        except Exception as e:
-            print(f"[process-cluster][WARN] 로컬 slim-index 없음+fetch 실패({url}) → KG 마커 포함 없이 진행. "
-                  f"(process-profile을 먼저 실행해 {{out}}/_ontology_index.json을 만들었는지 확인): {e}", flush=True)
-    return None
 
 # ===================================================================== housekeeping
 import re as _re
@@ -180,17 +156,9 @@ def _data_driven_hk(cmeans, max_auc, genes, mean_pct=75, max_cv=0.2, max_auc_t=0
 
 # ===================================================================== ontology-derived domain context
 # 과거의 뇌-하드코딩(_LINEAGE/_LAYER/_SPECIFIC/_PAN)을 폐기하고, lineage/specific/pan/sibling을
-# 그 wing의 온톨로지(slim-index)에서 유도한다. 유도 불가(계층/마커 빈약) 시에만 아래 cross-organ
+# 그 module의 온톨로지(slim-index)에서 유도한다. 유도 불가(계층/마커 빈약) 시에만 아래 cross-organ
 # fallback을 쓴다. → 어떤 organ에도 일반화.
 _BG_MAX_N=500; MIN_N_OUT=20
-# ★ NEUROPIL 마커 (2026-06-18) — 이제 FALLBACK-ONLY (2026-07-15): 기본 neuropil_pan은 slim-index의 tier=
-#   'compartment' 'neuropil' term(R∪DF)에서 유도한다(_compartment_ctx). 이 상수는 compartment layer가 존재하나
-#   'neuropil' term 자체가 비어있는 예외 상황의 폴백으로만 남긴다. 수상돌기·축삭·시냅스 단백질 — 세포체가 아닌
-#   neuropil(뉴런 사이 시냅스 부피)에서 우세. segmentation-free 공간(ssam/KDE)은 neuropil 격자점을 별도 클러스터로
-#   만든다(저밀도 + 이 마커 우세 + 세포유형 배타마커 부재) → celltype 아닌 조직 구획 'neuropil' 라벨.
-_NEUROPIL_MK={"CAMK2A","CAMK2B","CAMK2N1","CAMK2N2","MAP2","MAP1B","DLG4","DLG2","DLG3","SYP","SYT1","SNAP25",
-              "NRGN","NEFL","NEFM","NEFH","GAP43","STMN2","STMN3","SYN1","SYN2","SYNGR3","TUBB3","NSMF","SNPH",
-              "KIF5A","KIF5C","ARC","HOMER1","SHANK3","BSN","PCLO","GRIA1","GRIN1","RTN1","NEFL","CALM1","CALM2","CALM3"}
 def _U(s): return str(s).upper()
 
 # cross-organ fallback(온톨로지 유도가 비었을 때만): 흔한 broad lineage 마커.
@@ -262,110 +230,67 @@ def _sibling_groups(idx):
 # ★ PROCESS tier (2026-07-15, 'compartment'→'process' 개명 2026-07-17): 세포체가 아니라 **세포에서 뻗어나온
 #   부분**(process)으로 채워진 조직 영역. 정의 = "mRNA는 있는데 핵/세포체가 아닌 영역". neuropil(수상돌기·축삭·
 #   교세포 돌기의 mesh)과 fiber tract(수초화 축삭 다발)이 그 신경계 사례고, 망막 plexiform layer·신장 podocyte
-#   발돌기·폐 I형 폐포세포 확장부처럼 **비신경 조직으로도 확장**된다. 'compartment'(구획)는 너무 넓어서 폐기.
-#   모양이 공통점이 아님에 주의 — neuropil은 그물, fiber tract는 다발이다. 공통점은 오직 "소마가 아니다"뿐이라
-#   이름이 구조가 아니라 그 성질을 가리킨다.
-#   마커 집합은 wing slim-index의 tier='process' term에서 유도(하드코딩 _NEUROPIL_MK 대체). process term이 없는
-#   wing은 {} → 기능 완전 비활성(back-compat).
-#   'compartment'는 legacy tier로 계속 받는다 — KG 개명과 helper 배포 사이에 엔진이 죽지 않도록.
+#   발돌기·폐 I형 폐포세포 확장부처럼 **비신경 조직으로도 확장**된다.
+#   ★ 2026-07-21 리팩터: process를 **pre-Leiden 자동 파티션**으로 찾던 로직(Step P + cluster-level Step 0.5)은
+#   제거됐다. process는 양성 마커를 그 전사체를 만든 소마와 **공유**하므로 마커축 클러스터링(clustering-based
+#   annotation)으로는 소마에서 안 갈린다 — 오직 **음성축(MALAT1 등 핵-보유)** 으로만 갈린다. 그래서 process
+#   탐지는 이제 사용자가 명시적으로 요청하는 **scoring-based annotation**(score-profile/apply/finalize) 전용이다.
+#   _PROC_TIERS는 (1) scoring 기본 대상(target 미지정 시 tier='process' class) + (2) _onto_ctx에서 process term을
+#   celltype 엔진(lineage/anchor)에서 배제(회귀 방지: neuropil이 lineage root로 잡혀 oligodendrocyte 오판)에 쓰인다.
+#   'compartment'는 legacy tier로 계속 받는다.
 _PROC_TIERS={"process","compartment"}
-_COMP_TIER="process"        # back-compat alias (외부에서 참조할 수 있음)
-def _compartment_ctx(idx):
-    """slim-index의 tier='compartment' term에서 compartment 마커 컨텍스트를 유도.
-    compartment term이 없으면 {} 반환(비-CNS wing → neuropil/fiber-tract 검출 비활성 = 기존 동작 보존).
-    반환:
-      neuropil_pan   = 'neuropil' term의 R∪DF (pan synaptic 마커; neuropil-여부 판정)
-      neuropil_neg   = 'neuropil' term의 N (세포체/핵 음성 — 예: MALAT1 핵-보유 lncRNA). fiber tract의
-                       fibertract_neg와 대칭: "조직 마커 O + 세포체 핵 X"라야 compartment. KG에 N이 없으면
-                       빈 집합 → 게이트가 기존과 동일하게 동작(하위호환).
-      subtype_delta  = {canonical_label: R∪DF} — neuropil transmitter subtype(glutamatergic/GABAergic/…)별 델타
-      fibertract_pos = 'fiber tract' term의 R∪DF (myelin 마커) ; fibertract_neg = 그 N (SOX10/OLIG2 세포체 음성)
-      label2id/id2label ; neuropil_id / fibertract_id — emission이 REAL term_id를 넣도록.
-    유전자 심볼은 UPPER 정규화(mouse Title / human UPPER 모두 매칭). 마커는 인덱스에서만 읽고 하드코딩 안 함."""
-    terms=(idx or {}).get("terms",{}) or {}
-    comp={tid:t for tid,t in terms.items() if (t.get("T") or "") in _PROC_TIERS}
-    if not comp: return {}
-    def _U2(gs): return {str(g).upper() for g in (gs or [])}
-    def _rdf(t): return _U2(t.get("R"))|_U2(t.get("DF"))
-    def _neg_inherited(tid, _seen=None):
-        """N(자신) ∪ N(조상 전부). ★ 필수: 범용 핵 축(MALAT1)은 process 루트 term에만 있고
-        모든 자식이 상속으로 받는다 — "핵이 없다"는 neuropil의 성질이 아니라 process-ness
-        자체의 성질이라서. 자기 N만 읽으면 루트의 축을 통째로 놓친다.
-        P(부모) 중복(slim이 Term-IS_A와 Concept-IS_A를 둘 다 실어 ['process','process']가 됨)과
-        사이클은 _seen으로 방어."""
-        if _seen is None: _seen=set()
-        if tid in _seen or tid not in comp: return set()
-        _seen.add(tid)
-        out=_U2(comp[tid].get("N"))
-        for p in (comp[tid].get("P") or []):
-            out |= _neg_inherited(p, _seen)
-        return out
-    def _find(name):
-        n=name.strip().lower()
-        for tid,t in comp.items():
-            if str(t.get("L","")).strip().lower()==n: return tid,t
-        return None,None
-    neuropil_id,nt=_find("neuropil")
-    fibertract_id,ft=_find("fiber tract")
-    label2id={t.get("L",tid):tid for tid,t in comp.items()}
-    id2label={tid:t.get("L",tid) for tid,t in comp.items()}
-    neuropil_pan=_rdf(nt) if nt else set()
-    neuropil_neg=_neg_inherited(neuropil_id) if neuropil_id else set()      # 자신 N ∪ 조상 N(루트의 MALAT1)
-    fibertract_pos=_rdf(ft) if ft else set()
-    fibertract_neg=_neg_inherited(fibertract_id) if fibertract_id else set()
-    subtype_delta={}
-    for tid,t in comp.items():
-        if tid in (neuropil_id, fibertract_id): continue
-        _P={p for p in (t.get("P") or [])}
-        _isnp=(neuropil_id and neuropil_id in _P) or str(t.get("L","")).strip().lower().endswith("neuropil")
-        if _isnp: subtype_delta[t.get("L",tid)]=_rdf(t)
-    return {"neuropil_pan":neuropil_pan,"neuropil_neg":neuropil_neg,"subtype_delta":subtype_delta,
-            "fibertract_pos":fibertract_pos,"fibertract_neg":fibertract_neg,
-            "label2id":label2id,"id2label":id2label,
-            "neuropil_id":neuropil_id,"fibertract_id":fibertract_id}
 
-# ================================================================ PROCESS partition (pre-Leiden)
-# ★ 2026-07-17. downsample_vector가 뱉은 벡터를 **Leiden 전에** cell / process / background로 가른다.
-#   segmentation-free 샘플링은 세포가 아닌 것도 때린다 — 그걸 세포인 척 클러스터링하면 그 구획을
-#   영영 잃는다(오늘까지의 Step 0.5는 클러스터 수준이라 앵커가 생기면 게이트가 막혔다).
-#   설계: process 후보를 **엄격하게** 떼어내고 **나머지 전부 cell**. 오류 프로파일이 비대칭이라서다 —
-#     세포를 process로 보내면 Leiden도 에이전트 판정도 못 받아 **복구 불가**
-#     process를 cell로 보내면 Leiden→에이전트→Step 0.5가 아직 잡을 수 있어 **복구 가능**
-#   background는 잔여가 아니라 **연언**(저밀도 AND 마커 없음)이다. 잔여로 두면 임계 미달이 전부 섞인다.
+# ================================================================ SCORING-based annotation
+# ★ 2026-07-21. process P 로직을 **일반화**한 per-vector scoring 엔진. clustering-based annotation(마커축
+#   Leiden→클러스터당 판정)과 대비되는 두 번째 모드다. 대상 class의 positive 마커 합성점수 상위 N%를 후보로,
+#   negative 마커 합성점수 상위 M%를 배제해 keep을 정한다(클러스터 아님, 벡터 단위). neuropil/fiber tract처럼
+#   양성 마커를 소마와 공유해 클러스터로 안 갈리는 대상에 필수. 기본 대상=tier='process' class지만 --targets로
+#   임의 KG class도 스코어링할 수 있다(pos=자신 R∪DF, neg=자신 N∪조상 N).
 _PROC_CAND_PCT = 10.0     # 후보 = pos_score 상위 N%   (default; 스킬과 같은 값)
 _PROC_NEG_PCT  = 10.0     # 제거 = neg_score 상위 M%   (default; 우연 제거율 = M% 이 되어 배수 해석이 자명)
 
-def _process_ctx(idx):
-    """tier='process' term에서 class 구조 + 마커를 **구조로부터** 유도. 하드코딩 이름 없음.
-      class      = 루트(process-부모가 없는 process term)의 **직속 자식** (neuropil / fiber tract / …)
-      pos        = 그 class의 R∪DF
-      neg        = N(자신) ∪ N(조상 전부)  ← 범용 핵 축(MALAT1)은 루트에만 있고 전원이 상속한다
-      children   = typed subtype(그 class의 자식)들의 델타
-    {} 반환 = 이 wing엔 process term 없음 → 단계 전체 skip(비-CNS wing)."""
+def _score_targets_ctx(idx, target_labels=None):
+    """scoring-based annotation의 대상 class를 KG 구조에서 유도. 하드코딩 이름 없음.
+      target_labels=None  → module의 tier='process' class(process 루트의 **직속 자식**: neuropil / fiber tract / …)
+                            를 기본 대상으로 (process 탐지의 기본 동작).
+      target_labels=[...] → 임의 KG class 라벨(대소문자 무시)을 대상으로. "score 기반으로 <X> 찾아" 처럼
+                            사용자가 명시한 임의 class를 스코어링.
+    각 class:
+      pos       = 그 class의 R∪DF
+      neg       = N(자신) ∪ N(조상 전부)  ← 범용 핵 축(MALAT1)은 루트에만 있고 전원이 상속한다(process),
+                  임의 class면 그 계보의 curated N을 상속.
+      children  = 직속 자식(typed subtype)들의 델타(R∪DF).
+    {} 반환 = 대상 없음(기본 모드에서 process term 없는 module, 또는 --targets가 어떤 term에도 매칭 안 됨)."""
     terms=(idx or {}).get("terms",{}) or {}
-    P={tid:t for tid,t in terms.items() if (t.get("T") or "") in _PROC_TIERS}
-    if not P: return {}
+    if not terms: return {}
     def _U(gs): return {str(g).upper() for g in (gs or [])}
     def _rdf(t): return _U(t.get("R"))|_U(t.get("DF"))
-    def _par(tid): return [p for p in dict.fromkeys(P[tid].get("P") or []) if p in P]   # slim이 P를 중복해 실음
-    def _kid(tid): return [c for c in P if tid in _par(c)]
+    def _par(tid): return [p for p in dict.fromkeys(terms[tid].get("P") or []) if p in terms and p!=tid]  # slim이 P를 중복해 실음
+    def _kid(tid): return [c for c in terms if tid in _par(c)]
     def _neg(tid, seen=None):
         if seen is None: seen=set()
-        if tid in seen or tid not in P: return set()
+        if tid in seen or tid not in terms: return set()
         seen.add(tid)
-        out=_U(P[tid].get("N"))
+        out=_U(terms[tid].get("N"))
         for q in _par(tid): out |= _neg(q, seen)
         return out
-    roots=[tid for tid in P if not _par(tid)]
+    # 대상 term id 결정
+    if target_labels:
+        want={str(l).strip().lower() for l in target_labels}
+        target_ids=[tid for tid,t in terms.items() if str(t.get("L","")).strip().lower() in want]
+    else:
+        P={tid for tid,t in terms.items() if (t.get("T") or "") in _PROC_TIERS}
+        if not P: return {}
+        def _parP(tid): return [p for p in _par(tid) if p in P]
+        roots=[tid for tid in P if not _parP(tid)]
+        target_ids=[c for r in roots for c in P if r in _parP(c)]      # process 루트의 직속 자식
     classes=[]
-    for r in roots:
-        for c in _kid(r):
-            classes.append({"id":c, "label":P[c].get("L",c),
-                            "pos":sorted(_rdf(P[c])), "neg":sorted(_neg(c)),
-                            "children":[{"id":k,"label":P[k].get("L",k),"delta":sorted(_rdf(P[k]))}
-                                        for k in _kid(c)]})
-    return {"root_ids":roots, "classes":classes,
-            "root_labels":[P[r].get("L",r) for r in roots]}
+    for c in target_ids:
+        classes.append({"id":c, "label":terms[c].get("L",c),
+                        "pos":sorted(_rdf(terms[c])), "neg":sorted(_neg(c)),
+                        "children":[{"id":k,"label":terms[k].get("L",k),"delta":sorted(_rdf(terms[k]))}
+                                    for k in _kid(c)]})
+    return {"classes":classes}
 
 
 def _zc(X, cols):
@@ -379,12 +304,17 @@ def _zc(X, cols):
     return (c-c.mean())/(c.std()+1e-9)
 
 
-def _proc_scores(adata, ctx, cand_pct=_PROC_CAND_PCT, neg_pct=_PROC_NEG_PCT):
-    """class별 pos/neg score와 판단 재료를 계산. 라벨을 붙이지 않는다 — 판정은 에이전트 몫."""
+def _proc_scores(adata, ctx, cand_pct=_PROC_CAND_PCT, neg_pct=_PROC_NEG_PCT, restrict=None):
+    """class별 pos/neg score와 판단 재료를 계산. 라벨을 붙이지 않는다 — 판정은 에이전트 몫.
+    restrict = 전체 길이 bool 마스크(None=전 벡터). 지정 시 후보 percentile을 그 subset **안에서만** 잡는다
+    ('이 neuron들 안에서 상위 N%')·keep/pct도 subset 기준. z-score는 전 벡터 대비(=whole-dataset enrichment).
+    반환 마스크(_mask/_cand)는 전체 길이(restrict 밖은 False)라 하류 인덱스 매핑이 필요 없다."""
     import numpy as _np
     X=adata.X; X=_np.asarray(X.todense()) if hasattr(X,"todense") else _np.asarray(X)
     um={str(g).upper():i for i,g in enumerate(adata.var_names)}
     vf=adata.obs["vf_norm"].to_numpy() if "vf_norm" in adata.obs else None
+    rm=_np.ones(adata.n_obs,bool) if restrict is None else _np.asarray(restrict,bool)
+    nrm=max(int(rm.sum()),1)
     out=[]
     for cl in ctx["classes"]:
         pc=[um[g] for g in cl["pos"] if g in um]; pmiss=[g for g in cl["pos"] if g not in um]
@@ -394,31 +324,31 @@ def _proc_scores(adata, ctx, cand_pct=_PROC_CAND_PCT, neg_pct=_PROC_NEG_PCT):
                         "reason":"positive 마커가 패널에 하나도 없음",
                         "pos_missing":pmiss,"neg_missing":nmiss}); continue
         ps=_zc(X,pc)
-        cand=ps>_np.quantile(ps,1-cand_pct/100.0)
+        cand=(ps>_np.quantile(ps[rm],1-cand_pct/100.0)) & rm            # 후보는 restrict 안에서만
         rec={"label":cl["label"],"term_id":cl["id"],"usable":True,
              "pos_used":[adata.var_names[i] for i in pc],"pos_missing":pmiss,
              "neg_used":[adata.var_names[i] for i in nc],"neg_missing":nmiss,
-             "n_candidate":int(cand.sum()),"pct_candidate":round(100*float(cand.mean()),2)}
+             "n_candidate":int(cand.sum()),"pct_candidate":round(100*float(cand.sum())/nrm,2)}
         if nc:
             ns=_zc(X,nc)
-            negon=ns>_np.quantile(ns,1-neg_pct/100.0)
+            negon=(ns>_np.quantile(ns[rm],1-neg_pct/100.0)) & rm
             removed=float((cand&negon).sum())/max(int(cand.sum()),1)
             keep=cand&~negon
             rec.update({
-                "corr_pos_neg":round(float(_np.corrcoef(ps,ns)[0,1]),3),
-                # ★ 배수 해석: neg_score 상위 M%는 정의상 전체의 M%를 지운다. neg가 후보와 무관하면
+                "corr_pos_neg":round(float(_np.corrcoef(ps[rm],ns[rm])[0,1]),3),
+                # ★ 배수 해석: neg_score 상위 M%는 정의상 restrict의 M%를 지운다. neg가 후보와 무관하면
                 #   후보에서도 M%가 지워진다 => 우연=M%. 배수>1 = 후보에 소마가 실제로 몰려 있고
                 #   필터가 그걸 걷어냄. 배수≈1 = 필터가 무정보. 배수<1 = 후보가 이미 소마-결핍.
                 "removal":{"observed_pct":round(100*removed,2),"chance_pct":neg_pct,
                            "ratio":round(removed/(neg_pct/100.0),2)},
-                "n_final":int(keep.sum()),"pct_final":round(100*float(keep.mean()),2)})
+                "n_final":int(keep.sum()),"pct_final":round(100*float(keep.sum())/nrm,2)})
         else:
             keep=cand
             rec.update({"removal":None,"n_final":int(keep.sum()),
-                        "pct_final":round(100*float(keep.mean()),2)})
+                        "pct_final":round(100*float(keep.sum())/nrm,2)})
         if vf is not None:
             rec["density"]={"median_vf_final":round(float(_np.median(vf[keep])),4) if keep.sum() else None,
-                            "median_vf_all":round(float(_np.median(vf)),4)}
+                            "median_vf_all":round(float(_np.median(vf[rm])),4)}
         subs=[]
         for k in cl["children"]:
             dc=[um[g] for g in k["delta"] if g in um]
@@ -436,14 +366,15 @@ def _proc_scores(adata, ctx, cand_pct=_PROC_CAND_PCT, neg_pct=_PROC_NEG_PCT):
 def _onto_ctx(idx):
     """profiling/validate가 쓰는 도메인 컨텍스트(온톨로지 유도, fallback 포함)."""
     terms_all=(idx or {}).get("terms",{})
-    # ★ COMPARTMENT 분리 (2026-07-15): compartment term(neuropil/fiber tract)은 celltype이 아니므로 lineage/
-    #   specific/pan/sibling 유도 및 IDM(anchor/top)에서 제외한다 — state term을 top에서 빼는 것과 같은 취지.
-    #   제외 안 하면 neuropil/fiber-tract가 root=lineage로 잡혀 진짜 oligodendrocyte(MBP+)를 'fiber tract'
-    #   lineage로 오판한다. compartment 마커는 _ontology_gene_set(full idx)엔 남아 신호로 측정된다.
-    #   comp={} (비-CNS wing)이면 idx 그대로 통과 → 완전 무영향.
-    comp=_compartment_ctx(idx)
+    # ★ PROCESS 분리 (2026-07-15, 게이트 일반화 2026-07-21): tier='process' term(neuropil/fiber tract 등)은
+    #   celltype이 아니므로 lineage/specific/pan/sibling 유도 및 IDM(anchor/top)에서 제외한다 — state term을
+    #   top에서 빼는 것과 같은 취지. 제외 안 하면 neuropil/fiber-tract가 root=lineage로 잡혀 진짜
+    #   oligodendrocyte(MBP+)를 'fiber tract' lineage로 오판한다(process module은 KG에 남아 있으므로 필수).
+    #   process 마커는 _ontology_gene_set(full idx)엔 남아 scoring-based annotation이 측정한다. process term이
+    #   없는 module이면 idx 그대로 통과 → 완전 무영향.
+    _has_proc=any((t.get("T") or "") in _PROC_TIERS for t in terms_all.values())
     idx_ct=({**(idx or {}), "terms":{tid:t for tid,t in terms_all.items() if (t.get("T") or "") not in _PROC_TIERS}}
-            if comp else idx)
+            if _has_proc else idx)
     terms=(idx_ct or {}).get("terms",{})
     return {"lineages": _derive_lineages(idx_ct) or {k:set(v) for k,v in _LINEAGE_FALLBACK.items()},
             "specific": _derive_specific(idx_ct) or set(_SPECIFIC_FALLBACK),
@@ -456,7 +387,6 @@ def _onto_ctx(idx):
             "pan_disc": _derive_pan(idx_ct, 12) or set(_PAN_FALLBACK),
             "siblings": _sibling_groups(idx_ct),
             "terms": terms,
-            "compartment": comp,   # ★ NEW: tier='compartment' 마커 컨텍스트(비-CNS wing이면 {} → 비활성)
             "cp": (idx or {}).get("cp") or [],   # confusion pairs from slim-index → surfaced by _graph_evidence
             "ca": (idx or {}).get("ca") or [],   # context axes (zonation/layer) → surfaced by _context_axis_eval (§4.3)
             "sa": (idx or {}).get("sa") or [],   # state axes (base-agnostic cell states) → surfaced by _state_axis_eval
@@ -464,7 +394,7 @@ def _onto_ctx(idx):
 
 def _context_axis_eval(lineage_label, ca, fon, lf, pin, gidx_U, lean_ratio=1.15, sig_floor=0.03, extra_labels=None):
     """★ Context-axis subtyping (§4.3) — DETERMINISTIC engine support. lineage의 subtype이 세포-내재 마커가
-    아니라 *공간 위치*(zonation/layer)로 갈리는 경우, wing이 선언한 ca 축의 pole별 context_markers(=이웃 우세
+    아니라 *공간 위치*(zonation/layer)로 갈리는 경우, module이 선언한 ca 축의 pole별 context_markers(=이웃 우세
     세포형 마커, 분할데이터선 ambient)를 점수화해 dominant pole→subtype을 제안한다. lineage는 graph_evidence가
     내재마커로 이미 확정(여기선 절대 안 바꿈) — pole은 subtype 축에만 적용. off-panel context 마커는 스킵.
     ★ WEAK-LEAN (2026-06-21): zonation은 연속체라 신호가 약하다 — 강한 우세를 요구하면 대부분 bare class로
@@ -763,14 +693,14 @@ def _build_ident_maps(octx, genes, pan_n=12):
             "lin_idx":lin_idx,"lin_class":lin_class,"root":{tid:root(tid) for tid in terms},
             "genes":list(genes), "P":{tid:[p for p in (t.get("P") or []) if p in terms] for tid,t in terms.items()}}
 
-# ★ ANATOMICAL REGION-PRESENCE GATE (F-B, 2026-06-22) — brain wing force-fit 차단.
+# ★ ANATOMICAL REGION-PRESENCE GATE (F-B, 2026-06-22) — brain module force-fit 차단.
 #   배경: 저감도 spatial(Stereo-seq)에서 정체성 약한 클러스터가, KG의 promiscuous region-exclusive 마커가
 #   noise로 ON 되며 **절편에 존재하지도 않는 region**(소뇌/뇌교)의 rare nucleus로 force-fit됨(예: 시상 뉴런
 #   749개가 cerebellar unipolar brush cell로). KG region 마커로는 부재 판정이 불가(promiscuous → cerebellar
 #   GABA가 thalamic보다 높게 나옴 = 정상 차단 회귀)이므로, **curated anatomical-region 마커**(아래)로 데이터셋
 #   수준 존재 여부를 1회 판정해, 부재 region의 region-group을 dominant/anchor 후보에서 제외한다.
 #   anatomical(coarse) 수준이라 weak-marker 하위(SNr=midbrain GABAergic; midbrain union이 Th/Slc6a3 포함)는
-#   부당 차단되지 않음. 비-brain wing은 region-group 라벨이 매칭 안 돼 게이트 비활성(무영향).
+#   부당 차단되지 않음. 비-brain module은 region-group 라벨이 매칭 안 돼 게이트 비활성(무영향).
 #   검증(stereoseq_brain): PRESENT hippocampus11%/cortex7.9/thalamus4.3/striatum3.1/midbrain2.5/amygdala2.2
 #   vs ABSENT olfactory_bulb0.026/pons-medulla0.024/cerebellum0.007 (present_thr=0.002로 명백 부재만 차단).
 BRAIN_ANAT_MARKERS = {
@@ -887,7 +817,7 @@ def _graph_evidence(fon, lf, pin, IDM, octx, frac=0.30, lf_on=1.5, pin_min=0.25,
         #   folded in (computed in _profile_leaves). Applied ONLY here (positive anchors) + ONLY region_gated —
         #   so negatives(on_anchor)/region-scoring stay STRICT. (2026-07-02: on_present(lineage) ALSO uses pin_floor —
         #   region-agnostic — for rare-lineage recovery; safe because codom identity still requires disc_on, see on_present.)
-        #   None (default/off) ⇒ predicate identical to before (zero change to existing wings). Recovers Rspo1→L4;
+        #   None (default/off) ⇒ predicate identical to before (zero change to existing modules). Recovers Rspo1→L4;
         #   Rorb/Etv1 stay off (low fold+high global detection). auc bars unchanged (already rank-normalized).
         def on_pos(g): return on_anchor(g) or (region_gated and auc is not None and auc[g]>=auc_pos) \
             or (region_gated and pin_floor is not None and lf[g]>=lf_on and pin[g]>=pin_floor[g]) \
@@ -1492,9 +1422,33 @@ def _mimicry_terms(idx):
         out[tid]={"L":t.get("L",tid),"D":(t.get("D") or "normal"),"A":A,"MP":MP,
                   "R":list(t.get("R") or []),"S":list(t.get("S") or []),"DF":list(t.get("DF") or []),
                   "P":list(t.get("P") or []),"Qspec":Qspec}
+    # ★ StateAxis 기반 transition (2026-07-26): mimics+anchor_markers 를 가진 StateAxis(sa)도 transition
+    #   후보로 흡수한다. StateAxis 재구조화로 EMT/EndMT/dedifferentiation 등이 Term-level A/MP 에서 sa 로
+    #   옮겨졌으므로, 여기서 통합해 leaf 판정 시 false-split 가드를 유지한다(상피 base + mesenchymal program
+    #   = EMT state 이지 상피/mesenchymal 혼합 아님 → split 금지). StateAxis.markers 는 이미 큐레이션된
+    #   program signature 이므로 share 필터 없이 (anchor 제외) 그대로 Qspec 으로 쓴다.
+    def _dd(seq):
+        s=set(); o=[]
+        for g in seq:
+            u=str(g).upper()
+            if u and u not in s: s.add(u); o.append(g)
+        return o
+    for st in ((idx or {}).get("sa") or []):
+        mim=st.get("mimics"); name=st.get("name")
+        if not (mim and name): continue
+        A=[str(x) for x in (st.get("anchor_markers") or [])]
+        prog=[str(x) for x in (st.get("markers") or [])]
+        if not (A and prog): continue
+        _A={x.upper() for x in A}
+        Qspec=_dd([g for g in prog if g.upper() not in _A])          # 흉내 program = anchor 제외 program 마커
+        if not Qspec: continue
+        out["SA:"+str(name)]={"L":str(name),"D":"normal","A":_dd(A),
+                  "MP":[{"lineage":mim,"program":str(name)}],
+                  "R":[],"S":[],"DF":[],"P":[],"Qspec":Qspec,
+                  "of":[str(x) for x in (st.get("of") or [])]}       # origin lineages (STATE_OF 대상)
     return out
 def _state_terms(idx):
-    """Wing의 모든 state term(tier=state 또는 dev/reactive 키워드)을 추출.
+    """Module의 모든 state term(tier=state 또는 dev/reactive 키워드)을 추출.
     ★ disease는 필터가 아니라 힌트(2026-06-22): --disease 미지정이어도 이 term들을 leaf별 disease_candidates로
     항상 surface해, 마커가 우세하면 agent가 그 state로 판정할 수 있게 한다(SKILL §7). disease 지정 시 _disease_terms와
     교차해 hint=True 표시. 반환 {tid:{L,D,R,S,DF}}."""
@@ -1933,57 +1887,9 @@ def _profile_leaves(X, genes, leaf_arr, leaves, ont_gene_set, ont_protected,
             # ★ graph-descent EVIDENCE — the redesigned primary identity substrate (the agent reasons over
             #   the KG it built). identity_scores is kept only as a supplementary absolute-fold summary.
             entry["graph_evidence"]=_graph_evidence(fon, lf, pin, IDM, octx, mean=mi, auc=auc, restrict_root=restrict_root, auc_pos=auc_pos, absent_rg=absent_rg, pin_floor=_pf, fon_floor=_ff)
-            # ★ COMPARTMENT 신호 (2026-07-15, 2026-06-18 neuropil 일반화): 세포체가 아니라 조직 구획(뉴런 사이
-            #   시냅스 mesh=neuropil / 축삭 다발=fiber tract)인지. KG tier='compartment' layer(octx["compartment"])로
-            #   판정 — 하드코딩 마커셋 없음, 비-CNS wing({})은 완전 비활성. 게이트 3조건(neuropil 원본과 동일):
-            #   (a) 저밀도(density.low_frac≥0.5), (b) compartment 마커가 up(ENRICHED, R1)에 우세, (c) 세포유형
-            #   SPECIFIC anchor 부재. neuropil_pan enriched(≥3) AND neuropil_neg NOT enriched → type=neuropil, 그 중
-            #   transmitter subtype 델타가 실제 ENRICHED(deepest-REAL)면 그 subtype으로, 아니면 bare 'neuropil'.
-            #   fibertract_pos enriched(≥3) AND fibertract_neg(SOX10/OLIG2) NOT enriched → type='fiber tract'.
-            #   ★ 2026-07-17 대칭화: neuropil도 fiber tract와 같은 pos-AND-NOT-neg 형태. 시냅스 마커(Snap25/Camk2a
-            #   등)는 소마와 neuropil이 공유하므로 pos만으론 뉴런 소마와 안 갈린다 — KG neuropil term의 N(핵-보유
-            #   전사체; MALAT1은 핵 보유가 문헌 확립: Wilusz 2008 Cell)이 ENRICHED면 소마이지 neuropil이 아니다.
-            #   KG에 neuropil N이 없는 wing은 _np_neg=∅ → 조건이 항상 참 → 기존 동작과 완전 동일(회귀 없음).
-            #   scRNA엔 neuropil 격자점이 없어 거의 안 뜸(저밀도 드뭄). 'neuropil' 키는 back-compat alias로 유지.
-            _ge=entry["graph_evidence"]; _dens=(identity.get("density") or {})
-            _lowf=_dens.get("low_frac")
-            _comp=octx.get("compartment") or {}
-            _up_enr={_U(r[0]) for r in (up or [])}                          # ENRICHED(vs-rest auc≥auc_up) 마커 = R1 신호
-            _np_pan=_comp.get("neuropil_pan") or (_NEUROPIL_MK if _comp else set())   # 폴백: neuropil term 비어있으면 상수
-            _np_neg=_comp.get("neuropil_neg") or set()
-            _ft_pos=_comp.get("fibertract_pos") or set()
-            _ft_neg=_comp.get("fibertract_neg") or set()
-            _syn=sorted(_up_enr & _np_pan)                                  # ENRICHED synaptic 마커
-            _mye=sorted(_up_enr & _ft_pos)                                  # ENRICHED myelin 마커
-            _np_neg_on=sorted(_up_enr & _np_neg)                           # 핵-보유 전사체 ENRICHED → 뉴런 세포체(NOT neuropil)
-            _ft_neg_on=sorted(_up_enr & _ft_neg)                           # SOX10/OLIG2 ENRICHED → oligo 세포체(NOT fiber tract)
-            _spec_anchor=any((a.get("tier") in ("subclass","supertype","cluster")) for a in (_ge.get("anchors") or []))
-            _no_anchor=(not _spec_anchor)
-            _ctype=None; _clab=None; _cid=""
-            if _comp and _lowf is not None and _lowf>=0.5 and _no_anchor:
-                if len(_syn)>=3 and not _np_neg_on:
-                    _ctype="neuropil"; _clab="neuropil"; _cid=_comp.get("neuropil_id") or ""
-                    # deepest-REAL transmitter subtype: 델타 마커가 실제 ENRICHED인 것 중 최다, 없으면 bare neuropil.
-                    _best=None; _bn=0
-                    for _sl,_dm in (_comp.get("subtype_delta") or {}).items():
-                        _on=_up_enr & {str(g).upper() for g in _dm}
-                        if len(_on)>=1 and len(_on)>_bn: _best=_sl; _bn=len(_on)
-                    if _best: _clab=_best; _cid=(_comp.get("label2id") or {}).get(_best, _cid)
-                elif len(_mye)>=3 and not _ft_neg_on:
-                    _ctype="fiber tract"; _clab="fiber tract"; _cid=_comp.get("fibertract_id") or ""
-            _cand=bool(_ctype)
-            entry["compartment"]={"low_frac":_lowf,"synaptic_top":_syn[:8],"n_synaptic":len(_syn),
-                                  "neuropil_neg_on":_np_neg_on[:8],"n_neuropil_neg":len(_np_neg_on),
-                                  "myelin_top":_mye[:8],"n_myelin":len(_mye),
-                                  "fibertract_neg_on":_ft_neg_on[:8],"n_fibertract_neg":len(_ft_neg_on),
-                                  "no_specific_anchor":_no_anchor,
-                                  "candidate":_cand,"compartment_type":_ctype,
-                                  "compartment_term_id":_cid,"compartment_label":_clab}
-            # back-compat alias: legacy 'neuropil' 키 유지(다른 코드/agent가 읽을 수 있음). neuropil-type일 때만 candidate.
-            entry["neuropil"]={"low_frac":_lowf,"synaptic_top":_syn[:8],"n_synaptic":len(_syn),
-                               "neuropil_neg_on":_np_neg_on[:8],"n_neuropil_neg":len(_np_neg_on),
-                               "no_specific_anchor":_no_anchor,
-                               "candidate":bool(_ctype=="neuropil")}
+            # (구 Step 0.5 cluster-level compartment(neuropil/fiber tract) emission은 2026-07-21 제거 —
+            #  process는 clustering-based 경로에서 라벨하지 않는다. 사용자가 명시 요청하는 scoring-based
+            #  annotation(score-profile/apply/finalize)이 유일한 process 탐지 경로다.)
             # DF-confirmed terms in this leaf (a DEFINING marker is fold-ON: log2fold>=1.5 AND detected>=25%).
             # Used by the finalize split-review gate (§8.1) + DF_MULTI_SUBTYPE to flag splits with a real 2nd identity.
             # ★ LINEAGE-GATED (2026-06-17): leaf의 dominant lineage(graph_evidence.lineage)에 속한 term만 df_present에
@@ -2017,7 +1923,7 @@ def _profile_leaves(X, genes, leaf_arr, leaves, ont_gene_set, ont_protected,
                 _hi=(gmu_arr+gsd_arr) if (gmu is not None and gsd is not None) else None
                 _exm=_exclusive_mixture(_Xl, IDM, octx, _exm_lin, genes_arr, hi_thr=_hi)
                 if _exm: entry["exclusive_mixture"]=_exm
-            # ★ CONTEXT-AXIS (§4.3, 2026-06-21) — DETERMINISTIC zonation/layer subtyping. lineage가 wing 선언
+            # ★ CONTEXT-AXIS (§4.3, 2026-06-21) — DETERMINISTIC zonation/layer subtyping. lineage가 module 선언
             #   ca축의 applies_to면 pole별 context_markers 점수화 → mixed(≥2 pole 존재)면 부모에서 분할대상,
             #   sub-leaf면 dominant_pole→suggested_subtype 제안. lineage는 graph_evidence가 확정(여기선 불변).
             _ge_ca=entry.get("graph_evidence") or {}
@@ -2043,7 +1949,7 @@ def _profile_leaves(X, genes, leaf_arr, leaves, ont_gene_set, ont_protected,
                 entry["state_axis"]=_sax
             # ★ disease_candidates — disease는 필터가 아니라 힌트(2026-06-22). _is_state_term이 정상 scoring
             #   코어(top/coh/chimera)에서 state를 빼므로(broad 마커 force-fit 방지) 여기서 별도 노출하되, --disease
-            #   미지정이어도 wing의 모든 state term(st_terms)을 항상 surface한다 → 마커가 우세하면 agent가 그 state로
+            #   미지정이어도 module의 모든 state term(st_terms)을 항상 surface한다 → 마커가 우세하면 agent가 그 state로
             #   판정 가능(SKILL §7). --disease 매칭분(dz_terms)은 hint=True로 표시·우선정렬. 같은 ON 정의 사용.
             _src = st_terms if st_terms else dz_terms
             if _src:
@@ -2141,6 +2047,54 @@ def _vf_setup(adata):
         return vf, float(np.percentile(vf,25))
     return None, None
 
+def _check_input_matrix(adata, force=False):
+    """init 진입 게이트: 표준 annotator는 adata.X만 읽는다(--layer 없음). 두 전제를
+    검증한다 — X=log-normalized(정수 raw count 아님), var_names=gene symbol(Ensembl ID 아님).
+    둘 다 위반해도 파이프라인은 조용히 완주하지만 라벨은 쓰레기가 된다(마커축 통계가 lognorm을
+    가정, 마커 매칭이 심볼 기준). 그래서 여기서 fail-fast. --force로 무시 가능(비표준 입력 자인)."""
+    import re as _re
+    X=adata.X
+    n=adata.n_obs
+    # ---- 표본 추출(대형 h5ad 전체를 densify하지 않도록 앞 N행만) --------------------
+    rows=min(n,2000)
+    Xs=X[:rows]
+    Xs=np.asarray(Xs.todense()) if hasattr(Xs,"todense") else np.asarray(Xs)
+    Xs=Xs.astype(np.float64, copy=False)
+    problems=[]
+    # ---- (1) var_names = gene symbol? --------------------------------------------
+    vn=[str(g) for g in adata.var_names[:200]]
+    ens=sum(1 for g in vn if _re.match(r'^ENS[A-Z]*[GT]?\d{6,}(\.\d+)?$', g) or _re.match(r'^ENSMUS[GT]\d', g))
+    if vn and ens/len(vn) > 0.5:
+        ex=next((g for g in vn if g.upper().startswith("ENS")), vn[0])
+        problems.append(f"var_names가 gene symbol이 아니라 Ensembl ID로 보입니다(표본 {ens}/{len(vn)}개, 예: '{ex}'). "
+                        f"마커는 심볼(EPCAM, Snap25)로 매칭하므로 Ensembl ID면 마커가 하나도 안 잡힙니다. "
+                        f"adata.var_names를 gene symbol로 바꾸세요.")
+    # ---- (2) X = log-normalized? (정수 raw count 감지) ---------------------------
+    finite=Xs[np.isfinite(Xs)]
+    if finite.size:
+        if np.any(finite < 0):
+            problems.append("X에 음수가 있습니다 — log-normalized가 아닌 정규화로 보입니다"
+                            "(z-scored/scaled, 또는 Pearson residual 등). "
+                            "annotator는 비음수 log-normalized X를 기대합니다 — scale/residual 이전 단계를 사용하세요.")
+        else:
+            nz=finite[finite>0]
+            allint = nz.size>0 and np.allclose(nz, np.round(nz))
+            xmax=float(finite.max())
+            # log-normalized X는 log1p 결과라 사실상 절대 all-integer가 아니다 → all-integer면 raw count.
+            # (max 임계에 의존하지 않는다: 저심도 데이터도 걸러야 하고, max>1 은 binary mask 오탐만 배제.)
+            if allint and xmax>1:
+                problems.append(f"X가 정수 raw count로 보입니다(비영 값이 전부 정수, max={xmax:.0f}). "
+                                f"annotator는 log-normalized X를 기대합니다(count는 마커축 통계를 왜곡). "
+                                f"sc.pp.normalize_total(adata, target_sum=1e4) 후 sc.pp.log1p(adata)를 적용하세요.")
+    if problems:
+        msg="\n".join(f"   • {p}" for p in problems)
+        if force:
+            print(f"[init][WARN:INPUT_MATRIX] 입력 전제 위반(--force로 강행):\n{msg}", flush=True)
+        else:
+            sys.exit(f"[init][ERROR:INPUT_MATRIX] 입력 h5ad가 annotator 전제를 위반합니다:\n{msg}\n"
+                     f"   → 고친 뒤 다시 실행하거나, 비표준 입력임을 인지하고 강행하려면 --force. "
+                     f"→ caller는 사용자에게 위 문제를 그대로 전달할 것.")
+
 # ===================================================================== init
 def cmd_init(a):
     os.makedirs(a.out, exist_ok=True)
@@ -2148,19 +2102,12 @@ def cmd_init(a):
     adata=ad.read_h5ad(a.h5ad)
     if a.cluster_col not in adata.obs:
         sys.exit(f"[init] obs에 cluster 컬럼 '{a.cluster_col}' 없음. 사용가능: {list(adata.obs.columns)}")
+    _check_input_matrix(adata, force=getattr(a,"force_input",False))   # X=lognorm / var_names=symbol 전제 검증
     cps=adata.obs[a.cluster_col].astype(str).values.copy()
-    # ★ 빈 클러스터 라벨 = **annotation 대상 아님** (2026-07-17). process-cluster는 cell 벡터만
-    #   Leiden하고 process/background 벡터엔 leiden=''를 남긴다. ''를 leaf로 만들면 수만 개의
-    #   process 벡터가 하나의 '클러스터'로 뭉쳐 세포형 라벨을 받는다 — 정확히 Step P가 막으려던 일이다.
-    #   process 벡터의 라벨은 Step P.2(KG subtype)가 따로 만든다. reference(R1의 "전체 데이터셋")에는
-    #   그대로 남긴다 — 그게 실제 조직이고, 빼면 R1 기준선이 바뀐다.
-    _NOT_A_TARGET={"", "nan", "none", "na"}
-    leaves=sorted({c for c in set(cps.tolist()) if str(c).strip().lower() not in _NOT_A_TARGET},
+    # 사용자가 준 cluster/annotation 컬럼의 모든 라벨이 leaf(=annotation 대상). clustering-based
+    #   annotation은 사용자 클러스터링(외부/노트북)을 그대로 입력받는다.
+    leaves=sorted(set(cps.tolist()),
                   key=lambda s:[int(x) for x in s.split(".")] if s.replace('.','').isdigit() else [10**9,s])
-    _skipped=int(sum(1 for c in cps if str(c).strip().lower() in _NOT_A_TARGET))
-    if _skipped:
-        print(f"[init] cluster '{a.cluster_col}'가 빈 벡터 {_skipped}개는 annotation 대상에서 제외 "
-              f"(process/background — Step P.2가 따로 라벨). reference에는 포함.", flush=True)
     # ★ subcluster 표현공간(use_rep): subcluster의 neighbors를 통합 임베딩(scVI 등)에서 재계산.
     #   미지정('auto')이면 obsm에서 통합 임베딩 자동탐지; 'recompute'/'none'이면 raw 대신 normalize+log1p+PCA fallback.
     #   (예전 동작=raw count PCA는 stress/library-size에 지배돼 정체성 분할 실패 → 더 이상 기본 아님.)
@@ -2175,9 +2122,9 @@ def cmd_init(a):
                  "(또는 --use-rep recompute 로 normalize+log1p+PCA 재계산).")
     print(f"[init] subcluster representation: {rep or 'recompute (normalize_total+log1p+PCA)'}", flush=True)
     # ★ subcluster metric/n_neighbors는 **초기 클러스터링과 반드시 같아야** 한다(다르면 조용히 틀어짐).
-    #   process-cluster가 자기가 쓴 값을 uns['cellman_cluster_params']에 남기므로 여기서 그대로 상속한다 —
-    #   캘러가 --subcluster-*로 다시 넘길 필요가 없고, 다시 넘기게 하면 어긋날 여지만 생긴다.
-    #   (플래그는 back-compat로 남아 있고, 주면 uns를 이깁니다. 외부에서 클러스터링해 온 h5ad용.)
+    #   입력 h5ad를 만든 클러스터링(사용자 노트북/외부)이 uns['cellman_cluster_params']에 metric/n_neighbors를
+    #   남겨두면 여기서 그대로 상속한다 — 없으면 기본(euclidean/15). --subcluster-metric/-n-neighbors로 직접
+    #   지정하면 uns를 이깁니다(외부에서 다른 설정으로 클러스터링해 온 h5ad용).
     _cp={}
     try:
         _raw=adata.uns.get("cellman_cluster_params")
@@ -2204,11 +2151,11 @@ def cmd_init(a):
         if not (a.species and a.organ):
             sys.exit("[init] --species/--organ 가 필요합니다(또는 --ontology-url / 로컬 --ontology). "
                      "서버는 자동으로 기본 Cell-Ontology 서버에 연결됩니다.")
-        url=f"{_resolve_server(a.server_url)}/wing/{a.species}/{a.organ}/slim-index"
-        print(f"[init] ontology server: {_resolve_server(a.server_url)} (wing {a.species}/{a.organ})", flush=True)
+        url=f"{_resolve_server(a.server_url)}/module/{a.species}/{a.organ}/slim-index"
+        print(f"[init] ontology server: {_resolve_server(a.server_url)} (module {a.species}/{a.organ})", flush=True)
     idx=_fetch_slim_index(a.out, url, a.ontology)
     if not idx or not _ontology_gene_set(idx):
-        sys.exit("[init] FATAL: ontology(slim-index) 비어있음 — 서버/ wing 확인. ontology-blind 금지.")
+        sys.exit("[init] FATAL: ontology(slim-index) 비어있음 — 서버/ module 확인. ontology-blind 금지.")
     ogs=_ontology_gene_set(idx); prot=_ontology_protected(idx); octx=_onto_ctx(idx)
     print(f"[init] ontology markers {len(ogs)} (protected {len(prot)}); lineages {len(octx['lineages'])} "
           f"(derived={'yes' if _derive_lineages(idx) else 'fallback'})", flush=True)
@@ -2225,7 +2172,7 @@ def cmd_init(a):
     print(f"[init] state terms {len(st_terms)} → leaf별 disease_candidates로 항상 surface (disease=힌트; 판정은 agent §7)"
           + (f"; --disease='{a.disease}' 매칭 {len(dz_terms)}개 hint" if a.disease else "; --disease 미지정(모든 state 고려)"), flush=True)
     # ★ F-B: anatomical region-presence 게이트 (전체 데이터 1회 계산 → persist). 부재 region(소뇌/뇌교 등)을
-    #   anchor/dominant/floor 후보에서 제외해 force-fit 차단. brain-anat 매칭 region-group만 영향(비-brain wing 무영향).
+    #   anchor/dominant/floor 후보에서 제외해 force-fit 차단. brain-anat 매칭 region-group만 영향(비-brain module 무영향).
     absent_rg, _rpres = _absent_region_groups(X, list(adata.var_names), octx, gmu, gsd)
     _rlab=_build_ident_maps(octx, np.asarray(list(adata.var_names)))["lab"]
     json.dump({"absent_region_groups":sorted(absent_rg),
@@ -2442,8 +2389,9 @@ def _validate(decisions, st, out):
         if dec=="celltype":
             _verd=_ge.get("verdict"); _linc=str(_ge.get("lineage") or "").strip().lower()
             _ll=str(d.get("label","")).strip().lower()
-            if (_verd=="class_or_unknown" and _ll and _ll!=_linc and _ll not in ("unknown","background","neuropil")
-                    and not _ll.endswith("neuropil") and _ll!="fiber tract"):   # compartment 라벨은 force-fit 검사 면제
+            _is_proc_term=((idx.get((d.get("term_id") or "").strip(),{}) or {}).get("T") in _PROC_TIERS)
+            if (_verd=="class_or_unknown" and _ll and _ll!=_linc and _ll not in ("unknown","background")
+                    and not _is_proc_term):   # scoring-based process 라벨은 force-fit 검사 면제
                 # ★ 라벨 고유 마커(R∪DF)가 클러스터 강한 up에 하나도 없을 때만 flag (astrocyte Aqp4 등 마커 ON이면 정당 → 면제).
                 _tid=(d.get("term_id") or "").strip(); _term=idx.get(_tid) or {}
                 _mk={_U(g) for g in ((_term.get("R") or [])+(_term.get("DF") or []))}
@@ -2483,7 +2431,7 @@ def _validate(decisions, st, out):
                         f"label을 '{_ax['suggested_subtype']}'로 변경(reason_code=context_axis, confidence={_ax.get('pole_confidence') or 'low'}). 내재 off-panel 마커가 아니라 pole context로 판정.")
             # ★ over-split 일반 규칙 (2026-06-23): "magnitude-only subtype" = subtype 라벨인데 부모 class를 구별하는
             #   *고유* 변별마커가 ON이 아님 → 공유마커의 발현 *크기*만으로의 분할 → 부모 class로 collapse. 하드코딩 0
-            #   (KG 계층+데이터로만 분기), 모든 wing 적용. 진짜 subtype(L4=Rorb·CA3=Grik4·Opalin+ oligo)은 고유마커 ON이라 유지.
+            #   (KG 계층+데이터로만 분기), 모든 module 적용. 진짜 subtype(L4=Rorb·CA3=Grik4·Opalin+ oligo)은 고유마커 ON이라 유지.
             #   #1=일반 subtype(term-마커 differential), #2=context-axis pole(cross-leaf 반대극 존재). 둘로 나눈 이유:
             #   liver zonation pole(ambient context로 분리)은 per-leaf differential로 판정 불가 → 반대극 공존으로만 진짜/noise 구분.
             _ca_pole_subs=set()
@@ -2518,23 +2466,16 @@ def _validate(decisions, st, out):
                         add(lf,"CONTEXT_AXIS_LONELY_POLE","warn",
                             f"context axis '{_ax['axis']}'의 '{d.get('label')}' pole로 라벨됐으나 반대 극({sorted(_others)})이 어떤 클러스터에도 없음 — 축이 실제로 분리 못 한 단일-극 noise lean(진짜 zonation이면 양극이 모두 떠야).",
                             f"부모 class '{_Cl or 'parent'}'로 라벨 변경(반대 극이 실제로 나타나면 그때 pole 분할). cross-leaf 판정 — liver(양극 공존)는 유지됨.")
-            # ★ COMPARTMENT (tissue 구획: neuropil / typed neuropil / fiber tract) — KG celltype이 아니라 조직 구획.
-            #   term_id는 REAL compartment KG id 또는 legacy "" 둘 다 허용(Background/Unknown처럼). candidate 검증만
-            #   하고 celltype 검사(REQUIRED_ABSENT_ONPANEL 등)는 건너뛴다(continue). compartment 신호(candidate)가
-            #   떴고 specific anchor 없을 때 agent가 쓰는 정직한 종착 라벨.
-            _is_comp=(_lab_l=="neuropil" or _lab_l=="fiber tract" or _lab_l.endswith("neuropil")
-                      or (idx.get(tid,{}) or {}).get("T") in _PROC_TIERS)
-            if _is_comp:
-                _npc=(p.get("compartment") or p.get("neuropil") or {})
-                if not _npc.get("candidate"):
-                    add(lf,"COMPARTMENT_UNSUPPORTED","warn",
-                        f"'{d.get('label')}'(tissue compartment)인데 compartment 신호 약함(low_frac={_npc.get('low_frac')}, n_synaptic={_npc.get('n_synaptic')}, n_myelin={_npc.get('n_myelin')}, specific_anchor={not _npc.get('no_specific_anchor')}).",
-                        "저밀도 + compartment 마커 ENRICHED + 세포유형 anchor 부재일 때만 compartment. 세포체 마커/anchor가 있으면 그 celltype으로, 아니면 계통 class/Unknown.")
-                elif _lab_l=="fiber tract" and _npc.get("compartment_type")!="fiber tract":
-                    add(lf,"COMPARTMENT_UNSUPPORTED","warn",
-                        "'fiber tract' 라벨인데 myelin 신호 부족 또는 oligo 세포체 음성마커(SOX10/OLIG2)가 ENRICHED — oligodendrocyte 세포체 오라벨 가능.",
-                        "fiber tract = myelin 마커 ENRICHED AND SOX10/OLIG2 clean일 때만. 세포체면 oligodendrocyte celltype으로.")
-                continue                                          # compartment → celltype 검사 skip
+            # ★ PROCESS (tier='process' — neuropil / fiber tract 등)은 celltype이 아니라 scoring-based
+            #   annotation이 다루는 조직 process다. clustering-based 결정 JSON에는 원칙적으로 나오지 않지만,
+            #   혹시 process term_id가 실려 있으면 celltype 검사(REQUIRED_ABSENT_ONPANEL 등)를 건너뛴다(continue).
+            #   process 탐지는 score-profile/apply/finalize로 하라는 안내를 warn으로 남긴다.
+            _is_proc=((idx.get(tid,{}) or {}).get("T") in _PROC_TIERS)
+            if _is_proc:
+                add(lf,"PROCESS_IN_CLUSTERING","warn",
+                    f"'{d.get('label')}'은 tier='process'(조직 process) — clustering-based annotation은 이를 라벨하지 않는다.",
+                    "process(neuropil/fiber tract 등)는 scoring-based annotation(score-profile→score-apply→score-finalize)으로 찾으세요.")
+                continue                                          # process → celltype 검사 skip
             elif not tid or (idx and tid not in idx):
                 add(lf,"BAD_TERM_ID","error",
                     f"celltype인데 term_id가 비었거나 온톨로지에 없음(term_id='{tid}').",
@@ -3075,7 +3016,7 @@ def _finalize_review(decisions, st, out, max_depth=1, large_min_n=1500):
         d=decisions.get(lf)
         if not d or d.get("decision")!="celltype": continue
         if bool(d.get("subclass_resolved",True)): continue                  # only class/region FLOORS (agent stopped short)
-        if (d.get("reason_code") or "") in ("panel_limited","neuropil","fiber_tract"): continue
+        if (d.get("reason_code") or "") in ("panel_limited",): continue
         n=int(ncnt.get(lf,0))
         if n<large_min_n: continue
         _p=prof.get(lf) or {}
@@ -3207,7 +3148,7 @@ def cmd_finalize(a):
     #   → "CD8 T cell, proliferating, interferon-stimulated". Source per leaf = the agent's explicit
     #   dec["states"] override if set, else the engine's `state_axis` (ENRICHED program markers) from the
     #   latest profile. Only for `celltype` decisions; states already named in the base label are dropped.
-    #   Wings without a state axis (sa empty) get nothing → fully additive.
+    #   Modules without a state axis (sa empty) get nothing → fully additive.
     _state_of={}
     for _r in range(1, int(st.get("round",1))+1):
         _pf=os.path.join(a.out, f"cluster_gene_profiles_round{_r}.json")
@@ -3243,8 +3184,9 @@ def cmd_finalize(a):
         return (not appl) or bool(base_lins & appl)      # empty applies_to = GLOBAL state → always ok
     def _synth(path, base, dec):
         base_s=str(base); _bl=base_s.strip().lower()
-        if ((dec.get("decision") or "")!="celltype" or base_s in ("","Background","Unknown","neuropil")
-                or _bl.endswith("neuropil") or _bl=="fiber tract"):   # compartment 라벨엔 state 미부착
+        _is_proc=((_gterms.get((dec.get("term_id") or "").strip(),{}) or {}).get("T") in _PROC_TIERS)
+        if ((dec.get("decision") or "")!="celltype" or base_s in ("","Background","Unknown")
+                or _is_proc):   # scoring-based process 라벨엔 state 미부착
             return base_s
         states=dec.get("states")
         if states is None: states=_state_of.get(path, [])
@@ -3332,6 +3274,8 @@ def _helper_cli():
     pi.add_argument("--server-url",dest="server_url",default=None)   # 보통 불필요(기본 서버 자동연결)
     pi.add_argument("--ontology-url",dest="ontology_url",default=None)  # 전체 URL 직접지정(고급)
     pi.add_argument("--ontology",default=None); pi.add_argument("--output",default=None)
+    pi.add_argument("--force",dest="force_input",action="store_true",
+                    help="입력 행렬 검증(X=lognorm / var_names=symbol)을 경고로 낮추고 강행. 비표준 입력임을 인지한 경우만.")
     pi.add_argument("--disease",default=None,help="입력 데이터의 질병 컨텍스트(예: 'brain cancer'). 그 질병의 state term을 leaf별 disease_candidates로 surface(§7).")
     pi.add_argument("--use-rep",dest="use_rep",default="auto",
                     help="subcluster의 neighbors를 계산할 표현공간(obsm key, 예 X_scVI). "
@@ -3383,7 +3327,7 @@ def _helper_cli():
 
 
 # ===================================================================================
-# annotate-mode-v2 additions — marker-axis split (subcluster) + KG descent (descend)
+# annotate-mode additions — marker-axis split (subcluster) + KG descent (descend)
 # ===================================================================================
 # ---------------------------------------------------------------- candidate marker axis (KG-aware)
 def _term_full_markers(terms, tid):
@@ -3561,7 +3505,7 @@ def cmd_descend(a):
     dominant_region/anchor 를 잡아 region/subtype 을 해상(층 마커가 희석에서 풀림). 자식 후보를 marker
     axis 로 써서 subcluster 코어에 그대로 위임. 반복(node→children→그 child node→…)은 agent 가 SKILL 대로.
 
-    사용: helper_v2.py descend --out O --paths '["cl3"]' --node "glutamatergic neuron"
+    사용: helper.py descend --out O --paths '["cl3"]' --node "glutamatergic neuron"
       → node 의 자식(neocortical/thalamic/hippocampal… glut)을 marker-axis 후보로 subcluster.
     STOP 조건(agent): 하강해도 sub-leaf 가 전부 부모와 같은 class 로 재판정되면 = 진짜 floor → 멈춘다."""
     idx = _load_ontology_index(a.out); terms = (idx or {}).get("terms", {})
@@ -3573,59 +3517,55 @@ def cmd_descend(a):
     print(f"[descend] node '{a.node}' → {len(kids)} KG children as marker-axis candidates: {kids[:6]}{'…' if len(kids)>6 else ''}", flush=True)
     cmd_subcluster(a)
 
-def _out_of_tissue(xy, bin_um=None, close_iter=3, min_frac=1e-4):
-    """조직 밖(out-of-tissue) 벡터를 **공간만으로** 찾는다. 마커 무관.
-    segmentation-free 벡터는 tissue 마스크에서 뽑히지만 Otsu 경계 밖으로 새는 고립 부유점이 남는다.
-    이건 발현이 아니라 **공간 구조** 문제 — lineage/핵/밀도 어느 마커로도 안 잡힌다(조직 밖 점도
-    ambient로 마커가 조금씩 있고, blur된 lineage-max는 0 근처가 바닥이라 못 내려간다).
-    방법: 벡터 위치를 격자 래스터화 → 형태학적 closing으로 조직 내부 gap 메움 → 최대 연결요소 +
-    fill holes = 조직 footprint → 마스크 밖 벡터 = 조직 밖. bin은 median 최근접거리에서 유도해
-    좌표 스케일(µm/bin/px)에 무관하다.
-    반환: bool 마스크(True=조직 밖). 점이 3개 미만이면 전부 False."""
-    import numpy as np
-    from scipy import ndimage as ndi
-    from scipy.spatial import cKDTree
-    xy=np.asarray(xy, float)
-    n=len(xy)
-    if n<3: return np.zeros(n, bool)
-    if bin_um is None:
-        med=float(np.median(cKDTree(xy).query(xy, k=2)[0][:,1]))
-        bin_um=max(med*4.0, 1e-9)                      # 격자 = 표본간격의 ~4배
-    x0,y0=xy[:,0].min(), xy[:,1].min()
-    ix=((xy[:,0]-x0)/bin_um).astype(int); iy=((xy[:,1]-y0)/bin_um).astype(int)
-    H,W=int(iy.max())+1, int(ix.max())+1
-    occ=np.zeros((H,W), bool); occ[iy,ix]=True
-    st=ndi.generate_binary_structure(2,2)
-    m=ndi.binary_closing(occ, structure=st, iterations=int(close_iter))
-    lab,nc=ndi.label(m)
-    if nc==0: return np.zeros(n, bool)
-    big=1+int(np.argmax(np.bincount(lab.ravel())[1:]))
-    tissue=ndi.binary_fill_holes(lab==big)
-    out=~tissue[iy,ix]
-    if out.mean()>0.5:                                 # 안전장치: 마스크가 뒤집혔으면(조직밖>50%) 무효
-        return np.zeros(n, bool)
-    return out
-
-
-def cmd_process_profile(a):
-    """판단 재료를 산출한다. **라벨을 쓰지 않는다** — 판정은 에이전트가 한다(annotate 원칙).
-    wing에 tier='process' term이 없으면 applicable=false로 끝 → 캘러는 그냥 기존 경로로 간다."""
-    import anndata as ad, json, os
-    url=None if a.ontology else f"{_resolve_server(a.server_url)}/wing/{a.species}/{a.organ}/slim-index"
+# ---------------------------------------------------------------- scoring-based helpers
+def _score_ctx_for(a):
+    """slim-index를 받아 _score_targets_ctx(idx, targets)를 돌린다. --targets(JSON list, 선택)=임의 KG class.
+    반환 (idx, ctx, targets)."""
+    import json
+    url=None if a.ontology else f"{_resolve_server(a.server_url)}/module/{a.species}/{a.organ}/slim-index"
     idx=_fetch_slim_index(a.out, url, a.ontology)
-    ctx=_process_ctx(idx)
+    targets=None
+    if getattr(a,"targets",None):
+        targets=json.loads(a.targets) if isinstance(a.targets,str) else a.targets
+    return idx, _score_targets_ctx(idx, targets), targets
+
+
+def _restrict_mask(A, restrict, column):
+    """--restrict: obs[column] 값이 주어진 라벨 집합에 속하는 벡터만 스코어링 대상으로 (예: neuron들 안에서
+    neuropil을 score). None/미지정 = 전 벡터. 반환: 전체길이 bool 마스크(None=전체)."""
+    import numpy as np, json
+    if not restrict: return None
+    want={str(x).strip() for x in (json.loads(restrict) if isinstance(restrict,str) else restrict)}
+    if column not in A.obs:
+        raise SystemExit(f"[score] --restrict 인데 obs['{column}'] 없음. 있는 것: {list(A.obs.columns)}")
+    m=np.isin(A.obs[column].astype(str).to_numpy(), list(want))
+    if not m.any():
+        raise SystemExit(f"[score] --restrict {sorted(want)} 에 해당하는 벡터가 obs['{column}']에 없음.")
+    return m
+
+
+def cmd_score_profile(a):
+    """scoring-based annotation의 **판단 재료**를 산출한다. 라벨을 쓰지 않는다 — REAL 판정은 에이전트가 한다.
+    대상 = --targets(임의 KG class 라벨) 또는 기본 tier='process' class. --restrict로 현 annotation 라벨
+    subset에 한정 스코어링(예: neuron들 안에서 neuropil). 대상이 없으면 applicable=false."""
+    import anndata as ad, json, os
+    _idx, ctx, targets = _score_ctx_for(a)
     os.makedirs(a.out, exist_ok=True)
-    dst=os.path.join(a.out,"_process_profile.json")
+    dst=os.path.join(a.out,"_score_profile.json")
     if not ctx or not ctx.get("classes"):
         json.dump({"applicable":False,
-                   "reason":f"wing {a.species}/{a.organ}에 tier='process' term 없음 — 이 단계 skip"},
+                   "reason":(f"--targets {targets} 가 module {a.species}/{a.organ}의 어떤 term에도 매칭 안 됨"
+                             if targets else f"module {a.species}/{a.organ}에 tier='process' term 없음")},
                   open(dst,"w"), ensure_ascii=False, indent=1)
-        print(f"[process] tier='process' term 없음 → SKIP (모든 벡터가 기존 경로로). -> {dst}", flush=True)
-        return
+        print(f"[score] 대상 class 없음 → applicable=false. -> {dst}", flush=True); return
     A=ad.read_h5ad(a.h5ad)
-    recs=_proc_scores(A, ctx, a.cand_pct, a.neg_pct)
-    prof={"applicable":True,
-          "h5ad":a.h5ad,"n_vectors":int(A.n_obs),"wing":f"{a.species}_{a.organ}",
+    rmask=_restrict_mask(A, getattr(a,"restrict",None), a.column)
+    recs=_proc_scores(A, ctx, a.cand_pct, a.neg_pct, restrict=rmask)
+    prof={"applicable":True,"h5ad":a.h5ad,"n_vectors":int(A.n_obs),"module":f"{a.species}_{a.organ}",
+          "targets":(targets or "tier=process (default)"),
+          "restrict":{"column":a.column,
+                      "labels":(json.loads(a.restrict) if getattr(a,"restrict",None) else None),
+                      "n_restricted":(int(rmask.sum()) if rmask is not None else int(A.n_obs))},
           "params":{"cand_pct":a.cand_pct,"neg_pct":a.neg_pct,
                     "rule":"후보=pos_score 상위 cand_pct%; 제거=neg_score 상위 neg_pct%. "
                            "score=표준화 composite(유전자별 z→평균→재표준화). "
@@ -3633,7 +3573,8 @@ def cmd_process_profile(a):
                            "검출(>0) 금지: blur 때문에 모든 마커가 ~100% '발현'됨."},
           "classes":[{k:v for k,v in r.items() if not k.startswith("_")} for r in recs]}
     json.dump(prof, open(dst,"w"), ensure_ascii=False, indent=1)
-    print(f"[process] wing={prof['wing']} n={A.n_obs} classes={[r['label'] for r in recs]}", flush=True)
+    print(f"[score] module={prof['module']} n={A.n_obs} targets={prof['targets']} "
+          f"restrict={prof['restrict']['n_restricted']} classes={[r['label'] for r in recs]}", flush=True)
     for r in recs:
         if not r.get("usable"): print(f"  {r['label']:16s} 사용불가: {r['reason']}", flush=True); continue
         rm=r.get("removal")
@@ -3646,212 +3587,70 @@ def cmd_process_profile(a):
     print(f"-> {dst}", flush=True)
 
 
-def cmd_process_apply(a):
-    """에이전트 판정을 obs에 쓴다.
-    --decisions {"<class label>": true|false, ...}  true = 그 class를 REAL로 인정
-    obs['cellman_class'] = background | cell | process ; obs['cellman_process'] = 어떤 process인지
-    연속량도 같이 남긴다 — 라벨만 남기면 하류(예: plaque 거리 분석)가 게이트에 순환의존하게 된다."""
-    import anndata as ad, numpy as np, json, os, pandas as pd
-    url=None if a.ontology else f"{_resolve_server(a.server_url)}/wing/{a.species}/{a.organ}/slim-index"
-    ctx=_process_ctx(_fetch_slim_index(a.out, url, a.ontology))
+def cmd_score_apply(a):
+    """에이전트의 REAL 판정을 obs['cellman_process']에 기록한다(어떤 대상 class인지; keep 벡터만, 나머지 '').
+    --decisions {"<class label>": true|false}  true = 그 class를 REAL로 인정. score-finalize가 이를 KG typed
+    subtype으로 세분화해 최종 라벨을 --column에 쓴다. (background/cellman_class 파티션 없음 — 2026-07-21.)"""
+    import anndata as ad, numpy as np, json, os, pandas as pd, collections
+    _idx, ctx, targets = _score_ctx_for(a)
+    if not ctx or not ctx.get("classes"):
+        raise SystemExit("[score-apply] 대상 class 없음 — score-profile을 먼저 확인하세요.")
     A=ad.read_h5ad(a.h5ad)
     dec=json.loads(open(a.decisions).read()) if os.path.exists(a.decisions) else json.loads(a.decisions)
-    recs=_proc_scores(A, ctx, a.cand_pct, a.neg_pct)
-    # legacy 컬럼 마이그레이션: 옛 스키마(cellman_voxel_class/cellman_process_label/cellman_score_*/
-    #   cellman_process_subtype, uns['cellman_process'])로 돌린 파일을 재처리할 때 옛 컬럼이 쌓이지 않게 제거.
-    for _c in list(A.obs.columns):
-        if _c in ("cellman_voxel_class","cellman_process_label","cellman_process_subtype") or _c.startswith("cellman_score_"):
-            del A.obs[_c]
-    if "cellman_process" in A.uns: del A.uns["cellman_process"]   # 옛 uns 키(지금은 cellman_partition)
-    cls=np.array(["cell"]*A.n_obs, dtype=object)
+    rmask=_restrict_mask(A, getattr(a,"restrict",None), a.column)
+    recs=_proc_scores(A, ctx, a.cand_pct, a.neg_pct, restrict=rmask)
+    if "cellman_class" in A.obs: del A.obs["cellman_class"]      # 옛 파티션 컬럼 정리
     lab=np.array([""]*A.n_obs, dtype=object)
-    scores={}
-    # ── background = 조직 밖 (공간 마스크; 마커 무관). 먼저 떼어낸다. ──
-    #   downsample_vector가 tissue 안에서 뽑지만 Otsu 경계 밖 고립 부유점이 남는다. 그게 background다.
-    #   조직 안은 cell/process로 가른다. (마커 기반 background는 폐기 — 조직 안엔 진짜 빈 곳이 사실상
-    #   없고, lineage-max는 0이 바닥이라 빈 곳을 못 내려가며, 핵(Malat1)은 region마다 달라 지역 인공물을 냈다.)
-    oot=np.zeros(A.n_obs, bool)
-    if "spatial" in A.obsm:
-        oot=_out_of_tissue(A.obsm["spatial"], close_iter=a.close_iter)
-        cls[oot]="background"
     for r in recs:
         if not r.get("usable"): continue
-        scores[r["label"]]=r["_pos"]
         if not dec.get(r["label"]):
             print(f"  [skip] {r['label']}: 에이전트가 REAL로 인정 안 함", flush=True); continue
-        m=r["_mask"] & (cls=="cell")          # 조직 안 & 아직 미배정만 (background/먼저 인정 class 보호)
-        cls[m]="process"; lab[m]=r["label"]
-    A.obs["cellman_class"]=pd.Categorical(cls)        # background | cell | process
-    A.obs["cellman_process"]=pd.Categorical(lab)       # 어떤 process인지 (neuropil / fiber tract / '')
-    # (연속 score는 obs에 저장하지 않는다 — 판정에만 쓰고 버린다.)
-    # uns는 JSON 문자열로 — 중첩 dict/None은 h5ad가 직렬화 못 한다(list of dict -> TypeError).
-    # 캘러가 판단 근거(배수·패널 누락·파라미터)를 나중에 되짚을 수 있어야 하므로 통째로 남긴다.
-    A.uns["cellman_partition"]=json.dumps(
-        {"params":{"cand_pct":a.cand_pct,"neg_pct":a.neg_pct,
-                    "background":"out-of-tissue spatial mask","close_iter":a.close_iter,
-                    "n_out_of_tissue":int(oot.sum())},
+        m=r["_mask"] & (lab=="")          # 먼저 인정된 class 보호(겹치면 첫 class 우선)
+        lab[m]=r["label"]
+    A.obs["cellman_process"]=pd.Categorical(lab)       # 어떤 대상 class인지 (neuropil / fiber tract / …; '' 아님)
+    A.uns["cellman_score"]=json.dumps(
+        {"params":{"cand_pct":a.cand_pct,"neg_pct":a.neg_pct},
+         "targets":(targets or "tier=process (default)"),
+         "restrict":{"column":a.column,
+                     "n_restricted":(int(rmask.sum()) if rmask is not None else int(A.n_obs))},
          "decisions":dec,
          "classes":[{k:v for k,v in r.items() if not k.startswith("_")} for r in recs]},
         ensure_ascii=False)
     A.write_h5ad(a.h5ad)
-    import collections
-    print("[process-apply] obs['cellman_class'] =", dict(collections.Counter(cls)), flush=True)
+    print("[score-apply] obs['cellman_process'] =", dict(collections.Counter(lab)), flush=True)
     print(f"  -> {a.h5ad}", flush=True)
 
 
-def cmd_process_cluster(a):
-    """cell로 분류된 벡터만 PCA/kNN/Leiden. **입력 h5ad 그대로에 obs['leiden']을 쓴다** —
-    subset 파일을 만들지 않는다. annotation 대상 컬럼이 'leiden'(cell)과 process 라벨 둘이라,
-    원본을 쪼개면 나중에 다시 합쳐야 하고 그 병합이 순전한 사고 위험이다.
-    process/background 벡터의 leiden은 '' (빈 문자열) — 클러스터가 아니라 그냥 대상이 아님.
-
-    ★ 파라미터는 **사용자가 정한다**(캘러가 물어본다). 기본값으로 조용히 굴리지 말 것:
-      n_neighbors=30 + leiden이 rare 클러스터를 병합해 희귀 세포를 지운 전례가 있다(15 또는
-      resolution 2~4로 회복). 그리고 여기 metric/n_neighbors는 나중에 init의 --subcluster-metric /
-      --subcluster-n-neighbors 와 **반드시 같아야** 한다 — 어긋나면 조용히 틀어진다. 그래서
-      uns['cellman_cluster_params']에 남겨 대조할 수 있게 한다."""
-    import anndata as ad, numpy as np, pandas as pd, json, collections
+def cmd_score_finalize(a):
+    """score-apply가 쓴 obs['cellman_process'](어떤 대상 class)를 KG typed subtype으로 세분화해 최종 라벨을
+    obs[--column](기본 cellman_annotation)에 쓴다 — process 벡터만 채우고 나머지 값은 그대로 둔다.
+    세분화 = subtype 델타 composite(표준화)의 per-vector argmax가 ENRICHED(>0)면 그 typed subtype, 아니면
+    bare class. (background 병합 없음 — 2026-07-21.)"""
+    import anndata as ad, numpy as np, pandas as pd, json, os, collections
+    _idx, ctx, targets = _score_ctx_for(a)
     A=ad.read_h5ad(a.h5ad)
-    if "cellman_class" in A.obs:
-        m=(A.obs["cellman_class"].astype(str)=="cell").to_numpy()
+    if "cellman_process" not in A.obs:
+        raise SystemExit("[score-finalize] obs['cellman_process'] 없음 — score-apply를 먼저 돌리세요.")
+    plab=A.obs["cellman_process"].astype(str).to_numpy()
+    col=a.column
+    if col in A.obs:
+        ann=A.obs[col].astype(object).to_numpy()
     else:
-        m=np.ones(A.n_obs,bool)      # Step P 미적용 wing → 전부 cell
-        print("[process-cluster] cellman_class 없음 → 전 벡터를 cell로 간주(Step P 미적용 wing)", flush=True)
-    lab=np.array([""]*A.n_obs, dtype=object)
-    params={"n_neighbors":a.n_neighbors,"metric":a.metric,"resolution":a.resolution,
-            "n_cell":int(m.sum()),"n_total":int(A.n_obs)}
-
-    # ── 모드 A: 이미 계산된 leiden/클러스터 컬럼을 그대로 사용 (아무것도 재계산 안 함) ──
-    if a.use_existing_leiden:
-        col=a.use_existing_leiden
-        if col not in A.obs: raise SystemExit(f"[process-cluster] obs['{col}'] 없음. 있는 것: {list(A.obs.columns)}")
-        src=A.obs[col].astype(str).to_numpy()
-        lab[m]=src[m]                                       # cell만; process/background는 ''
-        params.update({"source":f"existing obs['{col}']","backend":"none","n_pcs":None,"use_rep":None})
-        prev=json.loads(A.uns["cellman_cluster_params"]) if "cellman_cluster_params" in A.uns else {}
-        for k in ("n_neighbors","metric"):                  # 그 컬럼을 만든 원래 kNN 설정을 알면 유지
-            if k in prev: params[k]=prev[k]
-        print(f"[process-cluster] 기존 클러스터 obs['{col}'] 사용 (재계산 없음). cell {int(m.sum())}/{A.n_obs}", flush=True)
-    else:
-        # rapids-singlecell 우선, GPU 없으면 scanpy 자동 폴백. scanpy는 수십만 벡터에서 매우 느림 — GPU가 정상.
-        backend, mod = _pick_backend(a.gpu)
-        # 모드 B(기존 kNN 그래프로 leiden): 저장 그래프가 전체 벡터 기준이라 subset 없이 전체에 leiden 후 non-cell을 ''로.
-        if a.use_existing_neighbors:
-            print(f"[process-cluster] 저장된 kNN 그래프로 leiden (PCA·kNN 건너뜀), backend={backend} resolution={a.resolution}", flush=True)
-            sub=A.copy()
-            if backend=="rapids": mod.get.anndata_to_GPU(sub)
-            _kw={"neighbors_key":a.neighbors_key} if a.neighbors_key else {}
-            mod.tl.leiden(sub, resolution=a.resolution, key_added="leiden", **_kw)
-            if backend=="rapids": mod.get.anndata_to_CPU(sub)
-            src=sub.obs["leiden"].astype(str).to_numpy(); lab[m]=src[m]
-            params.update({"source":"existing neighbors graph","backend":backend,"n_pcs":None,"use_rep":None})
-        else:
-            # 기본(PCA) 또는 모드 C(use-rep): cell만 떼어 계산. use-rep이면 PCA 건너뛰고 obsm[rep]으로 kNN.
-            mode=(f"use_rep={a.use_rep} (PCA 건너뜀)" if a.use_rep else f"PCA n_pcs={a.n_pcs}")
-            print(f"[process-cluster] 대상 cell {int(m.sum())}/{A.n_obs}  backend={backend}  {mode}  "
-                  f"n_neighbors={a.n_neighbors} metric={a.metric} resolution={a.resolution}", flush=True)
-            sub=A[m].copy()
-            if a.use_rep and a.use_rep not in sub.obsm:
-                raise SystemExit(f"[process-cluster] obsm['{a.use_rep}'] 없음. 있는 것: {list(sub.obsm)}")
-            if backend=="rapids": mod.get.anndata_to_GPU(sub)
-            hvg_info={"source":"none"}
-            if a.use_rep:
-                mod.pp.neighbors(sub, use_rep=a.use_rep, n_neighbors=a.n_neighbors, metric=a.metric)
-            else:
-                # ★ HVG (선택; §5 Step P.1에서 사용자가 정함). **subset하지 않는다** — var['highly_variable']
-                #   플래그만 세팅해 PCA만 HVG로 계산하고, X는 전체 유전자를 유지한다. 그래야 엔진의 R1
-                #   기준선/enrichment/마커매칭이 non-HVG 마커(defining Icam1 등)까지 평가할 수 있다.
-                #   HVG는 위에서 cell(A[m])만 떼어낸 sub 위에서 계산 → process/background 제외.
-                use_hv=False
-                if a.use_existing_hvg:
-                    if "highly_variable" not in sub.var:
-                        raise SystemExit("[process-cluster] --use-existing-hvg 인데 var['highly_variable']가 없음. "
-                                         "--hvg --n-top-genes 로 계산하거나 HVG 없이(전 유전자 PCA) 진행하세요.")
-                    use_hv=True; hvg_info={"source":"existing"}
-                elif a.hvg:
-                    mod.pp.highly_variable_genes(sub, n_top_genes=a.n_top_genes)
-                    use_hv=True; hvg_info={"source":"computed","n_top_genes":a.n_top_genes}
-                else:
-                    print("[process-cluster] HVG 미적용 → 전 유전자로 PCA (use_highly_variable=False)", flush=True)
-                if use_hv:
-                    # panel = (HVG − technical genes) ∪ (KG 마커 ∩ data). select_gene_panel과 동일:
-                    #   tech gene 제거하되, KG에 있고 데이터에도 있는데 HVG가 놓친 마커는 도로 넣는다(KG는 denylist 우회).
-                    hv=set(np.asarray(sub.var_names)[sub.var["highly_variable"].to_numpy().astype(bool)].tolist())
-                    n_raw=len(hv)
-                    denied=_panel_denier(a.species)
-                    hv={g for g in hv if not denied(g)}
-                    n_tech=n_raw-len(hv)
-                    kg_idx=_load_wing_idx(getattr(a,"out",None), a.ontology, a.species, a.organ)
-                    present=set(map(str,sub.var_names))
-                    kg_in={_panel_clean(g) for g in _ontology_gene_set(kg_idx)} & present if kg_idx else set()
-                    readded=kg_in-hv
-                    panel=hv|kg_in
-                    sub.var["highly_variable"]=np.isin(np.asarray(sub.var_names),list(panel))
-                    hvg_info.update({"n_hvg_raw":n_raw,"n_tech_removed":n_tech,"n_kg_in_data":len(kg_in),
-                                     "n_kg_readded":len(readded),"n_panel":int(sub.var["highly_variable"].sum())})
-                    print(f"[process-cluster] HVG panel({hvg_info['source']}): HVG {n_raw} −{n_tech} tech "
-                          f"∪ KG-in-data {len(kg_in)} (HVG가 놓친 KG {len(readded)}개 재포함) "
-                          f"→ {hvg_info['n_panel']} genes (subset 아님; PCA에만 사용)", flush=True)
-                mod.pp.pca(sub, n_comps=a.n_pcs, use_highly_variable=use_hv)
-                mod.pp.neighbors(sub, n_neighbors=a.n_neighbors, metric=a.metric)
-            mod.tl.leiden(sub, resolution=a.resolution, key_added="leiden")
-            if backend=="rapids": mod.get.anndata_to_CPU(sub)
-            lab[m]=sub.obs["leiden"].astype(str).to_numpy()
-            if hvg_info["source"]!="none":
-                # 계산/확정된 HVG 플래그를 전체 h5ad(A)에 반영(행 subset이라 var 인덱스 동일). **subset 안 함.**
-                A.var["highly_variable"]=sub.var["highly_variable"].reindex(A.var_names).fillna(False).to_numpy()
-            params.update({"source":("obsm['%s']"%a.use_rep if a.use_rep else "PCA"),
-                           "backend":backend,"n_pcs":(None if a.use_rep else a.n_pcs),"use_rep":a.use_rep,
-                           "hvg":hvg_info})
-
-    A.obs["leiden"]=pd.Categorical(lab)
-    A.uns["cellman_cluster_params"]=json.dumps(params)
-    A.write_h5ad(a.h5ad)
-    nz={k:v for k,v in collections.Counter(lab).items() if k!=""}
-    print(f"[process-cluster] leiden 클러스터 {len(nz)}개 (cell 벡터에만). "
-          f"process/background는 leiden='' (annotation 대상 아님)", flush=True)
-    print(f"  init이 uns['cellman_cluster_params']에서 metric={params.get('metric')} "
-          f"n_neighbors={params.get('n_neighbors')}를 자동 상속합니다 — --subcluster-* 를 따로 넘기지 마세요.", flush=True)
-    print(f"  -> {a.h5ad}", flush=True)
-
-
-def cmd_process_finalize(a):
-    """Step P.2 + 병합. cell finalize가 만든 {input}_annotated.h5ad를 받아 **모든 벡터**가
-    obs['cellman_annotation'] 값을 갖게 채운다. finalize는 cell(leiden 클러스터)만 라벨하므로
-    process/background는 ''로 남는다 — 여기서 채운다.
-      · process 벡터 → KG typed subtype으로 세분화(각 class의 subtype 델타 composite, 벡터별 argmax가
-        ENRICHED(>0)면 그 typed neuropil, 아니면 bare class 라벨). 결과는 cellman_annotation에만 저장.
-      · background 벡터 → 'Background'
-      · cell 벡터 → finalize가 쓴 celltype 유지(안 건드림)
-    세분화는 per-vector composite(표준화)로, 하드코딩 임계 없음. 서버 KG에서 subtype 델타를 읽는다."""
-    import anndata as ad, numpy as np, pandas as pd, json, collections
-    url=None if a.ontology else f"{_resolve_server(a.server_url)}/wing/{a.species}/{a.organ}/slim-index"
-    ctx=_process_ctx(_fetch_slim_index(a.out, url, a.ontology))
-    A=ad.read_h5ad(a.h5ad)
-    if "cellman_annotation" not in A.obs:
-        raise SystemExit("[process-finalize] cellman_annotation 없음 — cell finalize를 먼저 돌리세요.")
-    ann=A.obs["cellman_annotation"].astype(object).to_numpy()
-    vc=A.obs["cellman_class"].astype(str).to_numpy() if "cellman_class" in A.obs else np.array(["cell"]*A.n_obs)
-    plab=A.obs["cellman_process"].astype(str).to_numpy() if "cellman_process" in A.obs else np.array([""]*A.n_obs)
+        ann=np.array([""]*A.n_obs, dtype=object)
+        print(f"[score-finalize] obs['{col}'] 없음 → 새로 만들고 process 벡터만 채움(나머지 '').", flush=True)
     X=A.X; X=np.asarray(X.todense()) if hasattr(X,"todense") else np.asarray(X)
     um={str(g).upper():i for i,g in enumerate(A.var_names)}
     def zc(genes):
-        idx=[um[g] for g in genes if g in um]
-        if not idx: return None
-        return np.column_stack([(X[:,i]-X[:,i].mean())/(X[:,i].std()+1e-9) for i in idx]).mean(1)
+        gi=[um[g] for g in genes if g in um]
+        if not gi: return None
+        return np.column_stack([(X[:,i]-X[:,i].mean())/(X[:,i].std()+1e-9) for i in gi]).mean(1)
     subtype=np.array([""]*A.n_obs, dtype=object)
-    dec=json.loads(open(a.decisions).read()) if (a.decisions and os.path.exists(a.decisions)) \
-        else (json.loads(a.decisions) if a.decisions else {})
-    # class label -> its subtypes[] (KG 구조에서)
     cls_children={c["label"]:c.get("children",[]) for c in (ctx.get("classes") or [])}
     for cl_label in set(plab):
         if not cl_label: continue
-        mask=(vc=="process") & (plab==cl_label)
-        if not mask.any(): continue
-        children=cls_children.get(cl_label,[])
-        # subtype 델타 composite (패널에 델타가 있는 subtype만)
+        mask=(plab==cl_label)
         cand=[]
-        for k in children:
+        for k in cls_children.get(cl_label,[]):
             z=zc([g.upper() for g in k.get("delta",[])])
             if z is not None: cand.append((k["label"],z))
         if cand:
@@ -3862,105 +3661,57 @@ def cmd_process_finalize(a):
         else:
             subtype[mask]=cl_label
         ann[mask]=subtype[mask]
-    # background
-    bg=(vc=="background")
-    ann[bg]="Background"; subtype[bg]="Background"
-    A.obs["cellman_annotation"]=pd.Categorical([str(x) for x in ann])
+    A.obs[col]=pd.Categorical([str(x) for x in ann])
     A.write_h5ad(a.h5ad)
-    empty=int(np.sum([str(x) in ("","nan","None") for x in ann]))
-    print(f"[process-finalize] cellman_annotation 채움. 남은 빈값 {empty} (0이어야 정상)", flush=True)
-    pcount={k:v for k,v in collections.Counter(subtype[vc=="process"]).items()}
-    print(f"  process 세분화: {pcount}", flush=True)
-    print(f"  background → 'Background': {int(bg.sum())}", flush=True)
+    pcount={k:v for k,v in collections.Counter(subtype[plab!=""]).items()}
+    print(f"[score-finalize] obs['{col}']에 process 세분화 기록: {pcount}", flush=True)
     print(f"  -> {a.h5ad}", flush=True)
 
 
-# ================================================================ annotate-mode-v2 CLI (single entry)
+# ================================================================ annotate-mode CLI (single entry)
 def main():
-    """SINGLE entry point for annotate-mode-v2. subcluster/descend = v2 marker-axis (this file);
+    """SINGLE entry point for annotate-mode. subcluster/descend = v2 marker-axis (this file);
     init/check/finalize = the inlined helper engine (_helper_cli), run IN-PROCESS (no subprocess)."""
     argv = sys.argv[1:]
     if not argv or argv[0] in ("-h", "--help"):
-        print("usage: helper_v2.py {process-profile|process-apply|init|descend|subcluster|check|finalize} ...\n"
-              "  process-profile = pre-Leiden cell/process/background 판단재료 (라벨 안 씀)\n"
-              "  process-apply   = 에이전트 판정을 obs['cellman_class']에 기록\n"
-              "  process-cluster = cell 벡터만 pca/knn/leiden (파라미터는 사용자가 정함)\n"
-              "  process-finalize= process 세분화(Step P.2)+background를 cellman_annotation에 병합\n"
+        print("usage: helper.py {init|descend|subcluster|check|finalize|score-profile|score-apply|score-finalize} ...\n"
+              "  [clustering-based annotation — 기본]\n"
+              "  init | check | finalize = the inlined annotate engine (사용자 지정 cluster 컬럼을 입력받음)\n"
               "  descend    = v2 marker-axis descent into a KG node's children (region->subtype, unconditional)\n"
               "  subcluster = v2 marker-axis split by EXPLICIT named candidates (PCA fallback when 0/1 candidate)\n"
-              "  init | check | finalize = the inlined annotate engine")
+              "  [scoring-based annotation — 'score 기반으로 찾아' / process(neuropil·fiber tract) 탐지 전용]\n"
+              "  score-profile  = positive-후보/negative-배제 판단재료 (라벨 안 씀; --targets 임의 KG class)\n"
+              "  score-apply    = 에이전트 REAL 판정을 obs['cellman_process']에 기록\n"
+              "  score-finalize = process를 KG typed subtype으로 세분화해 obs[--column]에 기록")
         return
     cmd, rest = argv[0], argv[1:]
-    if cmd == "process-finalize":
-        ap = argparse.ArgumentParser(prog="helper_v2.py process-finalize")
-        ap.add_argument("--h5ad", required=True)        # cell finalize가 만든 {input}_annotated.h5ad
-        ap.add_argument("--out", required=True)
-        ap.add_argument("--species", required=True)
-        ap.add_argument("--organ", required=True)
-        ap.add_argument("--decisions", default=None)     # process-apply와 같은 dict(선택; 참고용)
-        ap.add_argument("--server-url", dest="server_url", default=None)
-        ap.add_argument("--ontology", default=None)
-        cmd_process_finalize(ap.parse_args(rest))
-    elif cmd == "process-cluster":
-        ap = argparse.ArgumentParser(prog="helper_v2.py process-cluster")
-        ap.add_argument("--h5ad", required=True)
-        # 파라미터는 캘러가 사용자에게 물어 넘긴다(§5 Step P.1). 기본값 = 사용자가 "그냥 기본"이라 할 때 값.
-        ap.add_argument("--n-pcs", dest="n_pcs", type=int, default=50)
-        ap.add_argument("--n-neighbors", dest="n_neighbors", type=int, default=15)
-        ap.add_argument("--metric", default="euclidean")
-        ap.add_argument("--resolution", type=float, default=1.0)
-        # 표현/그래프 재사용 (셋 다 상호배타, 사용자가 원할 때만):
-        #   --use-rep NAME          PCA 건너뛰고 obsm[NAME](X_scvi 등)으로 kNN→leiden
-        #   --use-existing-neighbors 저장된 kNN 그래프로 바로 leiden (PCA·kNN 건너뜀)
-        #   --use-existing-leiden COL 이미 계산된 클러스터 컬럼을 그대로 사용 (전부 건너뜀)
-        ap.add_argument("--use-rep", dest="use_rep", default=None)
-        ap.add_argument("--use-existing-neighbors", dest="use_existing_neighbors", action="store_true")
-        ap.add_argument("--neighbors-key", dest="neighbors_key", default=None)   # 저장 그래프 키(선택)
-        ap.add_argument("--use-existing-leiden", dest="use_existing_leiden", default=None)  # 컬럼명
-        # HVG (기본 PCA 모드에서만; §5 Step P.1에서 사용자가 정함). **subset하지 않고** var 플래그만
-        #   세팅 → PCA만 HVG로, X는 전 유전자 유지(엔진이 non-HVG 마커까지 평가).
-        ap.add_argument("--hvg", action="store_true")                                # HVG 계산
-        ap.add_argument("--n-top-genes", dest="n_top_genes", type=int, default=2000)  # HVG 개수
-        ap.add_argument("--use-existing-hvg", dest="use_existing_hvg", action="store_true")  # var['highly_variable'] 그대로
-        # HVG panel = (HVG − technical) ∪ (KG 마커 ∩ data). KG wing은 파이프라인이 이미 받아온
-        #   {out}/_ontology_index.json(process-profile/init이 저장)을 재사용한다 → server-url 불필요.
-        ap.add_argument("--out", default=None)       # process-profile/init과 같은 out 디렉토리(받아온 wing 재사용)
-        ap.add_argument("--species", default=None)   # tech denylist(mouse/human); caller가 이미 아는 값
-        ap.add_argument("--organ", default=None)     # 로컬 index 없을 때만 폴백 fetch에 사용
-        ap.add_argument("--ontology", default=None)  # 로컬 slim-index json 직접지정(선택)
-        # --gpu: rapids-singlecell을 시도할 CUDA device (기본 0 = 시도함). GPU/rapids가 없으면
-        # _pick_backend가 조용히 scanpy로 폴백한다. --gpu -1 로 주면 강제 CPU.
-        # ※ 이 장비는 CUDA device 0 = RTX 4090 (nvidia-smi 순서와 반대).
-        ap.add_argument("--gpu", type=int, default=0)
-        _a = ap.parse_args(rest)
-        _modes = [bool(_a.use_rep), bool(_a.use_existing_neighbors), bool(_a.use_existing_leiden)]
-        if sum(_modes) > 1:
-            ap.error("--use-rep / --use-existing-neighbors / --use-existing-leiden 중 하나만 지정하세요.")
-        if _a.hvg and _a.use_existing_hvg:
-            ap.error("--hvg 와 --use-existing-hvg 는 동시에 쓸 수 없습니다.")
-        if (_a.hvg or _a.use_existing_hvg) and (_a.use_rep or _a.use_existing_neighbors or _a.use_existing_leiden):
-            ap.error("HVG 옵션(--hvg/--use-existing-hvg)은 기본 PCA 모드에서만 유효합니다 "
-                     "(--use-rep/--use-existing-neighbors/--use-existing-leiden 와 함께 쓸 수 없음).")
-        if _a.gpu is not None and _a.gpu < 0: _a.gpu = None      # 강제 CPU
-        cmd_process_cluster(_a)
-    elif cmd in ("process-profile", "process-apply"):
-        ap = argparse.ArgumentParser(prog=f"helper_v2.py {cmd}")
+    if cmd in ("score-profile", "score-apply", "score-finalize"):
+        ap = argparse.ArgumentParser(prog=f"helper.py {cmd}")
         ap.add_argument("--h5ad", required=True)
         ap.add_argument("--out", required=True)
         ap.add_argument("--species", required=True)
         ap.add_argument("--organ", required=True)
-        ap.add_argument("--cand-pct", dest="cand_pct", type=float, default=_PROC_CAND_PCT)
-        ap.add_argument("--neg-pct", dest="neg_pct", type=float, default=_PROC_NEG_PCT)
         ap.add_argument("--server-url", dest="server_url", default=None)
         ap.add_argument("--ontology", default=None)
-        if cmd == "process-apply":
-            ap.add_argument("--decisions", required=True)
-            # background = 조직 밖 공간 마스크. closing 반복수(조직 내부 gap 메우기; 클수록 관대).
-            ap.add_argument("--close-iter", dest="close_iter", type=int, default=3)
+        # --targets: 스코어링할 KG class 라벨 JSON list(선택). 미지정 시 module의 tier='process' class가 기본 대상.
+        ap.add_argument("--targets", default=None,
+                        help='스코어링 대상 KG class 라벨 JSON list(예: \'["neuropil","fiber tract"]\'). '
+                             "미지정=tier='process' class 기본.")
+        # --column: (profile/apply) --restrict 기준 컬럼 · (finalize) 최종 라벨을 쓸 컬럼(기본 cellman_annotation).
+        ap.add_argument("--column", default="cellman_annotation")
+        if cmd in ("score-profile", "score-apply"):
+            ap.add_argument("--cand-pct", dest="cand_pct", type=float, default=_PROC_CAND_PCT)
+            ap.add_argument("--neg-pct", dest="neg_pct", type=float, default=_PROC_NEG_PCT)
+            # --restrict: obs[--column] 값이 이 라벨들에 속하는 벡터만 스코어링(예: neuron들 안에서 neuropil).
+            ap.add_argument("--restrict", default=None,
+                            help='스코어링을 한정할 현 annotation 라벨 JSON list(예: \'["glutamatergic neuron","GABAergic neuron"]\').')
+        if cmd == "score-apply":
+            ap.add_argument("--decisions", required=True)   # {"<class label>": true|false}
         a = ap.parse_args(rest)
-        (cmd_process_profile if cmd == "process-profile" else cmd_process_apply)(a)
+        {"score-profile":cmd_score_profile,"score-apply":cmd_score_apply,
+         "score-finalize":cmd_score_finalize}[cmd](a)
     elif cmd in ("subcluster", "descend"):
-        ap = argparse.ArgumentParser(prog=f"helper_v2.py {cmd}")
+        ap = argparse.ArgumentParser(prog=f"helper.py {cmd}")
         ap.add_argument("--out", required=True)
         ap.add_argument("--paths", required=True)
         if cmd == "subcluster":
@@ -3977,7 +3728,7 @@ def main():
     elif cmd in ("init", "check", "finalize"):
         _helper_cli()   # inlined helper engine's argparse dispatch, in-process (reads sys.argv)
     else:
-        print(f"[helper_v2] unknown command '{cmd}' — use process-profile|process-apply|init|subcluster|check|finalize|descend")
+        print(f"[helper] unknown command '{cmd}' — use init|subcluster|descend|check|finalize|score-profile|score-apply|score-finalize")
         raise SystemExit(2)
 
 

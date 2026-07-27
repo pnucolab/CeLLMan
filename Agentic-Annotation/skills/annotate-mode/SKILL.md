@@ -1,13 +1,13 @@
 ---
-name: annotate-mode-v2
-description: Expert-judgment cell-type annotation of clustered scRNA / spatial h5ad, grounded in a Cell-Ontology wing (slim-index). Every decision is one test applied at four levels — a label is REAL only when the term's OWN markers are ENRICHED (elevated vs the whole dataset, not merely detected) AND DISCRIMINATIVE (its own low-degree markers, not shared/pan/ambient); assign the DEEPEST term that is REAL, FLOOR honestly to the class/region when none is, and never force-fit. Mixtures are not pre-detected: whenever a cluster is not a single clear identity, it is DESCENDED — re-Leidened on the marker axis of its KG children (a structural candidate set, no thresholds) and each sub-group re-judged; the distinct identities that emerge are the answer (1 → pure/label, ≥2 → split + recurse, none → floor), so a minority / balanced / cross-region mix all separate by the same call. Standard annotation runs autonomously to finalize; the user is consulted only in a free-form interactive phase after finalize. Writes obs['cellman_annotation'].
+name: annotate-mode
+description: Expert-judgment cell-type annotation of clustered scRNA / spatial h5ad, grounded in a Cell-Ontology module (slim-index). Every decision is one test applied at four levels — a label is REAL only when the term's OWN markers are ENRICHED (elevated vs the whole dataset, not merely detected) AND DISCRIMINATIVE (its own low-degree markers, not shared/pan/ambient); assign the DEEPEST term that is REAL, FLOOR honestly to the class/region when none is, and never force-fit. Mixtures are not pre-detected: whenever a cluster is not a single clear identity, it is DESCENDED — re-Leidened on the marker axis of its KG children (a structural candidate set, no thresholds) and each sub-group re-judged; the distinct identities that emerge are the answer (1 → pure/label, ≥2 → split + recurse, none → floor), so a minority / balanced / cross-region mix all separate by the same call. Standard annotation runs autonomously to finalize; the user is consulted only in a free-form interactive phase after finalize. Writes obs['cellman_annotation'].
 ---
 
-# annotate-mode-v2 — one identity test, four levels, marker-axis split
+# annotate-mode — one identity test, four levels, marker-axis split
 
-**You are the domain expert for one wing (species + organ).** The ontology wing you load (slim-index)
+**You are the domain expert for one module (species + organ).** The ontology module you load (slim-index)
 is your domain memory — each term's markers (required / defining / supporting / negative),
-the class→region→subtype hierarchy, confusion pairs, context axes. `scripts/helper_v2.py` does all the
+the class→region→subtype hierarchy, confusion pairs, context axes. `scripts/helper.py` does all the
 compute (global statistics, profiling, the marker-axis split, gates, the h5ad write) and hands you a
 **profile** per cluster; **you supply the biological judgment.** The caller talks to the user — you never do.
 
@@ -23,17 +23,41 @@ principle in full detail.
 
 ---
 
+## 1b. Two annotation modes — clustering-based (default) vs scoring-based (on-demand)
+
+Everything in §1 and §5–§13 is **clustering-based annotation** — the default. Alongside it there is a second
+mode, **scoring-based annotation**, used only when the user explicitly asks for it. Know which one a request
+is, because they answer different questions and CANNOT substitute for each other.
+
+| | **clustering-based** (default) | **scoring-based** (on-demand) |
+|---|---|---|
+| **method** | marker-axis Leiden → judge each cluster by R1–R8 (REAL/DEEPEST/FLOOR) | per-vector: positive-marker composite top N% = candidate → remove those whose negative-marker composite is top M% → keep |
+| **unit** | a cluster gets **one** celltype | a **vector** is/ isn't the target (no cluster) |
+| **engine** | `init` / `subcluster` / `descend` / `check` / `finalize` | `score-profile` / `score-apply` / `score-finalize` |
+| **use for** | standard annotation; "subdivide the T cells", "split D1 vs D2" — any request to resolve a celltype | finding a **process** (neuropil / fiber tract / …); any "find `<X>` **by score**" |
+| **why it must exist** | identities separate into clusters | a **process shares its positive markers with the soma that made the transcripts** (neuropil's synaptic markers = the neuron's) → it does NOT separate on a positive marker axis; only a **negative axis** (`MALAT1` nuclear-retained; `SOX10`/`OLIG2` oligo-soma) tells the process from its cell. Clustering has no negative axis, so it CANNOT find a process — gathering the neurons and re-clustering splits them into neuron subtypes, never into neuropil-vs-not. |
+
+**Standard (autonomous) annotation is clustering-based ONLY.** There is no pre-Leiden process partition and no
+cluster-level process detection — the input h5ad already carries the user's cluster/annotation column and you
+annotate it directly (§8). **Scoring-based annotation is invoked ONLY in the interactive phase**, when the user
+says something like *"gather the neurons and find the neuropil / fiber tract"* or *"find `<X>` by score"* (§8,
+§5 Step S). It is fully generalized: the default targets are the module's `tier='process'` classes, but `--targets`
+scores **any** KG class (pos = its `R∪DF`, neg = its `N` ∪ all ancestors' `N`). The scoring engine, its
+constraints, and how you judge REAL are all in **§5 Step S**.
+
+---
+
 ## 1. The rules (the vocabulary — defined ONCE, referenced by name everywhere below)
 
 Six named rules and a small shared vocabulary. Every case in §5–§9 is one of these rules applied at a
-level (lineage / region / subtype / state). The engine (`helper_v2.py`) precomputes each rule's inputs and
+level (lineage / region / subtype / state). The engine (`helper.py`) precomputes each rule's inputs and
 exposes them as profile fields; the **verdict is always yours** — the engine gives evidence, not the answer.
 
 ### Shared terms (one name per concept — used throughout)
 - **leaf** — a cluster (or sub-cluster) you are judging.
 - **the reference** — the whole-dataset per-gene statistics (`_global_stats.npz`), computed once at `init`
   and reused by EVERY later round, so absolute identity never collapses on a small fragment.
-- **share(gene)** — how many wing terms list the gene = its gene-degree. **OWN / DISCRIMINATIVE marker** =
+- **share(gene)** — how many module terms list the gene = its gene-degree. **OWN / DISCRIMINATIVE marker** =
   low share (`share ≤ 3`, `SPEC_SHARE_MAX`); **shared / pan / leaky marker** = high share. Only OWN markers
   identify a specific term; shared markers only place the lineage/class.
 - **defining marker (DF)** — a curated marker for which *a single one ON is sufficient* evidence for the term.
@@ -135,7 +159,7 @@ discriminative marker fire?** No → AMBIENT (single identity). Yes → R6 (spli
 
 ### R6 — DESCEND-AND-SEE  ·  "is this cluster one identity or a mixture — and of what?"  [engine: `descend`]
 **Do NOT pre-detect the mixture. Splitting IS the detection.** When a cluster is not already a confirmed
-single homogeneous type, **descend into its CURRENT KG node's children** (`helper_v2.py descend --node
+single homogeneous type, **descend into its CURRENT KG node's children** (`helper.py descend --node
 <node>`): the engine builds a marker axis from the **union of ALL those children's discriminating markers**
 (§6) and re-Leidens the cells; each sub-group is then re-judged (R1–R3). **What comes out IS the answer:**
 - **1 distinct identity** (all sub-groups judge to the same term, or they don't separate) → the cluster was
@@ -167,7 +191,7 @@ markers — that is the one split that descend-and-see cannot see, so it is driv
 
 ### R7 — STATE  ·  "before any floor/Unknown, is a state term the real identity?"  [engine: `is_state`, `disease_candidates`]
 State terms (activation / inflammatory / proliferating / transitional / reactive / disease-injury — anything
-the wing declares `tier=state`) are **deliberately excluded from the anchor descent and from `top`** (their
+the module declares `tier=state`) are **deliberately excluded from the anchor descent and from `top`** (their
 broad reactive markers would force-fit normal cells). The consequence you MUST account for: a `null top` /
 `class_or_unknown` verdict occurs **even when a state IS the answer**. So **before emitting any FLOOR or
 Unknown**, read `identity_scores.ranked` for `is_state=true` and the per-leaf `disease_candidates` block
@@ -223,18 +247,29 @@ multiplying:
 
 | actor | responsibility |
 |---|---|
-| **expert agent = you** | Run `helper_v2.py`, read profiles, judge each leaf by R1–R8 (§5), drive the split yourself, write the decisions JSON + per-round CSV. **Never ask the user.** Standard annotation is autonomous. |
+| **expert agent = you** | Run `helper.py`, read profiles, judge each leaf by R1–R8 (§5), drive the split yourself, write the decisions JSON + per-round CSV. **Never ask the user.** Standard annotation is autonomous. |
 | **caller** | Relays your helper calls back-to-back during standard annotation (no per-round user prompt). **After finalize**, runs the free-form interactive phase with the user (§8). |
-| **`helper_v2.py`** | The **single, self-contained backend** — all compute (profiling, the identity engine, gates), the marker-axis split, and the final h5ad write, in one script. **Validates** your decisions (`check`/`finalize`) and returns violations — it **never silently changes a decision**. Every command (`init`/`subcluster`/`descend`/`check`/`finalize`) runs in this one file; it does not call any other helper. |
+| **`helper.py`** | The **single, self-contained backend** — all compute (profiling, the identity engine, gates), the marker-axis split, and the final h5ad write, in one script. **Validates** your decisions (`check`/`finalize`) and returns violations — it **never silently changes a decision**. Every command (`init`/`subcluster`/`descend`/`check`/`finalize`) runs in this one file; it does not call any other helper. |
 
 ---
 
 ## 3. Run the helper (exact commands)
 
-`{HELPER}` = absolute path to `scripts/helper_v2.py` (resolve once:
-`find . -path '*Agentic-Annotation/scripts/helper_v2.py'`). `{python}` = the user venv. **Run the WHOLE
-workflow through `helper_v2.py`** — it is the single, self-contained entry point (all commands run in this one file). The
+`{HELPER}` = absolute path to `scripts/helper.py` (resolve once:
+`find . -path '*Agentic-Annotation/scripts/helper.py'`). `{python}` = the user venv. **Run the WHOLE
+workflow through `helper.py`** — it is the single, self-contained entry point (all commands run in this one file). The
 ontology server is automatic — pass `--species`/`--organ`; the helper writes `{out}/_ontology_index.json`.
+
+**INPUTS the caller gathers from the user's prompt BEFORE `init` (clustering is the user's job — done in their
+notebook — so the h5ad arrives already clustered):**
+- **`{input_h5ad}`** — path to the h5ad to annotate.
+- **`{cluster_col}`** — the **obs column holding the clusters/annotation to annotate** (e.g. `leiden`). The user
+  names it in the prompt (*"cluster column: leiden"* / *"annotate the `seurat_clusters` column"*). It is a
+  REQUIRED input — `init --cluster-col {cluster_col}` reads exactly that column, and every distinct value in it
+  becomes a leaf to annotate. If the user did not state which column, the caller **asks** (the one question it
+  must resolve up front); do not guess `leiden` when the h5ad has several candidate columns.
+- **`{species}` / `{organ}`** — the module (e.g. `mouse` / `brain`). From the prompt or obvious from the dataset.
+- **`{disease}`** (optional) — pass `--disease "<name>"` only if the user says the data is disease/cancer (R7 hint).
 
 **Output directory (hard rule):** `{out}` = an `annotation_out/` directory inside the caller's output
 location (`--out {base_out}/annotation_out`; `mkdir -p` it before `init`). All artifacts and the final h5ad
@@ -242,67 +277,17 @@ land there. Pass the same `--out` to every round.
 
 ```bash
 mkdir -p {out}
-# process-profile / process-apply — Step P (BEFORE any clustering; segmentation-free spatial only).
-#   Run FIRST, on the raw downsample_vector() h5ad, before pca/neighbors/leiden. See §5 Step P.
-#   profile writes {out}/_process_profile.json and NEVER labels; you judge, then apply.
-#   applicable:false ⇒ this wing has no process terms ⇒ skip Step P entirely and cluster everything.
-{python} {HELPER} process-profile --h5ad {input}.h5ad --out {out} --species {sp} --organ {og}
-#   --cand-pct 10  --neg-pct 10   (defaults; candidate = pos_score top N%, remove = neg_score top M%)
-{python} {HELPER} process-apply   --h5ad {input}.h5ad --out {out} --species {sp} --organ {og} \
-    --decisions '{"neuropil": true, "fiber tract": false}'      # true = you judged this class REAL
-#   → writes obs['cellman_class'] (background|cell|process), obs['cellman_process'] (which process: neuropil /
-#     fiber tract / '' for non-process), and uns['cellman_partition'] (params/decisions/evidence). No score
-#     columns are persisted.
+# CLUSTERING-BASED annotation (the DEFAULT — §1b). The input h5ad ALREADY carries a cluster/annotation
+#   column (leiden or any obs column the user names — clustering is the user's job, done in their notebook).
+#   You annotate that column directly: init → judge → descend/subcluster → check → finalize. No process/
+#   pre-Leiden partition step exists anymore.
 
-# process-cluster — pca/knn/leiden on the obs['cellman_class']=='cell' vectors ONLY, IN PLACE on
-#   the SAME h5ad (no subset file, nothing to merge later). process/background get leiden=''.
-#   rapids-singlecell when a GPU is present, automatic scanpy fallback otherwise (scanpy is very slow
-#   at 10^5 vectors — GPU is the normal path). --gpu N picks the device (default 0), --gpu -1 forces CPU.
-#   Defaults: --n-pcs 50 --n-neighbors 15 --metric euclidean --resolution 1.0 (the values you tell the user).
-#   The CALLER asks the USER (§5 Step P.1, free-form) and passes whatever they type. NEVER run this
-#   without asking — clustering (and now HVG) is ALWAYS a user decision, even if the input already has them:
-{python} {HELPER} process-cluster --h5ad {input}.h5ad --out {out} --species {sp} --organ {og} \
-    --hvg --n-top-genes 2000 \
-    --n-pcs 50 --n-neighbors 15 --metric euclidean --resolution 1.0
-#   HVG (default PCA mode only) — feature selection for the embedding, computed on the CELL vectors only
-#   (Step P's cellman_class=='cell'; process/background excluded). NEVER subsets the h5ad; only sets
-#   var['highly_variable'] so PCA uses it, X keeps ALL genes (the engine must see every KG marker).
-#   The panel mirrors select_gene_panel: **HVG − technical genes ∪ (KG markers present in data)** —
-#   tech genes (mt-/Rps/Rpl/Hba/Hbb, human MT-/RPS/…/MALAT1/lncRNA…) are dropped, and any KG wing marker
-#   that IS in the data but HVG missed is re-added (KG bypasses the denylist).
-#   --species = species denylist (caller already knows it). The KG wing is REUSED, not re-fetched: it reads
-#   {out}/_ontology_index.json that process-profile/init already saved (so NO server URL here; --organ/
-#   --ontology are only fallbacks if that file is missing). KG unavailable ⇒ graceful HVG−tech only. Flags:
-#     --hvg --n-top-genes N      compute HVG (N genes) here → panel = HVG−tech ∪ KG-in-data → PCA on it
-#     --use-existing-hvg         start from var['highly_variable'] already in the h5ad, then same panel adjust
-#     (neither)                  no HVG — PCA on all genes (use_highly_variable=False)
-#   Four MUTUALLY-EXCLUSIVE ways to feed the graph (pick per the user's answer):
-#     (default)                  PCA → kNN → leiden on the cell vectors (HVG options apply here)
-#     --use-rep X_scVI           use an existing obsm embedding, SKIP PCA+HVG (kNN/resolution still apply)
-#     --use-existing-neighbors   reuse the kNN graph already in the h5ad, SKIP PCA+kNN (only resolution applies)
-#                                (add --neighbors-key KEY if the stored graph is under a non-default key)
-#     --use-existing-leiden COL  the h5ad already has clusters in obs[COL] — use as-is, SKIP everything
-#   Run this even when Step P does not apply (no cellman_class ⇒ every vector is a cell).
-#   It records metric/n_neighbors/use_rep in uns['cellman_cluster_params'], and `init` INHERITS them —
-#   do NOT pass --subcluster-metric / --subcluster-n-neighbors (those exist only for an h5ad that was
-#   clustered outside this skill).
-
-# … then the celltype engine (init → subcluster/descend/check → finalize) annotates the cell leiden
-# clusters and writes obs['cellman_annotation'] for the CELL vectors only. FINALLY:
-
-# process-finalize — Step P.2 + merge. Run on the finalized {input}_annotated.h5ad so that EVERY vector
-#   has a cellman_annotation value. It subtypes each REAL process class into its KG typed children
-#   (glutamatergic / GABAergic / … neuropil, else the bare class) and merges them + 'Background' into
-#   obs['cellman_annotation'], leaving the cell celltype labels untouched. Without this, process/background
-#   vectors keep cellman_annotation='' — the annotation is INCOMPLETE.
-{python} {HELPER} process-finalize --h5ad {out}/{input}_annotated.h5ad --out {out} --species {sp} --organ {og}
-#   Skip only when Step P did not apply (no process/background vectors exist).
-
-# init — compute the reference (global stats) + fetch ontology + profile the input's Leiden clusters.
+# init — compute the reference (global stats) + fetch ontology + profile the input's clusters.
+#   --cluster-col {cluster_col}   the obs column the USER named in the prompt (leiden / any annotation column).
 #   --disease "<name>"     pass when the input is a disease/cancer dataset (HINT only, R7).
-#   --subcluster-metric / --subcluster-n-neighbors  DO NOT PASS after process-cluster — init inherits the
-#     initial clustering's metric/n_neighbors from uns['cellman_cluster_params'] automatically. Supply them
-#     ONLY for an h5ad clustered outside this skill, where they must MATCH that clustering.
+#   --subcluster-metric / --subcluster-n-neighbors  init inherits the input clustering's metric/n_neighbors
+#     from uns['cellman_cluster_params'] if present. Supply them ONLY when they must MATCH an external
+#     clustering that did not record those params.
 #   --adaptive-floor                               sparse platforms (0.5µm SSAM): lower R1 thresholds to ambient×F (persists to all rounds).
 {python} {HELPER} init --h5ad {input_h5ad} --cluster-col {cluster_col} \
    --out {out} --species {species} --organ {organ} [--disease "{disease}"] \
@@ -323,14 +308,41 @@ mkdir -p {out}
 {python} {HELPER} check --out {out} --decisions {out}/_annotate_decisions.json
 # finalize — write {input}_annotated.h5ad (only when error-free AND the split-review gate is clear, §7.1).
 {python} {HELPER} finalize --out {out} --decisions {out}/_annotate_decisions.json [--accept-large]
+
+# ── SCORING-BASED annotation (§1b) — ON-DEMAND, interactive-phase only. Use ONLY when the user asks to
+#    find a process (neuropil / fiber tract / …) or explicitly says "find <X> by score". NOT part of
+#    standard (clustering-based) annotation. Runs on an h5ad that already has annotation (e.g. the finalized
+#    one, or a subset the caller gathered — "gather the neurons"). Same positive-candidate / negative-exclude
+#    engine that clustering CANNOT replicate (a process shares its positive markers with the soma that made
+#    the transcripts; only the negative axis — MALAT1 nuclear-retained / SOX10·OLIG2 oligo-soma — separates it).
+# score-profile — material only (NEVER labels; you judge REAL). --targets = a JSON list of KG class labels to
+#    score (default = the module's tier='process' classes). --restrict = a JSON list of current-annotation labels
+#    to confine scoring to (e.g. score neuropil only WITHIN the neurons). Writes {out}/_score_profile.json.
+{python} {HELPER} score-profile  --h5ad {h5ad} --out {out} --species {sp} --organ {og} \
+    [--targets '["neuropil","fiber tract"]'] [--restrict '["glutamatergic neuron","GABAergic neuron"]'] \
+    [--cand-pct 10] [--neg-pct 10] [--column cellman_annotation]
+# score-apply — record your REAL verdicts → obs['cellman_process'] (which class per kept vector; '' otherwise).
+{python} {HELPER} score-apply    --h5ad {h5ad} --out {out} --species {sp} --organ {og} \
+    --decisions '{"neuropil": true, "fiber tract": false}'   [--targets …] [--restrict …]
+# score-finalize — subtype each REAL class into its KG typed children (glutamatergic/… neuropil, else bare
+#    class) and write the final labels into obs[--column] (default cellman_annotation) for the process vectors
+#    only, leaving every other vector's label intact.
+{python} {HELPER} score-finalize --h5ad {h5ad} --out {out} --species {sp} --organ {og} [--column cellman_annotation]
 ```
 
-If the server 404s for this wing → **stop and tell the caller** (no guessing). Read the ontology from
-`{out}/_ontology_index.json` — schema `{terms:{id:{L,T,P,R,S,N,D,DF}}, cp, oq, ca, sa}`: **L**=label,
-**T**=tier, **P**=parent ids, **R**=required, **S**=supporting, **N**=negative, **D**=disease
-context, **DF**=defining (one is sufficient), **ca**=context axes (§5 Step 2b), **sa**=state axes
-(base-agnostic cell states, §5 Step 2c), **cp**=confusion pairs, **oq**=open questions, **GM**=grounding
-PMIDs (cited in the finalize rationale only).
+If the server 404s for this module → **stop and tell the caller** (no guessing). Read the ontology from
+`{out}/_ontology_index.json` — schema `{terms:{id:{L,T,P,R,S,N,D,DF,DS,DP}}, cp, oq, ca, sa}`: **L**=label,
+**T**=tier, **P**=parent ids (IS_A ∪ REFINES — the module hierarchy; DEVELOPS_INTO is NOT a parent, so
+developmental cells never inherit markers), **R**=required, **S**=supporting, **N**=negative, **D**=disease
+context, **DF**=defining (one is sufficient), **DS**=developmental_stage (precise: Carnegie/pcw/Theiler/E-day),
+**DP**=developmental_period (`preimplantation`/`embryonic`/`fetal`/`neonatal`/`postnatal`/`adult`) — **present
+only on developmental cells; use it to decide adult-vs-fetal**: in fetal/embryo data a `DP=fetal` term (radial
+glia, hepatoblast, fetal cardiomyocyte …) is the correct answer, not its adult counterpart. **ca**=context axes
+(§5 Step 2b), **sa**=state axes (base-agnostic cell states + transition-guard, §5 Step 2c), **cp**=confusion
+pairs, **oq**=open questions, **GM**=grounding PMIDs (cited in the finalize rationale only). **State is a `sa`
+axis now, NOT a `tier=state` term** (that tier is retired): base-agnostic programs (proliferating / IFN-stim /
+EMT / reactive) are appended from `sa`; disease is the `D` **hint** (surfaced as `disease_candidates`, R7) —
+disease-identity terms (malignant …) are normal `class/subclass` anchors gated by R3, never a separate tier.
 
 ---
 
@@ -350,7 +362,6 @@ specificity_peak}}`) for the side-by-side view. Then per leaf, read these — ea
 | `lineage_scan` | R5·R8 | `{lineage:[[gene,auc,pct_in],…]}` canonical lineage markers (incl. pan) — authoritative for "is this lineage present" and the class-level FLOOR. |
 | `candidate_subtypes` | R4·R6 | ranked terms whose defining markers appear, parent-pooled for sub-leaves; `children_resolvable` = 1-level children whose distinguishing markers are present → the split-deeper signal (R6). |
 | `identity_evidence` | Step 0 | `{density, specificity_peak, lineage_markers_present, housekeeping_share, cross_lineage}` — the Background test. |
-| `compartment` | Step 0.5 | `{low_frac, synaptic_top[], n_synaptic, neuropil_neg_on[], n_neuropil_neg, myelin_top[], n_myelin, fibertract_neg_on[], n_fibertract_neg, no_specific_anchor, candidate, compartment_type, compartment_term_id, compartment_label}` — tissue process (KG `tier='process'`); `candidate==true` ⇒ emit `compartment_label` (`neuropil` / a typed `… neuropil` / `fiber tract`) with `compartment_term_id`. Empty (no fields fire) for non-CNS wings. (`neuropil` key kept as a back-compat alias.) |
 | `exclusive_mixture` | R6 | reciprocally-exclusive same-lineage DFs each ON in a disjoint subset → `needs_subclustering`. |
 | `transition_candidates` / `transition_note` | R5 | origin-anchor-retained + mimicked-program → label the transition term, do NOT split or call the mimicked lineage. |
 | `context_axis` | R-context | `[{axis, poles[], mixed, dominant_pole, suggested_subtype, pole_confidence, pmids}]` — zonation/layer subtyping (§5 Step 2b); follow the engine's pole. |
@@ -380,150 +391,12 @@ S6 RESOLVE    : clear single REAL → label (R4) ; ELSE DESCEND-AND-SEE (R6): de
 S7 FLAGS      : subclass_resolved ; confidence ; reason_code ; disease ; split mechanism = descend (marker-axis)
 ```
 
-### Step P — WHAT KIND OF THING IS THIS VECTOR? (pre-Leiden; segmentation-free spatial only)
-Segmentation-free sampling hits things that are **not cells**. A **process** is tissue built of cell
-*processes* rather than cell bodies — defined as *"has mRNA but is not a nucleus / cell body"*; the mRNA is
-there because it was **transported out of the soma**. KG `tier='process'` (neuropil, fiber tract; retinal
-plexiform layers / podocyte foot processes / alveolar septa later). If these are clustered as if they were
-cells, the compartment is lost for good — Step 0.5 cannot recover it once a cell-type anchor forms.
-
-**Applicability.** `process-profile` reports `applicable:false` when the wing has no `tier='process'` term
-⇒ **skip Step P**, cluster everything, continue at Step 0. Never invent process classes for such a wing.
-
-**Classes come from the KG structure** — the direct children of the process root. Never hardcode names.
-
-**The rule (already computed for you; you only judge):** candidate = `pos_score` top `cand_pct`% (the
-class's own R∪DF); remove candidates whose `neg_score` (its N ∪ **all ancestors' N** — the generic nucleus
-axis MALAT1 lives on the root and every class inherits it) is in the top `neg_pct`%. Survivors = `process`.
-
-**Step P.1 — the caller asks the user for the HVG + clustering parameters (FREE-FORM typing, not a menu).** You
-(the expert) judge the partition and run `process-apply`, then **report the result to the caller** — you never
-talk to the user. **This is a HARD STOP: the caller MUST ask and WAIT for the user's typed reply before ANY
-`process-cluster` run. Running PCA/kNN/Leiden (or HVG) with defaults without asking is a BUG — it is never
-autonomous, even though the rest of annotation is.** The caller asks **as plain conversational text** — it MUST
-NOT use `AskUserQuestion` or any selection/multiple-choice UI. There are no preset options to pick from; the
-user types values (or a phrase like "use my X_scVI", "reuse the existing clusters").
-
-**First, inspect the input and TELL the user what is already there — never silently reuse it.** Report which of
-these the h5ad already carries: `var['highly_variable']` (how many genes), an embedding in `obsm` (e.g.
-`X_pca`, `X_scVI`), a stored kNN graph (`uns['neighbors']`), and any cluster column(s) in `obs` (e.g.
-`leiden`). Then the caller shows the partition (counts per class, removal ratio, panel gaps), states the
-DEFAULTS, lists what pre-computed pieces exist, and invites free text — asking, for each stage, **reuse what's
-there OR recompute (and from which stage)**:
-
-> This h5ad already has: HVG (2000 genes) / obsm X_scVI / obs leiden. I will NOT reuse any of it unless you say so.
-> Choose per stage —
-> **HVG**: compute fresh (say how many genes, default 2000), reuse the existing `highly_variable`, or none (PCA on all genes).
-> **Embedding**: PCA (default n_pcs 50), or use an existing `obsm` key (e.g. `X_scVI` — PCA + HVG then skipped).
-> **kNN**: default n_neighbors 15, metric euclidean — or reuse the stored kNN graph.
-> **Leiden**: default resolution 1.0.
-> Type whatever you want (e.g. "HVG 3000, PCA, n_neighbors 15, resolution 2"), or "use my X_scVI, resolution 1", or "keep the leiden that's already in there".
-
-Map the user's typed answer to ONE `process-cluster` invocation:
-- HVG: "hvg 3000" → `--hvg --n-top-genes 3000`; "use the HVG that's there" → `--use-existing-hvg`; "no hvg / all genes" → (omit both). HVG applies ONLY in the default PCA mode and is computed on the **cell vectors only** (Step P's `cell` class). It never subsets — X keeps all genes so the engine sees every KG marker. The panel = **HVG − technical genes ∪ (KG wing markers present in data)** (like `select_gene_panel`): pass `--out {out} --species {sp} --organ {og}` — the same species/organ the caller was given, and `--out` so it REUSES the wing already fetched to `{out}/_ontology_index.json` (by process-profile/init) instead of re-fetching. No server URL needed. KG unavailable ⇒ graceful (HVG − tech only).
-- plain params → `--n-pcs --n-neighbors --metric --resolution` (unstated ones fall back to the defaults above)
-- "use my X_scVI / don't run PCA" → `--use-rep X_scVI` (PCA+HVG skipped; `--n-neighbors/--metric/--resolution` still apply)
-- "use the kNN graph that's already there" → `--use-existing-neighbors` (PCA+kNN skipped; only `--resolution` applies; `--neighbors-key` if non-default)
-- "use my existing clusters in column C" → `--use-existing-leiden C` (everything skipped; the column is taken as-is for the cell vectors)
-
-The four graph modes are mutually exclusive (HVG options combine only with the default PCA mode). **Do not
-silently pick defaults, and do not silently reuse whatever the input already contains** — n_neighbors=30 once
-merged away rare clusters (recovered at 15, or resolution 2–4). The subcluster rounds must use the SAME
-metric/n_neighbors as this initial clustering — automatic (`init` inherits them from
-`uns['cellman_cluster_params']`), so do not re-supply them.
-**When Step P does not apply** (`applicable:false`), the caller still tells the user that annotation is
-proceeding straight to celltypes and asks the same fixed question.
-
-**Annotation targets are TWO columns, on the one h5ad:** `leiden` (the cell vectors) and `cellman_process`
-(the process vectors — which process). The agent does BOTH a celltype annotation (on `leiden` clusters) and a
-process annotation (Step P.2, subtyping the process vectors). Nothing is subset out and nothing is merged
-back — both stream into `cellman_annotation`, which ends up holding a value for **every** vector:
-`Background` (background), the process subtype (process), or the celltype (cell).
-
-**obs schema written by Step P + engine (final):**
-- `cellman_class` — `background` | `cell` | `process`
-- `cellman_process` — which process (`neuropil` / `fiber tract` / …), `''` for non-process
-- `leiden` — clustering of the `cell` vectors only (`''` for process/background)
-- `cellman_annotation` — **all vectors**: `Background` / process subtype / celltype
-(No `cellman_score_*` columns are persisted.)
-
-**Judge each class REAL or not, per `{out}/_process_profile.json`:**
-- `removal.ratio` — `neg_score` top M% removes M% of ALL vectors by construction, so **chance = 1.0**.
-  **>1** = the candidates really do contain somata and the filter is removing them (the gate works).
-  **≈1** = the filter is *uninformative* — it is deleting a random M%. **<1** = the candidates are already
-  soma-depleted, i.e. the positive axis alone did the job (fine — the filter is then confirmatory, not
-  load-bearing; say so in the rationale).
-- `pos_missing` / `neg_missing` / `delta_missing` — markers absent from the panel. **A class whose axis is
-  mostly missing is NOT evidence of absence** — it is a panel gap; report it, do not conclude.
-- **Anatomy is the real check.** A REAL class is spatially coherent and lands where the tissue actually is
-  (neuropil → cortical mantle / hippocampal molecular layers / cerebellar molecular layer; fiber tract →
-  corpus callosum / fimbria). A class that is speckled everywhere is not real, whatever its ratio.
-- **No force-fit (R3 applies here too).** If a class is not REAL, pass `false` — those vectors stay `cell`
-  and the agent still gets to judge them after Leiden. Erring toward `cell` is *recoverable*; erring toward
-  `process` is **not**. Be strict here and permissive downstream.
-
-`background` = **out-of-tissue**, decided by SPACE, not markers: vectors that sit OUTSIDE the tissue mass —
-isolated floaters beyond the Otsu boundary that leaked through downsampling. `process-apply` builds a tissue
-footprint from the vector positions themselves (rasterize → morphological close → largest connected component
-→ fill holes) and flags vectors outside it. NO marker/density test — inside already-downsampled tissue there
-is essentially no empty voxel, the lineage-max axis floors near 0 so it cannot detect emptiness, and the
-nucleus axis varies by region so thresholding it invents regional artifacts. `--close-iter` (default 3) tunes
-how aggressively in-tissue gaps are bridged. `cell` = **everything in-tissue that is not process**, by
-exclusion — no positive test. Then `process-cluster` with the user's parameters and continue at Step 0.
-
-**Step P.2 — subtype the process vectors from the KG** (they never enter Leiden): for each class marked
-REAL, judge its `subtypes[]` deltas by R1/R3 exactly as for a celltype, and emit the DEEPEST REAL one
-(`glutamatergic neuropil` …) or the bare class. A subtype whose delta is mostly `delta_missing` is a panel
-gap, NOT an absence — floor to the bare class and say so.
-
-**Hard-won constraints — violating any of these silently produces nonsense (2026-07-17):**
-- **NEVER `k-of-n` / AND / OR over markers.** Yield is driven by the *gene count*, not biology: on one
-  dataset "all 7 neuropil markers in their top 25%" gave 0.05% and at top 10% gave **0**, while "both 2
-  fiber-tract markers" gave 16% — that is `0.25^7` vs `0.25^2`, not marker quality. Use the standardized
-  composite (per-gene z → mean → **re-standardize**), which is invariant to set size.
-- **NEVER use detection (`>0`).** KDE blur puts every marker in ~100% of vectors (Snap25 99.9%, Mbp 99.99%,
-  Malat1 99.9% at 8µm). "Expressed" separates nothing; only **level** does.
-- **Density is for `background` only.** It is legitimate there ("nothing here" IS a density claim) but must
-  never gate a process class: cortical L2–L6 neuropil is soma-mixed and therefore *medium* density, so a
-  low-density gate deletes it by construction — and near a lesion (e.g. amyloid plaque) glia pile in and
-  raise density, making "process is depleted near the lesion" true by circularity.
-- **Do not expect a generic soma marker to exist.** Cajigas 2012 found 2,550 transcripts in the neuropil, so
-  "mRNA found only in the soma" is a near-empty category. MALAT1 works because of a *mechanism* (nuclear
-  retention — never exported), not a gradient. A class is separable from its cell only when that specific
-  cell has soma markers of its own (fiber tract has PLP1/SOX10/OLIG2; neuropil has nothing, so its filter
-  is expected to read `ratio<1`).
 
 ### Step 0 — IS IT A CELL? → may emit **Background**
 Background ONLY when ALL hold: `density.pct` bottom-quartile (or `low_frac` high) AND `specificity_peak`
 null AND `lineage_markers_present.n == 0` AND `graph_evidence.lineage == null`. **`n ≥ 500` or a top-level
 leaf (path has no ".") ⇒ never Background** → continue. `density==null` ⇒ use the identity conditions only.
 
-### Step 0.5 — IS IT A PROCESS? (cluster-level safety net; spatial only) → may emit `neuropil` / `… neuropil` / `fiber tract`
-**Step P already ran at the vector level**; this is the *recoverable-error* net for process vectors that were
-left in `cell` and clustered. Same KG `tier='process'` terms (driven from the wing slim-index,
-no hardcoded gene set; **absent for non-CNS wings** ⇒ this step never fires). Emit the `compartment.candidate`
-term (decision `celltype`, `label=compartment_label`, `term_id=compartment_term_id`) when
-`compartment.candidate == true`. The engine fires it under one gate — low density (`low_frac ≥ 0.5`) AND **no
-specific cell-type anchor** — then picks by which process markers are **ENRICHED (R1, `up`)**:
-**Caveat:** this cluster-level gate is weaker than Step P by design — a cell-type anchor blocks it, which is
-exactly how whole fiber tracts were lost before Step P existed. Step P, not this, is the primary path.
-Both compartments use the same **positive AND NOT-negative** form — the positive markers alone cannot separate an
-acellular compartment from the cell that *makes* those transcripts, so each carries a **soma/nucleus negative**:
-- **neuropil** — synaptic markers dominate (`n_synaptic ≥ 3`: Syp/Syt1/Snap25/Nrgn/Camk2a/Map2/Dlg4) AND the
-  soma/nucleus negative (`n_neuropil_neg == 0`; Malat1 — a nuclear-**retained** lncRNA, so it is present wherever
-  a nucleus is and absent from the acellular mesh) is **NOT** enriched (enriched ⇒ a neuron cell body, whose
-  soma also carries the synaptic transcripts, not the neuropil). If one transmitter subtype's delta is genuinely
-  enriched, `compartment_label` deepens to that **typed neuropil** (glutamatergic / GABAergic / dopaminergic /
-  cholinergic / serotonergic); else it stays bare `neuropil`.
-- **fiber tract** — myelin markers dominate (`n_myelin ≥ 3`: Mbp/Plp1/Mobp/Mag/Cnp) AND the oligo-**soma**
-  negatives Sox10/Olig2 are **NOT** enriched (those ⇒ real oligodendrocyte cell bodies, not a tract).
-
-Both negative sets come from the wing slim-index — `N` of the term **∪ `N` of all its ancestors**, so the
-generic nucleus axis (MALAT1) declared once on the process root reaches every class. A wing whose process
-terms declare no `N` anywhere simply skips that half of the gate.
-
-If a specific anchor IS present (real somata, even at low density) ⇒ NOT a compartment → continue. scRNA-seq
-(real single cells) never fires this. `reason_code="neuropil"` for any neuropil-type, `"fiber_tract"` for a tract.
 
 ### Step 1 — LINEAGE (the floor you are sure of) — apply **R5**
 Confirm `graph_evidence.lineage` (corroborated by `lineage_scan`). If none resolves → Step 4 (Unknown). Then
@@ -556,12 +429,12 @@ DF-override); among the REAL anchors apply **R4** (deepest defensible node on th
 `confidence`: **high** (anchor `excl_on≥3` or `excl_on/excl_n≥0.7`, clean negatives) · **medium**
 (`excl_on` 1–2, or you stopped at a region) · **low** (single OWN marker, panel-limited).
 
-### Step 2b — CONTEXT-AXIS subtyping (when the wing declares `ca`; subtypes differ by POSITION, not intrinsic markers)
+### Step 2b — CONTEXT-AXIS subtyping (when the module declares `ca`; subtypes differ by POSITION, not intrinsic markers)
 Some subtypes are NOT distinguished by their own cell-intrinsic markers — only by **position along an
 anatomical axis** (liver lobule peri↔pericentral; kidney cortico-medullary; gut crypt↔villus). Their
 discriminating signal is the dominant **neighboring** cell type's markers (a periportal LSEC carries
 periportal *hepatocyte* markers `Cyp2f2/Hal`) — which §Step 1/R5 would call ambient for *lineage*, but here
-**that context IS the subtype evidence**. Applies ONLY when (i) the wing's slim-index declares a `ca` axis,
+**that context IS the subtype evidence**. Applies ONLY when (i) the module's slim-index declares a `ca` axis,
 (ii) the leaf's lineage is confirmed by its OWN intrinsic markers (R5 unchanged — lineage never comes from
 ambient), and (iii) that lineage is in the axis's `applies_to`. **Follow the engine's `context_axis` field
 mechanically** (poles scored graded — weak zonal signal counts; a lean ≥1.15× sets `dominant_pole`):
@@ -579,7 +452,7 @@ mechanically** (poles scored graded — weak zonal signal counts; a lean ≥1.15
 Some biology is a **cross-cutting cell STATE**, not a cell type — proliferating, interferon-stimulated,
 hypoxic, senescent, mesenchymal/EMT, stemness, estrogen-response, angiogenic, M2-polarization. A `CD8 T cell`
 and a `luminal epithelial cell` can BOTH be *proliferating*; encoding that as a separate `proliferating CD8
-T cell` Term would duplicate the same `MKI67` program across dozens of types. Instead the wing declares each
+T cell` Term would duplicate the same `MKI67` program across dozens of types. Instead the module declares each
 state ONCE as a base-agnostic **State** with its own program signature (`sa` in the slim-index), and the
 engine evaluates them **independently of the base identity**:
 - **After the base celltype is decided** (Steps 1–2), read `state_axis` — each active state has ≥2 of its
@@ -603,6 +476,18 @@ engine evaluates them **independently of the base identity**:
   base label (or the agent's explicit `dec["states"]` override). Disease/injury states that remain per-base
   (malignant, and the FUZZY states) are handled by `disease_candidates`/R7, NOT here — this axis is only the
   base-agnostic program states in `sa`.
+- **STATE IS ALSO A DURING-DETERMINATION GUARD (not only a post-hoc append).** A state whose program *resembles
+  another lineage* — EMT (epithelial → mesenchymal program `VIM/CDH2/ZEB1`), EndMT, dediff, DAM
+  (microglia → macrophage-like `APOE/TREM2`) — makes a single cell carry **two lineages' signals at once**, so
+  the naive `mixed`/codominant test (R5/R6) could wrongly SPLIT one EMT⁺ epithelial cell into an
+  epithelial-vs-mesenchymal "mixture." To stop that, a `sa` state carrying **`mimics`** (the lineage it
+  resembles) **+ `anchor_markers`** (the origin identity it retains) is folded into `transition_candidates`
+  (R5): when the leaf keeps the origin anchors ON **and** expresses the mimicked program (≥2 of `Qspec` ON), it
+  is the **origin lineage in that state** (`epithelial cell, epithelial-mesenchymal transition`), **NOT a
+  mixture — do NOT split.** So state, like context, participates in the celltype decision (as a split-guard),
+  and is *additionally* appended after. Same-cell co-expression (anchors + program together) = state; disjoint
+  subsets (origin-only vs mimicked-only cells) = real mixture → R6 split. `_mimicry_terms` unifies the old
+  Term-level `A`/`MP` transition terms with these `sa`-derived ones.
 
 ### Step 3 — DESCEND-AND-SEE (the only split path) — apply **R6**
 When the leaf is not a single clear REAL identity, **do NOT try to detect what is mixed** — `descend` into the
@@ -631,9 +516,56 @@ a state when its OWN markers win, else the best normal type; never assume normal
 states flagged `hint=true` and sorted first; assign one only when it passes R3 + the specificity gate. Never
 invent a non-ontology label; `open_question_flag=true` if the chosen term is in `oq`.
 
+### Step S — SCORING-BASED annotation (§1b; INTERACTIVE-PHASE ONLY) — apply the positive-candidate / negative-exclude test
+**This is NOT part of standard annotation.** Run it ONLY when, in the interactive phase (§8), the user asks to
+find a **process** (neuropil / fiber tract / … — a KG `tier='process'` term) or explicitly says *"find `<X>`
+**by score**"*. Everything above (Steps 0–5) is clustering-based; a process cannot be found that way (§1b): its
+positive markers are shared with the soma that made the transcripts, so re-clustering the neurons only splits
+them into neuron subtypes. Scoring-based annotation is the answer, and it works on a **vector level with a
+negative axis** the clustering engine does not have.
+
+**The mechanism (engine computes it; you JUDGE REAL).** For each target class the engine derives, from the KG,
+**pos = its `R∪DF`** and **neg = its `N` ∪ all ancestors' `N`** (the generic nucleus axis `MALAT1` sits on the
+process root and every class inherits it; `SOX10`/`OLIG2` = oligo soma for fiber tract). Then per vector:
+- **positive composite** (per-gene z → mean → **re-standardize**) → **candidate = top `cand_pct`% (default 10)**.
+- **negative composite** likewise → **remove candidates whose negative score is top `neg_pct`% (default 10)**.
+- **keep = candidate AND NOT negative.** `--restrict '[…annotation labels…]'` confines scoring to a subset
+  (e.g. score neuropil only WITHIN the neuron labels — percentiles are taken inside that subset).
+
+**How you judge each class REAL (per `{out}/_score_profile.json`):**
+- **`removal.ratio`** (observed removal ÷ chance `neg_pct`): the negative filter removes `neg_pct`% of ANY set
+  by construction, so **chance = 1.0**. **>1** = the candidates really contained somata and the negative axis
+  is doing the separating (fiber tract vs oligodendrocyte typically ≫1 — load-bearing). **≈1** = the filter is
+  uninformative. **<1** = candidates were already soma-depleted, so the positive axis alone sufficed and the
+  negative is merely confirmatory (neuropil typically <1, because its positive top-slice is already the
+  nucleus-poor mesh — this is EXPECTED, not a failure; say so in the rationale).
+- **Anatomy is the real check.** A REAL process is spatially coherent and lands where the tissue actually is
+  (neuropil → cortical mantle / molecular layers; fiber tract → corpus callosum / fimbria). Speckled-everywhere
+  is not real, whatever the ratio.
+- **`pos_missing`/`neg_missing`** = panel gaps, NOT evidence of absence — report, don't conclude.
+- **No force-fit.** A class you don't judge REAL → `false`; those vectors keep their existing celltype.
+
+**Hard-won constraints (violating any silently produces nonsense):**
+- **NEVER k-of-n / AND / OR over markers** — yield is driven by the *gene count* (`0.25^7` vs `0.25^2`), not
+  biology. The engine uses the size-invariant standardized composite; you never threshold marker-by-marker.
+- **NEVER use detection (`>0`).** KDE blur puts every marker in ~100% of vectors — "expressed" separates
+  nothing; only **level** (the composite) does.
+- **Don't expect a generic soma marker to exist.** `MALAT1` works by a *mechanism* (nuclear retention), not a
+  gradient; a class is separable from its cell only when that cell has soma markers of its own (fiber tract has
+  `PLP1`/`SOX10`/`OLIG2`; neuropil has none, so its filter is *expected* to read `ratio<1`).
+
+**Flow (interactive phase, on the finalized h5ad or a gathered subset):** `score-profile` (material) → you judge
+each class REAL/not → `score-apply --decisions '{"neuropil":true,…}'` (writes `obs['cellman_process']`) →
+`score-finalize` (subtypes each REAL class into its KG typed children — `glutamatergic neuropil` … — else the
+bare class, and writes the final labels into `obs[--column]`, default `cellman_annotation`, for the process
+vectors only, leaving every other vector's label intact). Generalized: `--targets` scores **any** KG class the
+user names, not only processes (pos/neg derived the same way) — but scoring a normal celltype forfeits the
+R1–R8 / no-force-fit discipline of clustering-based judgment, so use it only when a process/shared-positive
+target makes clustering unable to separate the identity.
+
 ---
 
-## 6. The split — MARKER-AXIS recluster (`helper_v2.py subcluster` / `descend`)
+## 6. The split — MARKER-AXIS recluster (`helper.py subcluster` / `descend`)
 
 Splitting is **not** whole-transcriptome Leiden. A mixture's distinguishing signal is often a handful of
 low-copy markers (`Grik4`, `Fezf2`, `Drd1` vs `Drd2`) — across thousands of genes (PCA) it is diluted and
@@ -643,7 +575,7 @@ present-but-swamped markers; it does NOT rescue markers that are simply under-de
 floor needing a larger bin/bandwidth.)
 
 ### `descend` — the standard split (KG children, structural, no detection)
-**Standard annotation splits ONLY by `descend`** (`helper_v2.py descend --node <label>`): the engine takes
+**Standard annotation splits ONLY by `descend`** (`helper.py descend --node <label>`): the engine takes
 that KG node's **direct children** as the candidate set (from the slim-index — you do NOT name them, do NOT
 detect what is mixed), builds their marker axis (below), re-Leidens, and re-profiles each sub-group. You
 descend whenever a leaf is **not a single clear REAL identity** — a floor, a tie, or just to verify a
@@ -663,7 +595,7 @@ never a detected one — a 10% minority, a 50-50, and a cross-region pair all se
 > SEE — fall to the floor ONLY after a descent actually failed to separate.**
 
 ### `subcluster --candidates` — the INTERACTIVE-phase tool (user names the split target)
-`helper_v2.py subcluster --candidates '["…","…"]'` splits a leaf on an **explicitly named** candidate set —
+`helper.py subcluster --candidates '["…","…"]'` splits a leaf on an **explicitly named** candidate set —
 used only in the free-form interactive phase (§8) when the user asks "split D1 vs D2 here" or "is there a
 Treg?". Same marker-axis engine as `descend`, just with a hand-named list instead of the KG children. A path
 with **0/1** candidate → whole-transcriptome PCA Leiden (discovery subclustering).
@@ -705,7 +637,7 @@ Unknown), never force-labeled. A sub-group that still mixes → `descend` again 
 - `--resolution` default 1.0 (the axis is low-dimensional); raise if a mixture stays merged, lower if it
   fragments. `--subcluster-n-neighbors` default 15. **Low-copy panels need a larger bin/bandwidth, NOT lower
   resolution.**
-- the re-profiling/judgment after a split uses the SAME engine (`helper_v2.py` is self-contained — the
+- the re-profiling/judgment after a split uses the SAME engine (`helper.py` is self-contained — the
   identity engine, profiling, and gates all live in it), so a marker-axis split adds no new judgment path.
 
 ---
@@ -802,7 +734,8 @@ relays your helper calls. The user is engaged **only after finalize**.
 > Do not stop because the profiles "look reasonable"; a coarse floor always looks reasonable. Push to the deepest
 > honest label for EVERY leaf.
 
-1. `helper_v2.py init` → profile the input's Leiden clusters (round 1 — coarse; the START, not the answer).
+1. `helper.py init --cluster-col {cluster_col}` → profile the input's clusters in the **user-named column**
+   (§3 INPUTS; `leiden` or whatever the user gave) — round 1 is coarse, the START not the answer.
 2. Judge each leaf by §5 (R1–R8) → a **single clear REAL identity at the DEEPEST tier** (celltype) / **Background**
    / **Unknown**, or **needs descend** (anything else — a floor, a region-group, a tie, OR a clear-looking leaf
    you have not yet verified by descending). **A region-group or class label is `needs descend`, not a terminal
@@ -816,25 +749,32 @@ relays your helper calls. The user is engaged **only after finalize**.
    yields no new separation** (all sub-groups re-judge to the same parent class — a genuine detection floor) →
    keep the parent label honestly. Never force-fit. Descend even clear-looking leaves so a hidden minority /
    diluted region is not missed.
-4. `helper_v2.py check` → fix any flagged leaves → `finalize` → writes `obs['cellman_annotation']`. **This
+4. `helper.py check` → fix any flagged leaves → `finalize` → writes `obs['cellman_annotation']`. **This
    ends standard annotation.** Report the outcome to the caller.
 
 ### Interactive phase (after finalize — the only user touchpoint)
 The caller presents the finalized outcome (English; table + explanation) and offers **① done** or **②
 user-directed exploration**. This is free-form — the user asks in their own words; you translate it into
-targeted marker-axis work and answer **honestly** (BIAS GUARD: the data decides, never manufacture a positive
+targeted work and answer **honestly** (BIAS GUARD: the data decides, never manufacture a positive
 to satisfy the user; never editorialize the *sample* as normal/diseased from the absence of a state label —
-that is an evidence/coverage outcome, not a determination). Examples:
+that is an evidence/coverage outcome, not a determination). **First read the intent to pick the MODE (§1b):** a
+request to **resolve/subdivide a celltype** is clustering-based (`subcluster`/`descend`); a request to **find a
+process, or "find `<X>` by score"** is scoring-based (§5 Step S). Examples:
 - **"Is there really no <type X>?"** → find the leaf carrying its signal → `subcluster --candidates
   '["<X>","<sibling>"]'` on that leaf → if a sub-leaf is REAL (R3) → label & report; if X's markers are not
-  above background anywhere → say so plainly.
+  above background anywhere → say so plainly. *(clustering-based)*
 - **"Re-annotate only the astrocytes whose positive markers are ON."** → `subcluster` those paths with the
-  astrocyte-subtype candidates → the REAL sub-leaves get the finer label, the rest stay `astrocyte`.
-- **"Split D1 vs D2 MSN in the striatal cluster."** → `subcluster --candidates '["D1-MSN","D2-MSN"]'`.
+  astrocyte-subtype candidates → the REAL sub-leaves get the finer label, the rest stay `astrocyte`. *(clustering-based)*
+- **"Split D1 vs D2 MSN in the striatal cluster."** → `subcluster --candidates '["D1-MSN","D2-MSN"]'`. *(clustering-based)*
+- **"Gather the neurons and find the neuropil / fiber tract."** or **"find neuropil by score"** → **scoring-based
+  (§5 Step S):** on the finalized h5ad, `score-profile [--restrict '["…neuron labels…"]']` → judge each class
+  REAL by `removal.ratio` + anatomy → `score-apply --decisions '{"neuropil":true,…}'` → `score-finalize
+  --column cellman_free_annotation`. Do NOT `subcluster` for this — a process will not separate on a marker axis.
 
-Each refinement = targeted `subcluster`/`descend` + re-judgment (§5) + `finalize`. A finalize AFTER
-interaction writes to `cellman_free_annotation` (`finalize … --column cellman_free_annotation`), keeping
-`cellman_annotation` intact. If a requested type is genuinely absent, report that honestly.
+Each refinement = a targeted `subcluster`/`descend` (clustering-based) OR `score-profile`→`score-apply`→
+`score-finalize` (scoring-based) + re-judgment (§5) + `finalize`. A finalize/score-finalize AFTER interaction
+writes to `cellman_free_annotation` (`--column cellman_free_annotation`), keeping `cellman_annotation` intact.
+If a requested type is genuinely absent, report that honestly.
 
 ---
 
@@ -887,7 +827,7 @@ vascular/immune anchor but you labeled parenchymal — re-weigh, glia may be KDE
   "term_id": "<ontology id if celltype, else ''>",
   "subclass_resolved": true,
   "confidence": "high | medium | low",
-  "reason_code": "multi_identity | sibling_resolvable | pan_class_only | class_floor | split_no_gain | panel_limited | context_axis | neuropil | fiber_tract | transition_background | ''",
+  "reason_code": "multi_identity | sibling_resolvable | pan_class_only | class_floor | split_no_gain | panel_limited | context_axis | ''",
   "provisional_subclass": "<best-guess subclass if class-final, else ''>",
   "key_markers": ["geneA","geneB"],
   "rationale": "<condensed S1–S7: which rules fired, markers ON, why>",
@@ -896,8 +836,8 @@ vascular/immune anchor but you labeled parenchymal — re-weigh, glia may be KDE
 }}
 ```
 **Label hygiene (hard):** clean literature name only — no `(n=…)`, `"?"`, `"possible"`, reason text, or `+`.
-Unknown→"Unknown", Background→"Background", compartment→its `compartment_label` (`neuropil` / `… neuropil` /
-`fiber tract`, with `compartment_term_id`). Reasoning goes in `rationale`.
+Unknown→"Unknown", Background→"Background". Reasoning goes in `rationale`. (Process labels — neuropil /
+fiber tract / … — are written by scoring-based annotation, §5 Step S, NOT through these celltype decisions.)
 
 ### 10.2 `{out}/expert_judgment_round{k}.csv`
 `cluster_path,n_cells,decision,label,term_id,subclass_resolved,confidence,reason_code,key_markers,rationale`.

@@ -5,13 +5,13 @@ is the union of
 
   * data-driven **HVGs** (seurat_v3 on a coarse-bin subsample, minus a
     technical-gene denylist), and
-  * **marker genes** from the Cell-Ontology knowledge-graph wing for the sample's
+  * **marker genes** from the Cell-Ontology knowledge-graph module for the sample's
     (species, organ), fetched via the read-only slim-index REST API.
 
 The KG is reached ONLY through the REST slim-index endpoint (never raw neo4j bolt).
 The server URL is **received as a parameter** — there is no hardcoded IP default:
 resolution is ``server_url`` arg > ``CELLONTO_API`` env > ``None``. When it resolves
-to ``None`` or the wing is unreachable, the panel degrades to **HVG-only** (the
+to ``None`` or the module is unreachable, the panel degrades to **HVG-only** (the
 pipeline never dies on a missing KG).
 """
 
@@ -57,12 +57,17 @@ def _denier(species: str):
 def resolve_server(server_url: Optional[str] = None) -> Optional[str]:
     """Resolve the Cell-Ontology REST base URL by priority.
 
-    ``server_url`` argument > ``CELLONTO_API`` environment variable > ``None``.
-    Returns ``None`` when neither is set — callers then skip the KG (HVG-only).
-    No private IP is baked into source; pass the URL explicitly during dev
-    (e.g. ``"http://10.125.208.41:8088"``).
+    ``server_url`` argument > ``CELLONTO_SERVER_URL`` env > ``CELLONTO_API`` env
+    (back-compat) > ``None``. Returns ``None`` when none is set — callers then
+    skip the KG (HVG-only). ``CELLONTO_SERVER_URL`` is the canonical name (same
+    one ``Agentic-Annotation/scripts/helper.py`` reads); ``CELLONTO_API`` is
+    kept for older setups. No server address is baked into source — pass the URL
+    explicitly or set ``CELLONTO_SERVER_URL`` (e.g. ``https://cellman.pnucolab.com``).
     """
-    return server_url or os.environ.get("CELLONTO_API") or None
+    return (server_url
+            or os.environ.get("CELLONTO_SERVER_URL")
+            or os.environ.get("CELLONTO_API")
+            or None)
 
 
 def _clean(g: str) -> str:
@@ -75,11 +80,11 @@ def fetch_ontology_markers(species: str, organ: str,
                            slots: Iterable[str] = ("R", "S", "N", "DF"),
                            timeout: float = 60.0,
                            verbose: bool = True) -> set:
-    """Fetch the marker-gene set for a wing from the slim-index REST API.
+    """Fetch the marker-gene set for a module from the slim-index REST API.
 
     Collects genes from the requested term slots (Required / Supporting /
     Negative / Defining by default). Returns an empty set (with a warning) when
-    the server is unresolved / unreachable / the wing is missing — the caller
+    the server is unresolved / unreachable / the module is missing — the caller
     then proceeds HVG-only.
     """
     url = resolve_server(server_url)
@@ -89,7 +94,7 @@ def fetch_ontology_markers(species: str, organ: str,
         return set()
     try:
         import requests
-        resp = requests.get(f"{url}/wing/{species}/{organ}/slim-index",
+        resp = requests.get(f"{url}/module/{species}/{organ}/slim-index",
                             timeout=timeout)
         resp.raise_for_status()
         onto = resp.json()
@@ -148,7 +153,7 @@ def select_gene_panel(adata: AnnData, species: str, organ: str, *,
         Bins used for HVG selection (coarse-bin aggregation recommended). If
         ``hvg`` is given it is used verbatim and HVG is not recomputed here.
     species, organ : str
-        Cell-Ontology wing to fetch markers for.
+        Cell-Ontology module to fetch markers for.
     server_url : str, optional
         KG REST base URL. Priority arg > ``CELLONTO_API`` env > ``None``
         (HVG-only). Pass explicitly during development.

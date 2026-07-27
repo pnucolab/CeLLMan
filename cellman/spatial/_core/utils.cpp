@@ -38,7 +38,7 @@ inline omp_int_t omp_get_max_threads() { return 1;}
 
 #ifdef _WIN32
 #include <intrin.h>
-#else
+#elif defined(__x86_64__) || defined(__i386__)
 #include <cpuid.h>
 #endif
 
@@ -132,6 +132,7 @@ void kde(std::unordered_map<pos3d, double> &arr, double *xx, double *yy, double 
     }
 }
 
+#ifdef __AVX512F__
 static double __corr__(double *a, double *b, int ngene) {
     __m512d sum_a = _mm512_setzero_pd();
     __m512d sum_b = _mm512_setzero_pd();
@@ -148,7 +149,7 @@ static double __corr__(double *a, double *b, int ngene) {
 
         sum_a = _mm512_add_pd(sum_a, va);
         sum_b = _mm512_add_pd(sum_b, vb);
-        
+
         sum_aa = _mm512_add_pd(sum_aa, _mm512_mul_pd(va, va));
         sum_bb = _mm512_add_pd(sum_bb, _mm512_mul_pd(vb, vb));
     }
@@ -209,22 +210,51 @@ static double __corr__(double *a, double *b, int ngene) {
 
     return rtn;
 }
+#else
+// Portable scalar fallback (non-x86_64, or AVX-512F unavailable/disabled).
+static double __corr__(double *a, double *b, int ngene) {
+    double a_mean = 0, b_mean = 0, aa_mean = 0, bb_mean = 0;
+    for (int i = 0; i < ngene; i++) {
+        a_mean += a[i] / ngene;
+        b_mean += b[i] / ngene;
+        aa_mean += a[i] * a[i] / ngene;
+        bb_mean += b[i] * b[i] / ngene;
+    }
+
+    double a_std = sqrt(aa_mean - a_mean * a_mean);
+    double b_std = sqrt(bb_mean - b_mean * b_mean);
+    double rtn = 0;
+
+    if (a_std != 0 && b_std != 0) {
+        for (int i = 0; i < ngene; i++) {
+            rtn += (a[i] - a_mean) * (b[i] - b_mean);
+        }
+        rtn /= (a_std * b_std * ngene);
+    }
+
+    return rtn;
+}
+#endif
 
 static PyObject *check_avx512f(PyObject *self, PyObject *args) {
+#if defined(_WIN32) || defined(__x86_64__) || defined(__i386__)
     long is_supported;
     int info[4];
-    
+
     #ifdef _WIN32
     __cpuidex(info, 7, 0);
     #else
     __cpuid_count(7, 0, info[0], info[1], info[2], info[3]);
     #endif
-    
+
     is_supported = (info[1] & (1 << 16)) != 0;  // Check if the 16th bit of EBX is set
     if (is_supported)
         return Py_True;
     else
         return Py_False;
+#else
+    return Py_False;  // non-x86 platforms (e.g. Apple Silicon) never have AVX-512F
+#endif
 }
 
 static PyObject *calc_kde(PyObject *self, PyObject *args, PyObject *kwargs) {

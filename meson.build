@@ -24,11 +24,6 @@ incdir_numpy = run_command(py,
 cpp_args = []
 link_args = []
 
-if openmp_dep.found()
-  cpp_args += ['-fopenmp']
-  link_args += ['-fopenmp']
-endif
-
 # SIMD (AVX-512F) — auto-enabled on x86_64
 simd_opt = get_option('simd')
 if simd_opt.enabled() or (simd_opt.auto() and host_machine.cpu_family() == 'x86_64')

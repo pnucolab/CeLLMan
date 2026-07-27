@@ -37,25 +37,34 @@ They compose, but neither requires the other. If you already have clusters, go s
 
 ## Install
 
-```bash
-git clone https://github.com/<ORG>/CeLLMan.git
-cd CeLLMan
+Run this from your **analysis project** (the directory holding your notebooks/data) — clone
+CeLLMan into it as a subdirectory and keep the venv at the project root, pointing `uv` at the
+`CeLLMan/` path rather than `cd`-ing into it:
 
-python -m venv .venv && source .venv/bin/activate     # or: uv venv .venv --python 3.11
-pip install -e .                                       # CPU
+```bash
+git clone https://github.com/<ORG>/CeLLMan.git      # creates ./CeLLMan
+
+uv venv .venv --python 3.11
+source .venv/bin/activate
+
+# Build deps must be installed into this venv (not an isolated build env): meson-python's
+# editable install re-invokes ninja on every import to check for source changes, so the
+# ninja/meson it calls has to persist — hence meson deps first, then --no-build-isolation.
+uv pip install meson-python meson ninja numpy
+uv pip install --no-build-isolation -e ./CeLLMan       # CPU
 ```
 
 GPU acceleration (KDE, rapids leiden, correlation) needs CUDA-specific wheels:
 
 ```bash
-pip install -e '.[gpu]' --index-strategy unsafe-best-match \
+uv pip install --no-build-isolation -e './CeLLMan[gpu]' --index-strategy unsafe-best-match \
   --extra-index-url https://pypi.nvidia.com \
   --extra-index-url https://download.pytorch.org/whl/cu128
 ```
 
 The C++ extension (`cellman.spatial.utils`) is compiled by meson — you need a C++17 compiler
-with OpenMP. `Agentic-Annotation/` is a plain directory in this repo, **not** a submodule; the
-clone above already contains it.
+with OpenMP. `Agentic-Annotation/` is a plain directory inside `CeLLMan/`, **not** a submodule;
+the clone above already contains it.
 
 ### Register the skills with your LLM host
 

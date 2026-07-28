@@ -259,11 +259,6 @@ def normalize_points_indices(sdata):
     PointsModel.parse otherwise emits on a partially-known categorical.
     """
     def _project_to_2d(t):
-        # Force a true (x,y) -> (x,y) transformation. Without this, a source
-        # transformation whose output_axes is 3D (e.g. vizgen-official pipeline
-        # output) combined with our now-2D points yields
-        # transform_coord_length=3 inside bounding_box_query -> case 2
-        # (data_dim=2, transform_coord_length=3, unsupported).
         if isinstance(t, Identity):
             return Identity()
         try:
@@ -291,7 +286,7 @@ def normalize_points_indices(sdata):
         if drop_cols:
             pdf = pdf.drop(columns=drop_cols)
         pdf = pdf.reset_index(drop=True)
-        pdf.attrs = {}  # so PointsModel.parse can re-attach transformations
+        pdf.attrs = {}
 
         kw = {'coordinates': {'x': 'x', 'y': 'y'}, 'transformations': tx}
         if feature_key is not None and feature_key in pdf.columns:
@@ -329,11 +324,6 @@ def main():
     try:
         extent = get_extent(sdata, coordinate_system=COORDINATE_SYSTEM)
     except ValueError as e:
-        # Merscope/vizgen transcripts parquet often loads as a dask DataFrame
-        # with duplicate indices across partitions; transforming it during
-        # get_extent then raises "cannot reindex on an axis with duplicate
-        # labels". The raster/shape extent already covers the same coordinate
-        # space, so skip points-derived extent in that case.
         if 'duplicate labels' not in str(e):
             raise
         print(f'  WARN: get_extent failed on points ({e}); '
@@ -386,7 +376,6 @@ def main():
                 raise
 
             if not has_biological_data(cropped):
-                # Quick stats for the log
                 npts = sum(points_count(p) for p in cropped.points.values()) if cropped is not None else 0
                 ntab = sum(t.n_obs for t in cropped.tables.values()) if cropped is not None else 0
                 print(f'  -> empty (transcripts={npts}, cells={ntab}), skipping', flush=True)

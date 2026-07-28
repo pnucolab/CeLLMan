@@ -135,14 +135,18 @@ class GridDataset:
         if self.origin == (0.0, 0.0):
             self.origin = (float(sp[:, 0].min()), float(sp[:, 1].min()))
 
-    # -- convenience --------------------------------------------------------
     @property
     def n_genes(self) -> int:
         return int(self.raw.n_vars)
 
     def subset_genes(self, genes) -> "GridDataset":
         """Return a copy of this dataset restricted to ``genes`` (a list of
-        symbols present in ``raw.var_names``), preserving all metadata."""
+        symbols present in ``raw.var_names``), preserving all metadata.
+
+        :param genes: Gene symbols to keep; those absent from ``raw.var_names``
+            are ignored.
+        :type genes: list of str
+        """
         keep = [g for g in genes if g in set(self.raw.var_names)]
         sub = self.raw[:, keep].copy()
         return GridDataset(
@@ -152,36 +156,45 @@ class GridDataset:
             he_revert=self.he_revert, meta=dict(self.meta),
         )
 
-    # -- SpatialData interop ------------------------------------------------
     def to_spatialdata(self, *, table_key: str = "table",
                        image_key: str = "staining", copy: bool = True):
         """Assemble a :class:`spatialdata.SpatialData` from this count sample.
 
-        * ``tables[table_key]`` — the count AnnData (region-less), with all
+        * ``tables[table_key]`` is the count AnnData (region-less), with all
           GridDataset metadata stashed in ``uns['cellman']`` so it round-trips.
-        * ``images[image_key]`` — the staining image ``(c, y, x)`` with an
-          **Affine** ``px → world µm`` transform built from ``affine_px_to_um``
-          (falls back to an isotropic ``um_per_px`` Scale). This is the single
-          cross-platform coordinate contract, now expressed natively.
+        * ``images[image_key]`` is the staining image ``(c, y, x)`` with an
+          **Affine** ``px`` to ``world µm`` transform built from
+          ``affine_px_to_um`` (falls back to an isotropic ``um_per_px`` Scale).
+          This is the single cross-platform coordinate contract, now expressed
+          natively.
 
         The count pipeline (:meth:`SSAMAnalysis.compute_vf`,
         :meth:`~SSAMAnalysis.downsample_vector`) threads this object through;
         :meth:`from_sdata` reconstructs the lightweight view the backend needs.
+
+        :param table_key: Key under which the count table is stored in the
+            resulting SpatialData ``tables``.
+        :type table_key: str
+        :param image_key: Key under which the staining image is stored in the
+            resulting SpatialData ``images``.
+        :type image_key: str
+        :param copy: If ``True`` duplicate ``raw`` before adding metadata; pass
+            ``False`` to mutate ``raw`` in place and skip the copy.
+        :type copy: bool
         """
         import spatialdata as sd
         from spatialdata.models import Image2DModel, TableModel
         from spatialdata.transformations import Affine, Scale
 
-        # staining image → (c, y, x)
         img = np.asarray(self.image)
         orig_ndim = int(img.ndim)
         if img.ndim == 2:
             cyx, nchan = img[None, :, :], 1
-        elif img.shape[-1] in (3, 4):                 # (y, x, c)
+        elif img.shape[-1] in (3, 4):
             cyx = np.moveaxis(img[..., :3], -1, 0); nchan = cyx.shape[0]
-        elif img.shape[0] in (3, 4):                  # (c, y, x)
+        elif img.shape[0] in (3, 4):
             cyx = img[:3]; nchan = cyx.shape[0]
-        else:                                         # single-plane fallback
+        else:
             cyx = img.reshape(-1, *img.shape[-2:])[:1]; nchan = 1
 
         if self.affine_px_to_um is not None:
@@ -195,12 +208,7 @@ class GridDataset:
         image = Image2DModel.parse(cyx, dims=("c", "y", "x"),
                                    transformations={"global": tf})
 
-        # ``copy=False`` skips a full AnnData duplication — ~107s on a 95M-bin
-        # Stereo-seq table, and pure waste when ``self.raw`` was just built for
-        # this call (the loaders). Only the tiny uns['cellman'] is added, so the
-        # sole side effect is that key appearing on the caller's ``raw``.
         tab = self.raw.copy() if copy else self.raw
-        # sanitize for the AnnData zarr writer (no tuples / numpy scalars in uns)
         tab.uns["cellman"] = _jsonify({
             "species": self.species, "organ": self.organ, "platform": self.platform,
             "um_per_px": float(self.um_per_px),
@@ -219,7 +227,17 @@ class GridDataset:
         """Reconstruct a GridDataset view from a count SpatialData built by
         :meth:`to_spatialdata` (reads the count table + ``uns['cellman']`` +
         staining image). The heavy backend consumes this view directly, so the
-        blur / lookup internals stay array-based and unchanged."""
+        blur / lookup internals stay array-based and unchanged.
+
+        :param sdata: Count SpatialData built by :meth:`to_spatialdata`.
+        :type sdata: spatialdata.SpatialData
+        :param table_key: Count-table key; defaults to the table carrying
+            ``uns['cellman']``.
+        :type table_key: str, optional
+        :param image_key: Staining-image key; defaults to the ``image_key``
+            stored in the metadata.
+        :type image_key: str, optional
+        """
         if table_key is None:
             table_key = next((k for k, t in sdata.tables.items()
                               if "cellman" in t.uns), next(iter(sdata.tables)))
@@ -228,12 +246,12 @@ class GridDataset:
         ik = image_key or meta.get("image_key", "staining")
         if ik not in sdata.images:
             ik = next(iter(sdata.images))
-        arr = np.asarray(sdata.images[ik].data)       # (c, y, x)
+        arr = np.asarray(sdata.images[ik].data)
         nchan = int(meta.get("image_nchan", arr.shape[0] if arr.ndim == 3 else 1))
         if arr.ndim == 3 and nchan == 1:
-            image = arr[0]                             # → (y, x)
+            image = arr[0]
         elif arr.ndim == 3:
-            image = np.moveaxis(arr[:3], 0, -1)        # → (y, x, c)
+            image = np.moveaxis(arr[:3], 0, -1)
         else:
             image = arr
         aff = meta.get("affine_px_to_um")
@@ -258,7 +276,16 @@ class GridDataset:
         ``obs_names`` (never used by the count backend). ~25-30x faster; the
         resulting GridDataset is consumed identically by aggregate_to_grid /
         compute_vf. Use in place of ``sd.read_zarr(path)`` + ``from_sdata(sdata)``
-        for the heavy count path (no ``to_spatialdata`` on the result)."""
+        for the heavy count path (no ``to_spatialdata`` on the result).
+
+        :param sdata_path: Filesystem path to the SpatialData zarr store.
+        :type sdata_path: str or pathlib.Path
+        :param table_key: Count-table key within the store.
+        :type table_key: str
+        :param image_key: Staining-image key; defaults to the ``image_key``
+            stored in the metadata.
+        :type image_key: str, optional
+        """
         import zarr
         from scipy.sparse import csr_matrix
         try:

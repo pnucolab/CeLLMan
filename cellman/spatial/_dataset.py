@@ -14,7 +14,6 @@ import numbers
 import zarr
 import dask.array as da 
 
-# Try to import xarray and SpatialData for image saving
 try:
     import xarray as xr
     from spatialdata.models import Image2DModel, Labels2DModel, TableModel
@@ -24,11 +23,9 @@ try:
 except ImportError:
     _SPATIALDATA_AVAILABLE = False
 
-# Try to import utils module (C++ extension)
 try:
     from .utils import corr
 except ImportError:
-    # Fallback to pure Python implementation
     import numpy as np
     corr = lambda a, b: np.corrcoef(a, b)[0, 1]
 
@@ -63,7 +60,6 @@ class SSAMDataset(object):
         self.normalized_vectors = None
         self.expanded_vectors = None
         self.cluster_labels = None
-        #self.corr_map = None
         self.tsne = None
         self.umap = None
         self.excluded_clusters = None
@@ -71,23 +67,17 @@ class SSAMDataset(object):
         self.max_probabilities = None
         self.zarr_store, self.zarr_group = self._get_zarr_group(store)
         self.in_memory = in_memory
-        
-        # Initialize scale properties for SpatialData coordinate transformations
+
         self.x_scale = None
         self.y_scale = None
     
     @staticmethod
     def _get_zarr_group(store):
         if store is None:
-            # memory store
             return None, zarr.group()
 
         zarr_format = None
         if isinstance(store, str):
-            # Detect existing zarr format from on-disk markers so we
-            # don't accidentally open a v2-written store in v3 mode
-            # (which would hide all the v2 arrays already in it). zarr 3
-            # warns about this case but still picks v3 by default.
             import os as _os
             store_path = store
             has_v2 = _os.path.exists(_os.path.join(store_path, '.zgroup'))
@@ -97,13 +87,8 @@ class SSAMDataset(object):
             elif has_v3 and not has_v2:
                 zarr_format = 3
             elif has_v2 and has_v3:
-                # Mixed store: prefer v2 since most legacy ssam state
-                # was written before the zarr 3 migration. Recently
-                # written v3 arrays (e.g., vf_norm, max_correlations)
-                # are not visible in this mode and need re-writing.
                 zarr_format = 2
 
-            # zarr 3+: zarr.storage.LocalStore; zarr 2: zarr.DirectoryStore
             if hasattr(zarr, 'storage') and hasattr(zarr.storage, 'LocalStore'):
                 store = zarr.storage.LocalStore(store_path)
             else:
@@ -135,7 +120,6 @@ class SSAMDataset(object):
         """Return the on-disk path of a zarr store, compatible with zarr 2/3."""
         if store is None:
             return None
-        # zarr 3 LocalStore exposes .root; zarr 2 DirectoryStore exposes .path
         for attr in ('root', 'path'):
             p = getattr(store, attr, None)
             if p is not None:
@@ -165,7 +149,6 @@ class SSAMDataset(object):
             return None
             
         try:
-            # Find the specified points element
             for element_type, elem_name, element in list(sdata.gen_elements()):
                 if element_type == 'points' and elem_name == element_name:
                     transforms = get_transformation(element, get_all=True)
@@ -173,11 +156,6 @@ class SSAMDataset(object):
                     matrix = t.to_affine_matrix(input_axes=('x', 'y'), output_axes=('x', 'y'))
                     self.x_scale = matrix[0, 0]
                     self.y_scale = matrix[1, 1]
-                    # Keep the full element→global affine (2x3) so the overlay can
-                    # apply translation/rotation, not just the diagonal scale.
-                    # Some platforms (e.g. MERSCOPE) carry a non-zero translation
-                    # (y-shift) on the transcripts transform; dropping it offsets
-                    # the downsampled-vector scatter from the morphology image.
                     self._global_affine = np.asarray(matrix[:2, :], dtype=np.float64)
                     return (self.x_scale, self.y_scale)
             
@@ -262,21 +240,6 @@ class SSAMDataset(object):
             self._vf_normalized = da.array(vf_normalized.compute())
         else:
             self._vf_normalized = vf_normalized
-            
-    # @property
-    # def vf_norm(self):
-    #     """
-    #     `L1-norm <http://mathworld.wolfram.com/L1-Norm.html>`_ of the vector field as a numpy.ndarray.
-    #     """
-
-    #     if self.vf is None:
-    #         return None
-    #     if self._vf_norm is None:
-    #         self.zarr_group.zeros(name='vf_norm', shape=self.vf.shape[:-1])
-    #         self.zarr_group['vf_norm'] = self.vf.sum(axis=3).compute()
-    #         self._try_flush()
-    #         self._vf_norm = da.from_zarr(self.zarr_group['vf_norm'])
-    #     return self._vf_norm
 
     @property
     def vf_norm(self):
@@ -325,11 +288,10 @@ class SSAMDataset(object):
 
 
     def _grid_to_original_coords(self, grid_x, grid_y, grid_z=None):
-        """KDE 그리드 좌표를 원본 SpatialData 좌표로 변환"""
+        """Convert KDE grid coordinates to original SpatialData coordinates."""
         if not hasattr(self, 'coordinate_offset') or not hasattr(self, 'sampling_distance'):
             return grid_x, grid_y, grid_z
-            
-        # 그리드 인덱스 -> 실제 거리(μm) -> 원본 좌표
+
         real_x = grid_x * self.sampling_distance + self.coordinate_offset[0]
         real_y = grid_y * self.sampling_distance + self.coordinate_offset[1]
         real_z = None
@@ -340,7 +302,7 @@ class SSAMDataset(object):
     
     @property
     def downsampled_vectors_original_coords(self):
-        """downsampled_vectors를 원본 좌표계로 변환하여 반환"""
+        """Return downsampled_vectors converted to the original coordinate system."""
         if not hasattr(self, 'downsampled_vectors') or self.downsampled_vectors is None:
             return None
             
@@ -350,10 +312,10 @@ class SSAMDataset(object):
         if orig_z is not None:
             return (orig_x, orig_y, orig_z)
         else:
-            return (orig_x, orig_y, grid_z)  # 2D의 경우 z는 그대로
+            return (orig_x, orig_y, grid_z)
 
     def _get_plot_extent(self):
-        """matplotlib imshow에 사용할 extent 계산"""
+        """Compute the extent used for matplotlib imshow."""
         if not hasattr(self, 'original_coordinate_bounds'):
             return None
 
@@ -382,12 +344,11 @@ class SSAMDataset(object):
         sctmap[empty_mask] = (0, 0, 0, 0)
 
         if set_alpha:
-            # per-voxel score = correlation (corr path) or softmax prob (tsvm path)
             score = self.max_correlations if getattr(self, "max_correlations", None) is not None \
                 else getattr(self, "max_probabilities", None)
             if score is not None:
                 alpha = np.array(score[..., z].T, copy=True)
-                alpha[alpha < 0] = 0 # drop negative correlations
+                alpha[alpha < 0] = 0
                 alpha = min_r + alpha / (np.max(alpha) / (1.0 - min_r))
                 sctmap[..., 3] = alpha
 
@@ -406,7 +367,6 @@ class SSAMDataset(object):
         plt.gca().set_facecolor(background)
         plt.imshow(sctmap, interpolation='nearest', extent=extent)
 
-        # plt.gca().invert_yaxis()
         if rotate == 1:
             plt.gca().invert_yaxis()
         elif rotate == 2:
@@ -449,10 +409,6 @@ class SSAMDataset(object):
         :type n_celltypes: int or None
         """
 
-        # Build per-tile color list for the map.
-        # If annotation_csv has global_cluster and no custom colors, use globally consistent colors.
-        # This runs regardless of show_annotation so that the map colors are the same whether
-        # or not the legend is displayed.
         plot_colors = colors
         ann_df = None
         if annotation_csv is not None and colors is None:
@@ -460,9 +416,6 @@ class SSAMDataset(object):
             ann_df = pd.read_csv(annotation_csv)
             if 'global_cluster' in ann_df.columns:
                 cmap_internal = plt.get_cmap(cmap)
-                # n_global priority: explicit parameter > n_global_celltypes column > max+1 in this CSV.
-                # The column-based value is written by cluster-analyst using the full cross-tile count,
-                # so it is the same in every tile's CSV and guarantees consistent color mapping.
                 if n_celltypes is not None:
                     n_global = n_celltypes
                 elif 'n_global_celltypes' in ann_df.columns:
@@ -470,15 +423,12 @@ class SSAMDataset(object):
                 else:
                     n_global = int(ann_df['global_cluster'].max() + 1)
                 num_ctmaps = int(np.max(self.filtered_celltype_maps) + 1)
-                # Sort by local 'cluster' to get the same order as filtered_celltype_maps values.
-                # exclude_and_merge_clusters preserves order, so rank k → map value k.
                 sorted_rows = ann_df.sort_values('cluster')
                 plot_colors = [None] * num_ctmaps
                 for rank, (_, row) in enumerate(sorted_rows.iterrows()):
                     if rank < num_ctmaps:
                         global_id = int(row['global_cluster'])
                         plot_colors[rank] = cmap_internal(float(global_id) / max(n_global - 1, 1))
-                # Fill any unassigned slots with background
                 plot_colors = [c if c is not None else background for c in plot_colors]
 
         self._plot_celltypes_map(self.filtered_celltype_maps, background, centroid_indices, plot_colors, cmap, rotate, min_r, set_alpha, z)
@@ -492,7 +442,6 @@ class SSAMDataset(object):
             if colors is None:
                 cmap_internal = plt.get_cmap(cmap)
                 if 'global_cluster' in ann_df.columns:
-                    # Use global_cluster for consistent cross-tile colors (same as map).
                     if n_celltypes is not None:
                         n_global = n_celltypes
                     elif 'n_global_celltypes' in ann_df.columns:
@@ -504,9 +453,6 @@ class SSAMDataset(object):
                         color = cmap_internal(float(global_id) / max(n_global - 1, 1))
                         patches.append(Patch(facecolor=color, label=row['celltype']))
                 else:
-                    # Fallback: rank-based coloring (no global_cluster column).
-                    # exclude_and_merge_clusters preserves order, so k-th sorted CSV cluster
-                    # corresponds to map value k.
                     num_ctmaps = int(np.max(self.filtered_celltype_maps) + 1)
                     for rank, (_, row) in enumerate(ann_df.sort_values('cluster').iterrows()):
                         color = cmap_internal(float(rank) / max(num_ctmaps - 1, 1))
@@ -518,7 +464,6 @@ class SSAMDataset(object):
                         patches.append(Patch(facecolor=colors[cluster_idx], label=row['celltype']))
             plt.legend(handles=patches, bbox_to_anchor=(1.05, 1), loc='upper left', borderaxespad=0.)
 
-        # Save celltype map to SpatialData if input was SpatialData
         if (save_to_spatialdata and
             _SPATIALDATA_AVAILABLE and
             hasattr(self, '_input_data_type') and
@@ -555,7 +500,7 @@ class SSAMDataset(object):
           :meth:`plot_celltypes_map`) for quick visual inspection. (SpatialData
           keys are globally unique across element types, so the RGB image cannot
           share the labels' key; it takes the ``…_rgb`` suffix by default.)
-        * ``tables[table_key]`` — annotates the labels: instance id → cell-type
+        * ``tables[table_key]`` — annotates the labels: instance id to cell-type
           name (+ colour), built from ``annotation_csv`` when given.
 
         All three carry the SAME ``Scale(sampling_distance) + Translation(origin)``
@@ -564,6 +509,32 @@ class SSAMDataset(object):
 
         ``sdata`` defaults to the SpatialData that was fed to ``compute_vf`` /
         ``downsample_vector`` (remembered as ``_original_input_data``). Returns it.
+
+        :param sdata: Target SpatialData to write the elements into. Defaults to the
+            SpatialData remembered from ``compute_vf`` / ``downsample_vector``.
+        :type sdata: spatialdata.SpatialData or None
+        :param colors: Colours for the clusters. Overrides ``cmap`` when given.
+        :type colors: list or None
+        :param cmap: Colormap used for the clusters when ``colors`` is not given.
+        :type cmap: str or matplotlib.colors.Colormap
+        :param background: Background colour for empty / Unknown voxels.
+        :type background: str or list(float)
+        :param z: Z index to slice a 3D cell-type map. Defaults to the middle slice.
+        :type z: int or None
+        :param min_r: Minimum correlation used when ``set_alpha`` scales opacity.
+        :type min_r: float
+        :param set_alpha: Whether to scale per-pixel opacity by correlation / probability.
+        :type set_alpha: bool
+        :param annotation_csv: Path to an annotation CSV used to build the annotating table.
+        :type annotation_csv: str or None
+        :param labels_key: Key for the integer labels element written into ``sdata``.
+        :type labels_key: str
+        :param image_key: Key for the RGB image element written into ``sdata``.
+        :type image_key: str
+        :param table_key: Key for the annotating table element written into ``sdata``.
+        :type table_key: str
+        :returns: The SpatialData object with the three elements added.
+        :rtype: spatialdata.SpatialData
         """
         if not _SPATIALDATA_AVAILABLE:
             raise ImportError("spatialdata not available — cannot write celltype map")
@@ -575,13 +546,11 @@ class SSAMDataset(object):
         data = self.filtered_celltype_maps
         if z is None:
             z = int(self.shape[2] / 2)
-        lab2d = np.asarray(data[..., z].T)               # (vx=col,vy=row) → (y,x); -1 = bg
+        lab2d = np.asarray(data[..., z].T)
         K = int(lab2d.max()) + 1 if (lab2d.size and lab2d.max() >= 0) else 0
 
-        # ---- labels: -1 → 0 background, clusters → 1..K ----
         labels_arr = (lab2d + 1).astype(np.int32)
 
-        # ---- RGB rendering (same colours as plot_celltypes_map) ----
         if colors is None:
             cmap_internal = plt.get_cmap(cmap)
             colors = cmap_internal([float(i) / max(K - 1, 1) for i in range(max(K, 1))])
@@ -594,16 +563,13 @@ class SSAMDataset(object):
             a = np.asarray(_score[..., z].T, dtype=float); a[a < 0] = 0
             if a.max() > 0:
                 rgba[..., 3] = min_r + a / (a.max() / (1.0 - min_r))
-        rgb = (rgba[..., :3] * rgba[..., 3:4] * 255).astype(np.uint8)     # premultiply on black
-        cyx = np.moveaxis(rgb, -1, 0)                                     # (c, y, x)
+        rgb = (rgba[..., :3] * rgba[..., 3:4] * 255).astype(np.uint8)
+        cyx = np.moveaxis(rgb, -1, 0)
 
-        # ---- transform: raster index (x=col, y=row) → world µm ----
         zg = self.zarr_group
         sd_um = float(zg.attrs.get("sampling_distance",
                       (zg["vf_params"][0] if "vf_params" in zg else 1.0)))
         ox, oy = self._celltype_map_origin(sdata)
-        # count platforms: x_scale=y_scale=1 → exact Scale(sd)+Translation(origin).
-        # transcript platforms fold in the points' world scale (extract_spatialdata_scale).
         xs = float(getattr(self, "x_scale", 1.0) or 1.0)
         ys = float(getattr(self, "y_scale", 1.0) or 1.0)
         mat = np.array([[sd_um * xs, 0.0, ox], [0.0, sd_um * ys, oy], [0.0, 0.0, 1.0]])
@@ -640,7 +606,7 @@ class SSAMDataset(object):
 
     def _write_celltype_table(self, sdata, K, colors, annotation_csv,
                               labels_key, table_key):
-        """Build the labels-annotating table: instance id (cluster+1) → celltype."""
+        """Build the labels-annotating table: instance id (cluster+1) to celltype."""
         import pandas as pd
         from anndata import AnnData
         from matplotlib.colors import to_hex
@@ -669,7 +635,7 @@ class SSAMDataset(object):
                                           rotate=0, min_r=0.6, set_alpha=False, z=None,
                                           image_name="cellman_celltype_map"):
         """Back-compat shim: ``plot_celltypes_map(save_to_spatialdata=True)`` routes
-        here → :meth:`write_celltype_map` (labels + RGB image + annotating table)."""
+        here to :meth:`write_celltype_map` (labels + RGB image + annotating table)."""
         try:
             self.write_celltype_map(colors=colors, cmap=cmap, background=background,
                                     z=z, min_r=min_r, set_alpha=set_alpha)
@@ -699,45 +665,36 @@ class SSAMDataset(object):
            respects whatever transformation lives on the element, which
            is the correct alignment with cell/transcript coordinates.
 
-        Parameters
-        ----------
-        source : str, pathlib.Path, or spatialdata.SpatialData
-            Either a path to an image file, or a SpatialData object
+        :param source: Either a path to an image file, or a SpatialData object
             containing the desired image element.
-        image_key : str, default ``'he'``
-            Image element key when ``source`` is a SpatialData object.
+        :type source: str, pathlib.Path, or spatialdata.SpatialData
+        :param image_key: Image element key when ``source`` is a SpatialData object.
             Use ``'morphology_focus'`` (Xenium), ``'DAPI'`` (Merscope),
             ``'hires_image'`` (Visium), etc., to render the morphology
             channel instead of H&E. Ignored when ``source`` is a path.
-        aspect : str
-            Aspect ratio passed to ``plt.imshow``. Default ``'equal'``.
-        **kwargs
-            Additional keyword arguments forwarded to ``plt.imshow``.
+        :type image_key: str
+        :param aspect: Aspect ratio passed to ``plt.imshow``. Default ``'equal'``.
+        :type aspect: str
+        :param kwargs: Additional keyword arguments forwarded to ``plt.imshow``.
         """
         import matplotlib.pyplot as plt
         from pathlib import Path as _Path
 
-        # ---------- helper: pick a 2D RGB or grayscale array for display ----------
         def _display_array(arr):
             arr = np.asarray(arr)
-            # spatialdata stores images as (c, y, x); xarray DataArray .values
-            # is the same. Move channel to last axis if so.
             if arr.ndim == 3 and arr.shape[0] in (1, 3, 4) and arr.shape[-1] not in (3, 4):
                 arr = np.moveaxis(arr, 0, -1)
             if arr.ndim == 3:
                 if arr.shape[-1] == 1:
                     return arr[..., 0]
                 if arr.shape[-1] == 3:
-                    return arr  # RGB
+                    return arr
                 if arr.shape[-1] == 4:
-                    # 4-channel can be RGBA (uint8) or multi-channel morphology
-                    # (e.g. Xenium morphology_focus, uint16). Heuristic by dtype.
                     if arr.dtype == np.uint8:
                         return arr[..., :3]
-                    return arr[..., 0]   # use first channel (typically DAPI)
-            return arr  # 2D grayscale
+                    return arr[..., 0]
+            return arr
 
-        # ---------- branch on input type ----------
         is_path = isinstance(source, (str, _Path))
 
         if is_path:
@@ -755,7 +712,6 @@ class SSAMDataset(object):
                 x_max = x_bounds[1] * x_scale
                 y_min = y_bounds[0] * y_scale
                 y_max = y_bounds[1] * y_scale
-                # extent = [left, right, bottom, top]; rows top→bottom = y_min→y_max
                 extent = [x_min, x_max, y_max, y_min]
         else:
             try:
@@ -766,7 +722,7 @@ class SSAMDataset(object):
                     "package."
                 ) from e
             try:
-                import spatialdata_plot  # noqa: F401  (registers .pl accessor)
+                import spatialdata_plot  # noqa: F401
             except ImportError as e:
                 raise ImportError(
                     "plot_he with a SpatialData input requires the "
@@ -783,17 +739,11 @@ class SSAMDataset(object):
                     f"Available: {list(source.images.keys())}"
                 )
 
-            # ---- delegate rendering to spatialdata-plot ----
-            # spatialdata-plot handles transformations correctly (rotation,
-            # scaling, etc.) so the rendered raster is axis-aligned in
-            # the requested coordinate system. plot_downsampled_vector can
-            # then scatter onto the same axes for overlay.
             title              = kwargs.pop('title', image_key)
             coordinate_systems = kwargs.pop('coordinate_systems', 'global')
             figsize            = kwargs.pop('figsize', None)
             ax                 = kwargs.pop('ax', None)
 
-            # Split render-side kwargs from show-side kwargs
             _render_keys = {'channel', 'cmap', 'norm', 'na_color',
                             'palette', 'alpha', 'scale'}
             render_kwargs = {k: kwargs.pop(k) for k in list(kwargs)
@@ -813,18 +763,11 @@ class SSAMDataset(object):
                 **kwargs,
             )
             ax.set_aspect(aspect)
-            # spatialdata-plot renders the image onto ``ax`` but also appends a
-            # colorbar axes and leaves *that* as the current axes. A subsequent
-            # ``plot_downsampled_vector`` (plt.scatter) would then land on the
-            # colorbar instead of the image and appear to vanish. Restore the
-            # image axes as current so the overlay scatters onto the image.
             plt.sca(ax)
             return
 
         plt.imshow(he_img, extent=extent, aspect=aspect, **kwargs)
 
-    # Backward-compat alias: the method was renamed plot_he → plot_image
-    # (it renders any morphology/staining image, not just H&E).
     plot_he = plot_image
 
     def plot_downsampled_vector(self, c='red', s=0.3, alpha=0.45, **kwargs):
@@ -837,16 +780,13 @@ class SSAMDataset(object):
 
         Requires ``downsample_vector()`` to have been called first.
 
-        Parameters
-        ----------
-        c : color
-            Colour of the scatter dots. Default ``'red'``.
-        s : float
-            Size of the scatter dots. Default ``0.3``.
-        alpha : float
-            Transparency of the scatter dots. Default ``0.45``.
-        **kwargs
-            Additional keyword arguments forwarded to ``plt.scatter``.
+        :param c: Colour of the scatter dots. Default ``'red'``.
+        :type c: color
+        :param s: Size of the scatter dots. Default ``0.3``.
+        :type s: float
+        :param alpha: Transparency of the scatter dots. Default ``0.45``.
+        :type alpha: float
+        :param kwargs: Additional keyword arguments forwarded to ``plt.scatter``.
         """
         import matplotlib.pyplot as plt
 
@@ -859,10 +799,6 @@ class SSAMDataset(object):
 
         x_coords, y_coords = plot_coords[0], plot_coords[1]
 
-        # Map sampled coords (element/raw frame) into the global frame the
-        # morphology image is drawn in. Prefer the full element→global affine
-        # (scale + translation + rotation) captured by extract_spatialdata_scale;
-        # fall back to the diagonal scale (legacy behaviour) when it is absent.
         M = getattr(self, '_global_affine', None)
         if M is not None:
             px = M[0, 0] * x_coords + M[0, 1] * y_coords + M[0, 2]

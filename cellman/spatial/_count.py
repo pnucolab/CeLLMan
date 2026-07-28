@@ -27,13 +27,8 @@ except Exception:  # noqa: BLE001
         return x
 
 
-# ---------------------------------------------------------------------------
-# GPU separable Gaussian blur
-# ---------------------------------------------------------------------------
 def _gaussian_kernel_1d(sigma_bin, device, prune_coefficient=4.3):
     import torch
-    # kernel truncation radius = prune_coefficient · σ (in bins). SSAM's default
-    # is 4.3 (radius ≈ FWTM ≈ cell diameter); 3.0 ≈ 99.7% mass, tighter/faster.
     radius = int(np.ceil(prune_coefficient * sigma_bin))
     k = torch.arange(-radius, radius + 1, dtype=torch.float32, device=device)
     g = torch.exp(-k ** 2 / (2 * sigma_bin ** 2)); g /= g.sum()
@@ -67,7 +62,7 @@ def _rasterize_blur_tile_gpu(Xt, Rt, Ct, rp0, rp1, cp0, cp1, n_G,
     import torch.nn.functional as F
     h = rp1 - rp0
     w = cp1 - cp0
-    raster = torch.zeros((n_G, h, w), device=device, dtype=dtype)       # GPU zeros (no CPU dense)
+    raster = torch.zeros((n_G, h, w), device=device, dtype=dtype)
     if Xt.shape[0] > 0:
         sub = Xt.tocoo()
         sub_R = (Rt - rp0)[sub.row]
@@ -76,7 +71,7 @@ def _rasterize_blur_tile_gpu(Xt, Rt, Ct, rp0, rp1, cp0, cp1, n_G,
         r = torch.as_tensor(sub_R, device=device, dtype=torch.long)
         c = torch.as_tensor(sub_C, device=device, dtype=torch.long)
         v = torch.as_tensor(sub.data, device=device, dtype=dtype)
-        raster.index_put_((g, r, c), v, accumulate=True)               # transfer only nnz
+        raster.index_put_((g, r, c), v, accumulate=True)
     t = raster.unsqueeze(0)
     t = F.conv2d(t, ky_g, padding=(radius, 0), groups=n_G)
     t = F.conv2d(t, kx_g, padding=(0, radius), groups=n_G)
@@ -109,7 +104,7 @@ def _tensorstore_array(group_dir, name, shape, chunks):
     """
     if group_dir is None:
         return None
-    if os.environ.get("CELLMAN_NO_TENSORSTORE"):       # explicit opt-out → zarr writer
+    if os.environ.get("CELLMAN_NO_TENSORSTORE"):
         return None
     try:
         import tensorstore as ts
@@ -152,7 +147,7 @@ def compute_vf_blur(analysis, bin_adata, *, sigma_bin: float = 1.0,
         ``sigma_bin * bin_size_um`` µm).
       * ``sampling_distance`` — the **output vector-field** grid spacing. The
         blurred field is point-sampled (decimated) by ``stride =
-        round(sampling_distance / bin_size_um)`` → a coarser vf than the raster
+        round(sampling_distance / bin_size_um)``, giving a coarser vf than the raster
         (fewer voxels on disk) while the blur itself stays raster-accurate.
         Defaults to ``bin_size_um`` (stride 1 = output == raster).
 
@@ -169,6 +164,29 @@ def compute_vf_blur(analysis, bin_adata, *, sigma_bin: float = 1.0,
     ``(h, w)`` tuple; ``None`` reverts to the legacy store == compute tile. For
     alignment (no read-modify-write on interior writes) ``chunk_h`` and ``chunk_w``
     should be integer multiples of the store tile (the defaults 64/512 vs 32 are).
+
+    :param analysis: the ``SSAMAnalysis`` instance (provides ``dataset`` and ``verbose``).
+    :type analysis: SSAMAnalysis
+    :param bin_adata: bin-count AnnData with ``obs['array_row']`` / ``obs['array_col']``.
+    :type bin_adata: AnnData
+    :param sigma_bin: Gaussian sigma in raster bins.
+    :type sigma_bin: float
+    :param chunk_h: GPU compute tile height in output rows.
+    :type chunk_h: int
+    :param chunk_w: GPU compute tile width in output columns.
+    :type chunk_w: int
+    :param bin_size_um: blur raster grid spacing in microns.
+    :type bin_size_um: float
+    :param sampling_distance: output vector-field grid spacing in microns; defaults to ``bin_size_um``.
+    :type sampling_distance: float
+    :param prune_coefficient: kernel truncation radius in units of sigma.
+    :type prune_coefficient: float
+    :param size_after_normalization: L1 scale applied before ``log1p``.
+    :type size_after_normalization: float
+    :param store_chunk: on-disk spatial chunk (int square side, ``(h, w)`` tuple, or ``None`` for legacy).
+    :type store_chunk: int or tuple or None
+    :param device: torch device string.
+    :type device: str
     """
     import torch
     zg = analysis.dataset.zarr_group
@@ -176,23 +194,20 @@ def compute_vf_blur(analysis, bin_adata, *, sigma_bin: float = 1.0,
 
     R = bin_adata.obs["array_row"].to_numpy()
     C = bin_adata.obs["array_col"].to_numpy()
-    n_R, n_C = int(R.max() + 1), int(C.max() + 1)       # raster (blur) grid
+    n_R, n_C = int(R.max() + 1), int(C.max() + 1)
     n_G = bin_adata.n_vars
     X = bin_adata.X.tocsr() if issparse(bin_adata.X) else bin_adata.X
 
     if sampling_distance is None:
         sampling_distance = bin_size_um
     stride = max(1, int(round(float(sampling_distance) / float(bin_size_um))))
-    sd_um = float(bin_size_um) * stride                  # true output spacing (µm)
+    sd_um = float(bin_size_um) * stride
     bw_um = float(sigma_bin * bin_size_um)
-    out_R = (n_R + stride - 1) // stride                 # output vf grid
+    out_R = (n_R + stride - 1) // stride
     out_C = (n_C + stride - 1) // stride
     kx, ky, radius = _gaussian_kernel_1d(sigma_bin, device, prune_coefficient)
-    # Blur always runs in fp32 (full precision).
     blur_dtype = torch.float32
     chunk_w = max(1, int(chunk_w))
-    # sort bins by raster row ONCE → O(log n) contiguous row-band selection per tile
-    # (replaces the O(n_bins) boolean scan the untiled path did inside every chunk).
     row_order = np.argsort(R, kind="stable")
     R_s = R[row_order]; C_s = C[row_order]
 
@@ -200,22 +215,14 @@ def compute_vf_blur(analysis, bin_adata, *, sigma_bin: float = 1.0,
               "coordinate_offset", "coordinate_bounds", "original_coordinate_bounds"):
         if k in zg:
             del zg[k]
-    # Store chunk decoupled from the GPU compute tile. Small SQUARE spatial tiles
-    # (gene axis full) let a sparse voxel gather decode only occupied tiles instead
-    # of whole full-width row bands; the compute tile stays large (below). Interior
-    # writes span whole store chunks (chunk_h/chunk_w are multiples of the store tile)
-    # so no read-modify-write. fill_value=0 → unwritten (empty) tiles read back as 0.
     if store_chunk is None:
-        sh_store, sw_store = chunk_h, min(chunk_w, out_C)          # legacy: store == compute tile
+        sh_store, sw_store = chunk_h, min(chunk_w, out_C)
     elif isinstance(store_chunk, (tuple, list)):
         sh_store, sw_store = int(store_chunk[0]), int(store_chunk[1])
     else:
         sh_store = sw_store = int(store_chunk)
     sh_store = max(1, min(sh_store, out_R))
     sw_store = max(1, min(sw_store, out_C))
-    # vf_normalized = the large field and the write bottleneck. Prefer tensorstore's
-    # C++ async writer (bit-identical output, same zarr-v3 metadata); fall back to
-    # the zarr-python writer if tensorstore is absent or the store is not local.
     _store_root = getattr(zg.store, "root", None)
     _group_dir = (os.path.join(str(_store_root), zg.path) if zg.path else str(_store_root)) \
         if _store_root is not None else None
@@ -225,8 +232,7 @@ def compute_vf_blur(analysis, bin_adata, *, sigma_bin: float = 1.0,
     if vf_ts is None:
         vf_z = zg.create_array("vf_normalized", shape=(n_G, out_R, out_C),
                                chunks=(n_G, sh_store, sw_store), dtype="f4", fill_value=0.0)
-    _vf_inflight = []                              # bounded in-flight async writes
-    # vf_norm is 2D, small, and read whole by the gather — keep it compute-tile chunked.
+    _vf_inflight = []
     col_chunk = min(chunk_w, out_C)
     norm_z = zg.create_array("vf_norm", shape=(out_R, out_C),
                              chunks=(chunk_h, col_chunk), dtype="f4", fill_value=0.0)
@@ -238,8 +244,8 @@ def compute_vf_blur(analysis, bin_adata, *, sigma_bin: float = 1.0,
     zg["coordinate_bounds"] = coord_bnd
     zg["original_coordinate_bounds"] = coord_bnd.copy()
     zg.attrs["sigma_bin"] = float(sigma_bin)
-    zg.attrs["bin_size_um"] = float(bin_size_um)          # raster spacing
-    zg.attrs["sampling_distance"] = sd_um                 # output vf spacing
+    zg.attrs["bin_size_um"] = float(bin_size_um)
+    zg.attrs["sampling_distance"] = sd_um
     zg.attrs["stride"] = int(stride)
     zg.attrs["prune_coefficient"] = float(prune_coefficient)
     zg.attrs["size_after_normalization"] = float(size_after_normalization)
@@ -252,14 +258,6 @@ def compute_vf_blur(analysis, bin_adata, *, sigma_bin: float = 1.0,
     ds.sampling_distance = sd_um
     ds.shape = (out_C, out_R, 1)
 
-    # iterate OUTPUT-row chunks; blur the corresponding fine raster rows (+halo),
-    # then decimate rows (stride-spaced) and columns (out_cols).
-    # 2D tiling: iterate OUTPUT-row chunks × OUTPUT-col chunks. Each tile blurs the
-    # corresponding fine raster rows/cols (+ ±radius halo), then decimates to the
-    # output grid. Memory is bounded to n_G × (chunk_h*stride + 2r) × (chunk_w*stride
-    # + 2r), independent of the full raster width (the untiled path held the full n_C).
-    # per-gene expanded kernels are CONSTANT across every tile — build ONCE (was
-    # re-expanded+contiguous'd inside _rasterize on every tile: n_tiles wasted copies).
     kx_g = kx.to(blur_dtype).expand(n_G, 1, 1, -1).contiguous()
     ky_g = ky.to(blur_dtype).expand(n_G, 1, -1, 1).contiguous()
     _cuda = str(device).startswith("cuda")
@@ -269,28 +267,24 @@ def compute_vf_blur(analysis, bin_adata, *, sigma_bin: float = 1.0,
         o_starts = tqdm(o_starts, desc="compute_vf (blur, tiled)")
     for o0 in o_starts:
         o1 = min(out_R, o0 + chunk_h)
-        frows = np.arange(o0, o1) * stride               # global raster rows for these output rows
+        frows = np.arange(o0, o1) * stride
         frows = frows[frows < n_R]
         if len(frows) == 0:
             continue
         rp0 = max(0, int(frows[0]) - radius)
         rp1 = min(n_R, int(frows[-1]) + 1 + radius)
-        # select this row band's bins ONCE via the sorted-row index (contiguous slice)
         lo = int(np.searchsorted(R_s, rp0, side="left"))
         hi = int(np.searchsorted(R_s, rp1, side="left"))
         if hi <= lo:
-            continue                                     # empty band → vf stays 0 (fill_value)
+            continue
         pos = row_order[lo:hi]
         Rb = R_s[lo:hi]; Cb = C_s[lo:hi]; Xb = X[pos]
-        # sort this band by raster COLUMN once → each col tile is a contiguous slice
-        # via searchsorted (replaces the O(band_nnz) np.where boolean re-scan the
-        # untiled inner loop did once PER col tile, i.e. out_C/chunk_w times/band).
         col_order = np.argsort(Cb, kind="stable")
         Cb_c = Cb[col_order]; Rb_c = Rb[col_order]; Xb_c = Xb[col_order]
         lr = torch.as_tensor(frows - rp0, device=device, dtype=torch.long)
         for oc0 in range(0, out_C, chunk_w):
             oc1 = min(out_C, oc0 + chunk_w)
-            ocols = np.arange(oc0, oc1) * stride          # global raster cols for these output cols
+            ocols = np.arange(oc0, oc1) * stride
             ocols = ocols[ocols < n_C]
             if len(ocols) == 0:
                 continue
@@ -299,30 +293,25 @@ def compute_vf_blur(analysis, bin_adata, *, sigma_bin: float = 1.0,
             clo = int(np.searchsorted(Cb_c, cp0, side="left"))
             chi = int(np.searchsorted(Cb_c, cp1, side="left"))
             if chi <= clo:
-                continue                                  # empty tile → vf stays 0 (fill_value)
+                continue
             Xt = Xb_c[clo:chi]; Rt = Rb_c[clo:chi]; Ct = Cb_c[clo:chi]
-            # GPU scatter-rasterize + separable blur of the (row band × col band) tile.
             blurred = _rasterize_blur_tile_gpu(Xt, Rt, Ct, rp0, rp1, cp0, cp1, n_G,
                                                kx_g, ky_g, radius, device, blur_dtype)
             lc = torch.as_tensor(ocols - cp0, device=device, dtype=torch.long)
-            # decimate rows+cols, then normalize in fp32 (protect the per-voxel gene sum).
             chunk = blurred.index_select(1, lr).index_select(2, lc).float().contiguous()
             normalized, vfn = _l1_normalize_log1p(chunk, size_after_normalization)
             nn = normalized.cpu().numpy()
-            if vf_ts is not None:                  # async C++ write (overlaps next tile)
+            if vf_ts is not None:
                 _vf_inflight.append(
                     vf_ts[:, o0:o0 + len(frows), oc0:oc0 + len(ocols)].write(nn))
-                while len(_vf_inflight) > 8:        # bound memory: drain oldest
+                while len(_vf_inflight) > 8:
                     _vf_inflight.pop(0).result()
             else:
                 vf_z[:, o0:o0 + len(frows), oc0:oc0 + len(ocols)] = nn
             norm_z[o0:o0 + len(frows), oc0:oc0 + len(ocols)] = vfn.cpu().numpy()
             del blurred, chunk, normalized
-    for _f in _vf_inflight:                         # flush remaining async writes
+    for _f in _vf_inflight:
         _f.result()
-    # NOTE: torch.cuda.empty_cache() is intentionally NOT called per tile — the
-    # tiling already bounds GPU memory and same-shape tiles are reused by the caching
-    # allocator; releasing to the driver every tile forced a sync + re-request (slow).
     if _cuda:
         torch.cuda.empty_cache()
     zg["kde_computed"][:] = True
@@ -332,9 +321,6 @@ def compute_vf_blur(analysis, bin_adata, *, sigma_bin: float = 1.0,
               f"radius {radius}, bandwidth {bw_um}µm, fp32)")
 
 
-# ---------------------------------------------------------------------------
-# Voxel selection from the tissue image (count downsample)
-# ---------------------------------------------------------------------------
 def _image_gray(image, revert):
     arr = np.asarray(image)
     if arr.ndim == 3:
@@ -356,10 +342,35 @@ def select_vectors_from_image(analysis, grid, *, bin_size_um: float,
                               lookup_n_workers: Optional[int] = None,
                               lookup_ram_gb: float = 32.0) -> np.ndarray:
     """Sample voxels from the tissue image (Otsu mask) and look them up in the
-    precomputed ``vf_normalized`` field → ``normalized_vectors`` (count downsample).
+    precomputed ``vf_normalized`` field into ``normalized_vectors`` (count downsample).
 
     Pixels are mapped to world µm via ``grid.affine_px_to_um`` (folds each
     platform's transpose/flip), then to grid bins via ``grid.origin`` + ``bin_size_um``.
+
+    :param analysis: the ``SSAMAnalysis`` instance (provides ``dataset`` and ``verbose``).
+    :type analysis: SSAMAnalysis
+    :param grid: raster/image grid with ``image``, ``origin``, ``um_per_px``, ``affine_px_to_um``, ``he_revert``.
+    :type grid: object
+    :param bin_size_um: grid bin spacing in microns.
+    :type bin_size_um: float
+    :param n_samples_per_block: pixels sampled per ``block_um`` square.
+    :type n_samples_per_block: int
+    :param block_um: sampling block size in microns.
+    :type block_um: float
+    :param otsu_threshold: fixed tissue-mask threshold; computed by Otsu when ``None``.
+    :type otsu_threshold: float or None
+    :param norm_threshold_mult: multiplier for the analytic ``vf_norm`` threshold when no percentile is used.
+    :type norm_threshold_mult: float
+    :param vf_norm_percentile: percentile of nonzero ``vf_norm`` used as the keep threshold; ``None`` uses the analytic form.
+    :type vf_norm_percentile: float or None
+    :param lookup_chunk_h: retained for API compatibility; no longer sizes the read.
+    :type lookup_chunk_h: int
+    :param seed: RNG seed for pixel sampling.
+    :type seed: int
+    :param lookup_n_workers: worker count for the parallel tile lookup; defaults to ``analysis.ncores``.
+    :type lookup_n_workers: int or None
+    :param lookup_ram_gb: RAM budget bounding concurrent tile decodes.
+    :type lookup_ram_gb: float
     """
     from skimage.filters import threshold_otsu
     zg = analysis.dataset.zarr_group
@@ -369,13 +380,12 @@ def select_vectors_from_image(analysis, grid, *, bin_size_um: float,
     sigma_bin = float(zg.attrs.get("sigma_bin", 1.0))
     X0, Y0 = grid.origin
 
-    # ---- A. Otsu mask + area-proportional pixel sampling ----
     he = _image_gray(grid.image, grid.he_revert)
     upp = grid.um_per_px
     if otsu_threshold is None:
         otsu_threshold = float(threshold_otsu(he))
     mask = he > otsu_threshold
-    ys, xs = np.where(mask)                                   # ys=row(px_y), xs=col(px_x)
+    ys, xs = np.where(mask)
     n_mask = len(ys)
     block_px = (block_um / upp) ** 2
     n_sel = max(int(n_mask / block_px * n_samples_per_block), 1)
@@ -383,7 +393,6 @@ def select_vectors_from_image(analysis, grid, *, bin_size_um: float,
     pick = rng.choice(n_mask, min(n_sel, n_mask), replace=False)
     px_x = xs[pick].astype(np.float64); px_y = ys[pick].astype(np.float64)
 
-    # ---- A'. pixel → world µm (affine) → bin (C, R) ----
     M = grid.affine_px_to_um
     if M is not None:
         M = np.asarray(M)
@@ -394,7 +403,6 @@ def select_vectors_from_image(analysis, grid, *, bin_size_um: float,
     C_i = np.floor((x_um - X0) / bin_size_um).astype(np.int64)
     R_i = np.floor((y_um - Y0) / bin_size_um).astype(np.int64)
 
-    # ---- B. bounds + vf_norm threshold filter ----
     norm_full = norm_z[:]
     if vf_norm_percentile is not None:
         nz = norm_full[norm_full > 0]
@@ -408,19 +416,6 @@ def select_vectors_from_image(analysis, grid, *, bin_size_um: float,
     order = np.argsort(R_sel)
     R_sel, C_sel = R_sel[order], C_sel[order]
 
-    # ---- C. lookup vf_normalized at selected voxels (parallel over occupied tiles) ----
-    # zarr decodes exactly the chunks that overlap a request, so we group the sampled
-    # voxels by the field's OWN storage chunk grid (vf_z.chunks) and read only the
-    # chunks that actually contain a voxel — every empty tile is skipped entirely. For
-    # a square-tiled field (store_chunk in compute_vf) this is the win: a sparse gather
-    # touches only ~occupied tiles instead of full-width row bands. For a legacy
-    # full-width (n_G, h, n_C) field each tile IS a full row band, so this gracefully
-    # reduces to the previous row-band behavior. Each voxel lands in exactly one chunk
-    # → tiles write DISJOINT rows of `nv`, so they decode concurrently without locking.
-    # A "tile" is exactly one storage chunk — reading less than a chunk still decodes
-    # the whole chunk, so we never sub-split it (that would re-decode the same chunk).
-    # lookup_chunk_h is retained for API compat but no longer sizes the read; RAM is
-    # bounded by capping the number of concurrent tile decodes (lookup_ram_gb).
     from concurrent.futures import ThreadPoolExecutor
     nv = np.zeros((len(R_sel), n_G), dtype=np.float32)
     tile_h = int(vf_z.chunks[1]); tile_w = int(vf_z.chunks[2])
@@ -434,7 +429,6 @@ def select_vectors_from_image(analysis, grid, *, bin_size_um: float,
     starts = np.searchsorted(key_o, uniq)
     ends = np.r_[starts[1:], len(key_o)]
 
-    # one decoded tile = n_G * tile_h * tile_w * 4 bytes; cap concurrency to the budget.
     tile_bytes = n_G * tile_h * tile_w * 4
     ram_cap = max(1, int(float(lookup_ram_gb) * (1024 ** 3) / max(1, tile_bytes)))
     n_workers = int(lookup_n_workers if lookup_n_workers is not None
@@ -456,7 +450,7 @@ def select_vectors_from_image(analysis, grid, *, bin_size_um: float,
         import numcodecs
         _prev_blosc = numcodecs.blosc.get_nthreads()
         numcodecs.blosc.set_nthreads(1)
-    except Exception:                                     # noqa: BLE001
+    except Exception:  # noqa: BLE001
         numcodecs, _prev_blosc = None, None
     try:
         if n_workers > 1:
@@ -504,9 +498,6 @@ def select_vectors_from_image(analysis, grid, *, bin_size_um: float,
     return nv
 
 
-# ---------------------------------------------------------------------------
-# Mappers over the precomputed field (count path)
-# ---------------------------------------------------------------------------
 def _write_maps(zg, ds, M, Rc, sd, *, overwrite=True, set_ds_attrs=True):
     cm_3d = M.T[:, :, None].astype(np.int32)
     mc_3d = Rc.T[:, :, None].astype(np.float32)
@@ -536,6 +527,19 @@ def map_corr(analysis, centroids=None, *, vf_norm_threshold=None, chunk_h=128,
     Reads ``vf_normalized`` chunk-by-chunk, mean-centers + L2-normalizes each
     voxel and each centroid, assigns the max-correlation cluster. Output layout
     matches the transcript KDE path so downstream filter/plot work unchanged.
+
+    :param analysis: the ``SSAMAnalysis`` instance (provides ``dataset`` and ``verbose``).
+    :type analysis: SSAMAnalysis
+    :param centroids: cluster centroids ``(k, n_G)``; read from the zarr group when ``None``.
+    :type centroids: numpy.ndarray or None
+    :param vf_norm_threshold: minimum ``vf_norm`` for a voxel to be mapped; auto-derived when ``None``.
+    :type vf_norm_threshold: float or None
+    :param chunk_h: number of raster rows processed per GPU chunk.
+    :type chunk_h: int
+    :param device: torch device string.
+    :type device: str
+    :param overwrite: replace any existing ``celltype_maps`` / ``max_correlations``.
+    :type overwrite: bool
     """
     import torch
     zg = analysis.dataset.zarr_group

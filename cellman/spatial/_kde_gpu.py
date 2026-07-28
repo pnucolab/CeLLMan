@@ -34,19 +34,16 @@ except ImportError:
     _HAS_TRITON = False
 
 
-# =============================================================================
-# Triton kernels — cell-list KDE (gather mode)
-# =============================================================================
 if _HAS_TRITON:
     @triton.jit
     def _kde_cell_kernel(
-        qx_ptr, qy_ptr,                          # (N,) fp64 — original µm coords
-        sx_ptr, sy_ptr, sg_ptr,                  # (M,) sorted by cell id
-        cell_start_ptr,                          # (W*H+1,) i32
-        out_ptr,                                 # (N, n_genes) fp32
+        qx_ptr, qy_ptr,
+        sx_ptr, sy_ptr, sg_ptr,
+        cell_start_ptr,
+        out_ptr,
         N, n_genes, W, H, Rp,
-        x_min, y_min,                            # fp64 — origin for cell-id math
-        inv_sd, two_h2, inv_norm, Rw2,           # fp64 scalars
+        x_min, y_min,
+        inv_sd, two_h2, inv_norm, Rw2,
         BLOCK_T: tl.constexpr,
     ):
         pid = tl.program_id(0)
@@ -86,13 +83,13 @@ if _HAS_TRITON:
 
     @triton.jit
     def _kde_cell_kernel_3d(
-        qx_ptr, qy_ptr, qz_ptr,                  # (N,) fp64
-        sx_ptr, sy_ptr, sz_ptr, sg_ptr,          # (M,) sorted by cell id
-        cell_start_ptr,                          # (W*H*D+1,) i32
-        out_ptr,                                 # (N, n_genes) fp32
+        qx_ptr, qy_ptr, qz_ptr,
+        sx_ptr, sy_ptr, sz_ptr, sg_ptr,
+        cell_start_ptr,
+        out_ptr,
         N, n_genes, W, H, D, Rp,
-        x_min, y_min, z_min,                     # fp64
-        inv_sd, two_h2, inv_norm, Rw2,           # fp64 scalars
+        x_min, y_min, z_min,
+        inv_sd, two_h2, inv_norm, Rw2,
         BLOCK_T: tl.constexpr,
     ):
         pid = tl.program_id(0)
@@ -139,9 +136,6 @@ if _HAS_TRITON:
                                                   mask=keep)
 
 
-# =============================================================================
-# Cell-list builders (GPU)
-# =============================================================================
 def _build_cell_list(lx_g, ly_g, gi_g, sampling_distance, x_min, y_min, W, H):
     inv_sd = 1.0 / sampling_distance
     tx = torch.floor((lx_g - x_min) * inv_sd).to(torch.int64)
@@ -185,15 +179,12 @@ def _build_cell_list_3d(lx_g, ly_g, lz_g, gi_g, sampling_distance,
             cell_start.contiguous())
 
 
-# =============================================================================
-# Public: drop-in GPU replacement for ssam.utils.kde_at_points
-# =============================================================================
 def kde_at_points_gpu(
     query_x, query_y, query_z,
     loc_x, loc_y, loc_z,
     gene_indices, n_genes,
     sampling_distance, bandwidth, prune_coefficient,
-    dim, ncores=None,                  # ncores accepted for signature parity, ignored
+    dim, ncores=None,
     device='cuda',
 ):
     """
@@ -201,6 +192,35 @@ def kde_at_points_gpu(
 
     Same positional signature; ``ncores`` is accepted but ignored.
     Returns a ``float32`` numpy.ndarray of shape (N, n_genes).
+
+    :param query_x: x coordinates of query points.
+    :type query_x: array-like
+    :param query_y: y coordinates of query points.
+    :type query_y: array-like
+    :param query_z: z coordinates of query points (used only for ``dim == 3``).
+    :type query_z: array-like
+    :param loc_x: x coordinates of transcript locations.
+    :type loc_x: array-like
+    :param loc_y: y coordinates of transcript locations.
+    :type loc_y: array-like
+    :param loc_z: z coordinates of transcript locations (used only for ``dim == 3``).
+    :type loc_z: array-like
+    :param gene_indices: per-transcript gene index.
+    :type gene_indices: array-like
+    :param n_genes: number of genes (output column count).
+    :type n_genes: int
+    :param sampling_distance: cell-list grid spacing.
+    :type sampling_distance: float
+    :param bandwidth: Gaussian KDE bandwidth.
+    :type bandwidth: float
+    :param prune_coefficient: kernel truncation radius in units of bandwidth.
+    :type prune_coefficient: float
+    :param dim: spatial dimensionality (2 or 3).
+    :type dim: int
+    :param ncores: accepted for signature parity with the C++ path; ignored.
+    :type ncores: int or None
+    :param device: torch device string.
+    :type device: str
     """
     if not _HAS_TRITON:
         raise ImportError("kde_at_points_gpu requires torch + triton.")
@@ -227,7 +247,6 @@ def kde_at_points_gpu(
     if N == 0:
         return np.zeros((0, n_genes), dtype=np.float32)
 
-    # Domain bounds covering both transcripts and queries (with Rw padding).
     x_min = float(min(lx_g.min().item(), qx_g.min().item())) - Rw - sampling_distance
     y_min = float(min(ly_g.min().item(), qy_g.min().item())) - Rw - sampling_distance
     x_max = float(max(lx_g.max().item(), qx_g.max().item())) + Rw + sampling_distance
@@ -252,17 +271,16 @@ def kde_at_points_gpu(
                 inv_sd, two_h2, inv_norm, Rw2,
                 BLOCK_T=32,
             )
-    else:  # dim == 3
+    else:
         lz_g = torch.as_tensor(loc_z, dtype=torch.float64, device=device).contiguous()
         qz_g = torch.as_tensor(query_z, dtype=torch.float64, device=device).contiguous()
         z_min = float(min(lz_g.min().item(), qz_g.min().item())) - Rw - sampling_distance
         z_max = float(max(lz_g.max().item(), qz_g.max().item())) + Rw + sampling_distance
         D = int(math.ceil((z_max - z_min) * inv_sd)) + 1
 
-        # Sanity check on cell-list memory footprint (cell_start is int32)
         n_cells = W * H * D
         cell_bytes = (n_cells + 1) * 4
-        if cell_bytes > (8 << 30):  # 8 GiB hard ceiling
+        if cell_bytes > (8 << 30):
             raise RuntimeError(
                 f"3D cell list too large: W={W}, H={H}, D={D} → "
                 f"{cell_bytes / (1 << 30):.1f} GiB. "
@@ -286,9 +304,6 @@ def kde_at_points_gpu(
     return out.cpu().numpy()
 
 
-# =============================================================================
-# Context manager — swap ssam.utils.kde_at_points temporarily
-# =============================================================================
 @contextlib.contextmanager
 def gpu_kde(device: str = 'cuda', fallback_3d_to_cpu: bool = False,
             force_2d: bool = False):
@@ -376,11 +391,12 @@ def gpu_kde(device: str = 'cuda', fallback_3d_to_cpu: bool = False,
         _utils.kde_at_points = original
 
 
-# =============================================================================
-# Auto-dispatch: GPU if usable, otherwise no-op (CPU C++ path stays active)
-# =============================================================================
 def gpu_available(device: str = 'cuda') -> bool:
-    """Return True iff torch+triton+CUDA are usable on the requested device."""
+    """Return True iff torch+triton+CUDA are usable on the requested device.
+
+    :param device: torch device string to test (e.g. ``'cuda'`` or ``'cuda:1'``).
+    :type device: str
+    """
     if not _HAS_TRITON:
         return False
     try:
@@ -389,7 +405,7 @@ def gpu_available(device: str = 'cuda') -> bool:
         if device.startswith('cuda:'):
             idx = int(device.split(':', 1)[1])
             return idx < torch.cuda.device_count()
-        return True  # 'cuda' or any other torch device string we treat as ok
+        return True
     except Exception:
         return False
 
@@ -405,6 +421,10 @@ def auto_kde_context(device: str = 'cuda', **gpu_kwargs):
 
     Nesting is safe: an outer ``gpu_kde``/``auto_kde_context`` already in
     effect is preserved by ``gpu_kde``'s save-and-restore protocol.
+
+    :param device: torch device string to dispatch on.
+    :type device: str
+    :param gpu_kwargs: forwarded to :func:`gpu_kde` when a CUDA device is used.
     """
     if gpu_available(device):
         with gpu_kde(device=device, **gpu_kwargs):

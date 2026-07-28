@@ -62,8 +62,6 @@ def main():
         print("already square-tiled at this size; nothing to do.")
         return
 
-    # read band = multiple of the new tile (writes align to new chunk rows → no
-    # row read-modify-write). Full width, so each old chunk is decoded once.
     band_h = max(tile, int(args.band_mult) * tile)
     band_h -= band_h % tile
     band_bytes = n_G * band_h * n_C * 4
@@ -90,13 +88,12 @@ def main():
         el = time.perf_counter() - t0
         print(f"  rows {r0:>6}:{r1:<6}  {el:6.0f}s", flush=True)
 
-    # swap on the filesystem (array identity = directory; zarr.json holds no name).
     old_dir = os.path.join(store_path, args.array)
     tmp_dir = os.path.join(store_path, tmp)
     bak_dir = os.path.join(store_path, f"{args.array}__old")
     if os.path.exists(bak_dir):
         shutil.rmtree(bak_dir)
-    os.rename(old_dir, bak_dir)          # keep old until the new one verifies
+    os.rename(old_dir, bak_dir)
     shutil.move(tmp_dir, old_dir)
 
     chk = zarr.open(store_path, mode="r")[args.array]

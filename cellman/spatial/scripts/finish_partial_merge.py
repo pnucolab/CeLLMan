@@ -21,7 +21,7 @@ the merge artifacts are still pre-merge:
        normalized_vectors grouped by current zarr cluster_labels (l2-normalize
        first, mirroring SSAM `_calc_centroid`).
     5. Shrink downsampled_vectors to surviving rows.
-    6. Write merged_annotation.csv (post-merge id → celltype + member
+    6. Write merged_annotation.csv (post-merge id -> celltype + member
        cluster_paths).
 
 Usage:
@@ -89,7 +89,6 @@ def main():
     print(f'[finish-merge] zarr normalized_vectors  : {nv_shape}')
     print(f'[finish-merge] zarr downsampled_vectors          : {lm_shape}')
 
-    # 1. surviving mask from h5ad
     celltype = adata.obs['celltype_annotation'].astype(str).values
     cluster_path = adata.obs['cluster_path'].astype(str).values
     surviving_mask = ~np.isin(celltype, list(EXCLUDE_LABELS))
@@ -98,7 +97,6 @@ def main():
     print(f'[finish-merge] surviving (non-B/U) rows  : {n_surviving}')
     print(f'[finish-merge] excluded (B + U)          : {n_excluded}')
 
-    # 2. shape sanity checks
     if cl_z.shape[0] != n_surviving:
         sys.exit(
             f'[error] zarr cluster_labels length ({cl_z.shape[0]}) does not '
@@ -116,7 +114,6 @@ def main():
             f'h5ad full row count ({n_total}). abort.'
         )
 
-    # 3. alignment check: each zarr cluster id maps to a single celltype label
     surv_celltype = celltype[surviving_mask]
     surv_cluster_path = cluster_path[surviving_mask]
     cl_to_ct = {}
@@ -134,7 +131,6 @@ def main():
     for cid in sorted(cl_to_ct):
         print(f'    new_id={cid:2d}  ->  {cl_to_ct[cid]}')
 
-    # 4. cluster_path → celltype  (each path leaf maps to one celltype)
     cp_to_ct = {}
     for cp, ct in zip(surv_cluster_path, surv_celltype):
         if cp in cp_to_ct and cp_to_ct[cp] != ct:
@@ -147,7 +143,6 @@ def main():
     for cp, ct in cp_to_ct.items():
         celltype_to_cps[ct].append(cp)
 
-    # 5. recompute centroids/centroids_stdev from current zarr normalized_vectors
     print('[finish-merge] loading normalized_vectors ...')
     nv = np.asarray(z['normalized_vectors'])
     n_genes = nv.shape[1]
@@ -161,7 +156,6 @@ def main():
         centroids_stdev[k, :] = np.std(cl_vecs, axis=0)
     print(f'[finish-merge] centroids shape          : {centroids.shape}')
 
-    # 6. shrink downsampled_vectors to surviving rows
     print('[finish-merge] loading downsampled_vectors ...')
     lm = np.asarray(z['downsampled_vectors'])
     new_downsampled_vectors = lm[:, surviving_mask]
@@ -182,8 +176,6 @@ def main():
         overwrite(z, 'centroids', centroids)
         overwrite(z, 'centroids_stdev', centroids_stdev)
         overwrite(z, 'downsampled_vectors', new_downsampled_vectors)
-        # cluster_labels / filtered_cluster_labels / normalized_vectors are
-        # already correct; leave them as-is.
         overwrite(z, 'filtered_cluster_labels', cl_z.astype(np.int64))
         print('[finish-merge] zarr write complete')
 

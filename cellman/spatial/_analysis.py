@@ -35,7 +35,6 @@ from collections import defaultdict
 import psutil
 import math
 
-# Import scanpy for clustering
 try:
     import scanpy as sc
     import anndata as ad
@@ -51,13 +50,11 @@ from scipy.ndimage import map_coordinates
 
 from packaging import version
 
-# Try to import utils module (C++ extension)
 try:
     from .utils import check_avx512f, calc_corrmap, calc_kde, accumulate_gene, accumulate_gene_vector, normalize_vf
     _UTILS_AVAILABLE = True
 except ImportError:
     _UTILS_AVAILABLE = False
-    # Fallback implementations
     def check_avx512f():
         return False
     
@@ -67,7 +64,6 @@ except ImportError:
     def calc_kde(*args, **kwargs):
         raise NotImplementedError("C++ extension not available. Please build SSAM properly.")
 
-# SpatialData support
 try:
     import spatialdata as sd
     from spatialdata import SpatialData
@@ -99,7 +95,6 @@ def _binary_fill_holes_fast(mask):
         cp.get_default_memory_pool().free_all_blocks()
         return out
     except Exception:
-        # CuPy unavailable / no GPU / OOM -> identical CPU result.
         return ndimage.binary_fill_holes(mask)
 
 if check_avx512f():
@@ -212,9 +207,6 @@ class SSAMAnalysis(object):
 
         
 
-        # zarr 3's ``__contains__`` on Group can be unreliable for plain
-        # arrays in some configurations, so collect keys explicitly once
-        # and then check membership against that set throughout auto-load.
         try:
             zk = set(self.dataset.zarr_group.array_keys())
             zk |= set(self.dataset.zarr_group.group_keys())
@@ -231,7 +223,6 @@ class SSAMAnalysis(object):
             self._m("Loaded existing KDE results.")
             self._load_kde()
 
-        # Load coordinate metadata if available
         if 'coordinate_offset' in zk:
             self.dataset.coordinate_offset = self.dataset.zarr_group['coordinate_offset'][:]
         if 'coordinate_bounds' in zk:
@@ -262,8 +253,6 @@ class SSAMAnalysis(object):
             self.dataset.vf_scaled = da.from_zarr(self.dataset.zarr_group['vf_scaled'])
             self.dataset.scaled_vectors = self.dataset.zarr_group['scaled_vectors'][:]
 
-        # Each of cluster_labels / filtered_cluster_labels / centroids loaded
-        # independently — store may have any subset (e.g. only cluster_labels).
         if 'cluster_labels' in zk:
             self._m("Loaded existing cluster labels.")
             self.dataset.cluster_labels = self.dataset.zarr_group['cluster_labels'][:]
@@ -359,7 +348,6 @@ class SSAMAnalysis(object):
         if not isinstance(sdata, SpatialData):
             raise TypeError(f"Expected SpatialData object, got {type(sdata)}")
         
-        # Get points data
         if element_name is None:
             if len(sdata.points) == 0:
                 raise ValueError("No points data found in SpatialData object")
@@ -370,27 +358,22 @@ class SSAMAnalysis(object):
         
         points_df = sdata.points[element_name]
         
-        # Convert Dask DataFrame to pandas DataFrame if necessary
         if hasattr(points_df, 'compute'):
             points_df = points_df.compute()
         
-        # Determine coordinate system
         if coordinate_system is None:
             if hasattr(points_df, 'attrs') and 'transform' in points_df.attrs:
                 coord_systems = list(points_df.attrs['transform'].keys()) if points_df.attrs['transform'] else []
                 if coord_systems:
                     coordinate_system = coord_systems[0]
         
-        # Extract spatial coordinates
         spatial_coords = ['x', 'y']
         if 'z' in points_df.columns:
             spatial_coords.append('z')
         
-        # Check required columns
         if not all(coord in points_df.columns for coord in spatial_coords[:2]):
             raise ValueError(f"Required spatial coordinates 'x', 'y' not found in points data. Available columns: {points_df.columns.tolist()}")
         
-        # Look for gene information
         gene_col = None
         possible_gene_cols = ['gene', 'gene_symbol', 'feature_name', 'target']
         for col in possible_gene_cols:
@@ -401,24 +384,19 @@ class SSAMAnalysis(object):
         if gene_col is None:
             raise ValueError(f"No gene information found. Expected one of: {possible_gene_cols}. Available columns: {points_df.columns.tolist()}")
         
-        # Filter to real genes only (exclude DeprecatedCodeword, NegControl, etc.)
         if 'is_gene' in points_df.columns:
             points_df = points_df[points_df['is_gene'] == True]
 
-        # Create output DataFrame
         result_cols = [gene_col] + spatial_coords
         result_df = points_df[result_cols].copy()
         
-        # Handle Categorical columns - convert to string
         if pd.api.types.is_categorical_dtype(result_df[gene_col]):
             result_df[gene_col] = result_df[gene_col].astype(str)
         
-        # Ensure coordinate columns are numeric
         for coord in spatial_coords:
             if not pd.api.types.is_numeric_dtype(result_df[coord]):
                 result_df[coord] = pd.to_numeric(result_df[coord], errors='coerce')
         
-        # Rename gene column to 'gene' if necessary
         if gene_col != 'gene':
             result_df = result_df.rename(columns={gene_col: 'gene'})
         
@@ -435,30 +413,24 @@ class SSAMAnalysis(object):
         :param depth: Image depth in um (optional, auto-detected if not provided)
         :returns: Tuple of (DataFrame, width, height, depth, is_3d, coordinate_metadata)
         """
-        # Handle SpatialData input
         if _SPATIALDATA_AVAILABLE and isinstance(data, SpatialData):
-            # Convert SpatialData to DataFrame
             df = self._spatialdata_to_dataframe(data, element_name)
             
-            # Calculate actual coordinate ranges
             x_min, x_max = df['x'].min(), df['x'].max()
             y_min, y_max = df['y'].min(), df['y'].max()
             z_min = z_max = 0
             if 'z' in df.columns:
                 z_min, z_max = df['z'].min(), df['z'].max()
             
-            # Calculate actual dimensions
             actual_width = float(x_max - x_min)
             actual_height = float(y_max - y_min)
             actual_depth = float(z_max - z_min) if 'z' in df.columns else 1
             
-            # Check if 3D data (z dimension meaningful)
-            z_threshold = 1.0  # 1μm threshold
+            z_threshold = 1.0
             is_3d = ('z' in df.columns and 
                     actual_depth > z_threshold and 
                     df['z'].nunique() > 1)
             
-            # If user didn't specify dimensions, use auto-detected values
             if width is None:
                 width = actual_width
             if height is None:
@@ -468,14 +440,12 @@ class SSAMAnalysis(object):
             elif depth is None:
                 depth = 1
                 
-            # Normalize coordinates to start from (0,0,0)
             df_normalized = df.copy()
             df_normalized['x'] = df_normalized['x'] - x_min
             df_normalized['y'] = df_normalized['y'] - y_min
             if 'z' in df_normalized.columns:
                 df_normalized['z'] = df_normalized['z'] - z_min
             
-            # Create coordinate metadata
             coordinate_metadata = {
                 'offset': [float(x_min), float(y_min), float(z_min)],
                 'bounds': [width, height, depth],
@@ -486,18 +456,15 @@ class SSAMAnalysis(object):
                 
             return df_normalized, width, height, depth, is_3d, coordinate_metadata
         
-        # Handle DataFrame input (existing functionality)
         elif isinstance(data, pd.DataFrame):
             df = data.copy()
             
-            # Ensure proper index format
             if df.index.name != 'gene':
                 if 'gene' in df.columns:
                     df = df.set_index('gene')
                 else:
                     raise ValueError("DataFrame must have 'gene' column or 'gene' as index")
             
-            # Validate required columns
             required_cols = ['x', 'y']
             if depth is not None and depth > 1:
                 required_cols.append('z')
@@ -506,25 +473,21 @@ class SSAMAnalysis(object):
             if missing_cols:
                 raise ValueError(f"Missing required columns: {missing_cols}")
             
-            # Calculate actual coordinate ranges
             x_min, x_max = df['x'].min(), df['x'].max()
             y_min, y_max = df['y'].min(), df['y'].max()
             z_min = z_max = 0
             if 'z' in df.columns:
                 z_min, z_max = df['z'].min(), df['z'].max()
             
-            # Calculate actual dimensions
             actual_width = float(x_max - x_min)
             actual_height = float(y_max - y_min)
             actual_depth = float(z_max - z_min) if 'z' in df.columns else 1
             
-            # Check if 3D data
-            z_threshold = 1.0  # 1μm threshold
+            z_threshold = 1.0
             is_3d = ('z' in df.columns and 
                     actual_depth > z_threshold and 
                     df['z'].nunique() > 1)
             
-            # Auto-detect dimensions if not provided
             if width is None:
                 width = actual_width
             if height is None:
@@ -534,14 +497,12 @@ class SSAMAnalysis(object):
             elif depth is None:
                 depth = 1
                 
-            # Normalize coordinates to start from (0,0,0)
             df_normalized = df.copy()
             df_normalized['x'] = df_normalized['x'] - x_min
             df_normalized['y'] = df_normalized['y'] - y_min
             if 'z' in df_normalized.columns:
                 df_normalized['z'] = df_normalized['z'] - z_min
             
-            # Create coordinate metadata
             coordinate_metadata = {
                 'offset': [float(x_min), float(y_min), float(z_min)],
                 'bounds': [width, height, depth],
@@ -556,6 +517,31 @@ class SSAMAnalysis(object):
             raise TypeError(f"Input data must be pandas.DataFrame or spatialdata.SpatialData, got {type(data)}")
         
     def calc_chunk(self, vx, vy, vz, g, mode="kde", rho=1.0, avail_frac=0.1, g2=None):
+        """Compute the X-axis chunk width and chunk count that fit in available RAM.
+
+        :param vx: Number of voxels along the X axis.
+        :type vx: int
+        :param vy: Number of voxels along the Y axis.
+        :type vy: int
+        :param vz: Number of voxels along the Z axis.
+        :type vz: int
+        :param g: Number of genes used to size the per-voxel byte budget.
+        :type g: int
+        :param mode: Memory model to use; ``"map_celltypes_cpu"`` accounts for the
+            mapping buffers, any other value uses the plain KDE estimate.
+        :type mode: str
+        :param rho: Fraction of kept (above-threshold) voxels assumed when sizing
+            the mapping buffers.
+        :type rho: float
+        :param avail_frac: Fraction of currently available system memory the chunk
+            is allowed to occupy.
+        :type avail_frac: float
+        :param g2: Secondary gene count used by the mapping buffers; defaults to
+            ``g`` when None.
+        :type g2: int or None
+        :returns: Tuple ``(cx, n_chunk)`` of chunk width in voxels and chunk count.
+        :rtype: tuple(int, int)
+        """
         avail = psutil.virtual_memory().available
         if mode == "map_celltypes_cpu":
             if g2 is None:
@@ -628,21 +614,17 @@ class SSAMAnalysis(object):
         vecs = self._resolve_cluster_vectors(vectors)
         centroids = []
         centroids_stdev = []
-        #medoids = []
         for lbl in np.unique(cluster_labels):
             if lbl == -1:
                 continue
             cl_vecs = vecs[cluster_labels == lbl, :]
             if normalize:
                 preprocessing.normalize(cl_vecs, norm=norm, axis=1)
-            #cl_dists = scipy.spatial.distance.cdist(cl_vecs, cl_vecs, metric)
-            #medoid = cl_vecs[np.argmin(np.sum(cl_dists, axis=0))]
             centroid = np.mean(cl_vecs, axis=0)
             centroid_stdev = np.std(cl_vecs, axis=0)
-            #medoids.append(medoid)
             centroids.append(centroid)
             centroids_stdev.append(centroid_stdev)
-        return centroids, centroids_stdev#, medoids
+        return centroids, centroids_stdev
 
     def cluster_vectors(self, adata, *, method="leiden", resolution=1.0,
                         key_added="leiden", min_cluster_size=2, max_correlation=1.0,
@@ -686,6 +668,14 @@ class SSAMAnalysis(object):
         min_cluster_size, max_correlation, outlier_detection_method,
         outlier_detection_kwargs :
             Label-refinement controls (unchanged from the previous implementation).
+
+        :param random_state: Random seed forwarded to the Leiden/Louvain backend.
+        :type random_state: int
+        :param auto_gpu: If True, use rapids_singlecell on a CUDA device when
+            available, otherwise fall back to scanpy (CPU).
+        :type auto_gpu: bool
+        :param kwargs: Extra keyword arguments accepted for forward compatibility.
+        :type kwargs: dict
         """
         import scipy.sparse as _sp
         if adata is None or not hasattr(adata, "obs"):
@@ -728,12 +718,10 @@ class SSAMAnalysis(object):
                 return lbls, lbls2
             return lbls
 
-        # normalized vectors = adata.X (same space as vf_normalized -> map_celltypes)
         X = adata.X
         X = X.toarray() if _sp.issparse(X) else np.asarray(X)
         X = X.astype(np.float32)
 
-        # ---- Leiden/Louvain on the caller-built neighbor graph ----
         backend, backend_name = self._pick_clustering_backend(auto_gpu=auto_gpu)
         self._m(f"cluster_vectors: backend = {backend_name}")
         nbrs_kw = {'neighbors_key': neighbors_key} if neighbors_key is not None else {}
@@ -761,7 +749,6 @@ class SSAMAnalysis(object):
         all_lbls = np.asarray(adata.obs[tmp_key].astype(int).values)
         del adata.obs[tmp_key]
 
-        # ---- label refinement + centroids (from adata.X) ----
         if outlier_detection_method is not None:
             filtered_all_lbls = self._correct_cluster_labels(
                 all_lbls, outlier_detection_method, outlier_detection_kwargs, vectors=X)
@@ -794,7 +781,6 @@ class SSAMAnalysis(object):
                 filtered_all_lbls = all_lbls = remove_small_clusters(all_lbls)
             centroids, centroids_stdev = self._calc_centroid(filtered_all_lbls, vectors=X)
 
-        # ---- persist labels + centroids to the store (map_celltypes reads these) ----
         self.dataset.cluster_labels = all_lbls
         self.dataset.filtered_cluster_labels = filtered_all_lbls
         self.dataset.centroids = np.array(centroids)
@@ -807,7 +793,6 @@ class SSAMAnalysis(object):
         self.dataset.zarr_group['centroids'] = self.dataset.centroids
         self.dataset.zarr_group['centroids_stdev'] = self.dataset.centroids_stdev
 
-        # ---- write final labels into adata IN PLACE (scanpy-style) ----
         adata.obs[key_added] = pd.Categorical(np.asarray(filtered_all_lbls).astype(str))
         self._m("Found %d clusters" % len(centroids))
         return None
@@ -935,94 +920,6 @@ class SSAMAnalysis(object):
             'is_3d': is_3d, 'dim': dim,
         }
 
-    # def _compute_normalized_vectors(self, query_voxels, meta, genes=None,
-    #                                  bandwidth=2.5, sampling_distance=1.0,
-    #                                  prune_coefficient=4.3, size_after_normalization=10,
-    #                                  log_transform=True):
-    #     """
-    #     Compute L1-normalised (+ optional log1p) KDE vectors at arbitrary voxel positions.
-    #
-    #     Parameters
-    #     ----------
-    #     query_voxels : ndarray, shape (N, 2|3)  — grid-index coordinates
-    #     meta : dict returned by ``_parse_transcripts``
-    #
-    #     Returns
-    #     -------
-    #     normalized : ndarray (N, n_genes)
-    #     vf_norm    : ndarray (N,)
-    #     genes      : list[str]
-    #     coordinate_offset : list[float]
-    #     """
-    #     from scipy.spatial import cKDTree
-    #
-    #     gene_names = meta['gene_names']
-    #     tx, ty, tz = meta['tx'], meta['ty'], meta['tz']
-    #     is_3d = meta['is_3d']
-    #     dim = meta['dim']
-    #     coordinate_offset = meta['coordinate_offset']
-    #
-    #     if genes is None:
-    #         genes = sorted(np.unique(gene_names))
-    #     gene_to_idx = {g: i for i, g in enumerate(genes)}
-    #     n_genes = len(genes)
-    #
-    #     gidx_arr = np.array([gene_to_idx.get(g, -1) for g in gene_names], dtype=np.int32)
-    #     valid = gidx_arr >= 0
-    #     tx, ty, tz = tx[valid], ty[valid], tz[valid]
-    #     gidx_arr = gidx_arr[valid]
-    #
-    #     query_voxels = np.asarray(query_voxels, dtype=np.float64)
-    #     qx = query_voxels[:, 0] * sampling_distance
-    #     qy = query_voxels[:, 1] * sampling_distance
-    #     qz = (query_voxels[:, 2] * sampling_distance
-    #           if (is_3d and query_voxels.shape[1] > 2)
-    #           else np.zeros(len(qx)))
-    #
-    #     norm_factor = (2.0 * np.pi * bandwidth ** 2) ** (dim / 2.0)
-    #     two_h2 = 2.0 * bandwidth ** 2
-    #     rw = bandwidth * prune_coefficient
-    #     rw2 = rw * rw
-    #     rp = int(np.floor(rw / sampling_distance + 1e-12))
-    #
-    #     if is_3d:
-    #         grid_coords = np.column_stack([meta['xc_g'][valid], meta['yc_g'][valid], meta['zc_g'][valid]])
-    #         query_grid = query_voxels[:, :3]
-    #         transcript_coords = np.column_stack([tx, ty, tz])
-    #         query_coords = np.column_stack([qx, qy, qz])
-    #     else:
-    #         grid_coords = np.column_stack([meta['xc_g'][valid], meta['yc_g'][valid]])
-    #         query_grid = query_voxels[:, :2]
-    #         transcript_coords = np.column_stack([tx, ty])
-    #         query_coords = np.column_stack([qx, qy])
-    #
-    #     grid_tree = cKDTree(grid_coords.astype(np.float64))
-    #     neighbors_list = grid_tree.query_ball_point(query_grid.astype(np.float64), r=rp, p=np.inf)
-    #
-    #     n_query = len(query_voxels)
-    #     kde_values = np.zeros((n_query, n_genes), dtype=np.float32)
-    #
-    #     for i, neighbors in enumerate(neighbors_list):
-    #         if not neighbors:
-    #             continue
-    #         nb = np.asarray(neighbors, dtype=np.int64)
-    #         diff = transcript_coords[nb] - query_coords[i]
-    #         r2 = (diff ** 2).sum(axis=1)
-    #         mask = r2 <= rw2
-    #         if not mask.any():
-    #             continue
-    #         w = (np.exp(-r2[mask] / two_h2) / norm_factor).astype(np.float32)
-    #         np.add.at(kde_values[i], gidx_arr[nb[mask]], w)
-    #
-    #     vf_norm = kde_values.sum(axis=1)
-    #     normalized = np.zeros_like(kde_values)
-    #     nonzero = vf_norm > 0
-    #     normalized[nonzero] = (kde_values[nonzero] / vf_norm[nonzero, np.newaxis]
-    #                            * size_after_normalization)
-    #     if log_transform:
-    #         np.log1p(normalized, out=normalized)
-    #
-    #     return normalized, vf_norm, genes, coordinate_offset
 
     def _compute_normalized_vectors(self, query_voxels, meta, genes=None,
                                      bandwidth=2.5, sampling_distance=1.0,
@@ -1090,9 +987,6 @@ class SSAMAnalysis(object):
 
         return normalized, vf_norm, genes, coordinate_offset
 
-    # -------------------------------------------------------------------------
-    # H&E downsampling helpers
-    # -------------------------------------------------------------------------
 
     def _he_array_from_sdata(self, sdata, image_key='he'):
         """Extract an (H, W, 3) uint8 RGB ndarray from ``sdata.images[image_key]``.
@@ -1122,7 +1016,6 @@ class SSAMAnalysis(object):
             )
         node = sdata.images[image_key]
 
-        # Multiscale (DataTree): pick the full-resolution leaf
         if not hasattr(node, 'values') or hasattr(node, 'children'):
             scale_keys = list(node.keys())
             if not scale_keys:
@@ -1142,43 +1035,21 @@ class SSAMAnalysis(object):
         else:
             arr = node.values
 
-        # ---- Collapse the channel axis to (y, x) or (y, x, 3/4) ----
-        # spatialdata stores images channel-first as (c, y, x). RGB(A) -> move
-        # channels last; single-channel (1, y, x) or (y, x, 1) -> squeeze to 2-D
-        # (handled below by the grayscale replication). Without the single-
-        # channel case a (1, y, x) morphology MIP would slip past moveaxis and
-        # get sliced along x by ``arr[:, :, :3]`` into a (1, y, 3) garbage array.
-        # Multi-channel fluorescence morphology (e.g. MERSCOPE Cellbound stores
-        # 2 stain channels as (2, y, x)) matches none of the RGB(A)/single
-        # branches; without an explicit case the channel axis is never moved and
-        # the final ``arr[:, :, :3]`` slices along x into a (c, y, 3) strip
-        # (observed: (2, 20000, 3)), which the bbox crop then pads to an almost
-        # entirely blank tile. Collapse such stacks to a tissue-bright (y, x)
-        # intensity via a max projection over the channel axis.
         if arr.ndim == 3 and arr.shape[0] in (3, 4) and arr.shape[-1] not in (3, 4):
-            arr = np.moveaxis(arr, 0, -1)        # (3|4, y, x) -> (y, x, 3|4)
+            arr = np.moveaxis(arr, 0, -1)
         elif arr.ndim == 3 and arr.shape[0] == 1:
-            arr = arr[0]                          # (1, y, x) -> (y, x)
+            arr = arr[0]
         elif arr.ndim == 3 and arr.shape[-1] == 1:
-            arr = arr[..., 0]                     # (y, x, 1) -> (y, x)
+            arr = arr[..., 0]
         elif arr.ndim == 3 and arr.shape[0] < arr.shape[-1] and arr.shape[0] not in (3, 4):
-            # channel-first multi-channel (c, y, x), c not 1/3/4 -> max-project
-            arr = arr.max(axis=0)                 # (c, y, x) -> (y, x)
+            arr = arr.max(axis=0)
         elif arr.ndim == 3 and arr.shape[-1] not in (3, 4) and arr.shape[-1] < arr.shape[0]:
-            # channel-last multi-channel (y, x, c), c not 1/3/4 -> max-project
-            arr = arr.max(axis=-1)                # (y, x, c) -> (y, x)
+            arr = arr.max(axis=-1)
 
-        # ---- Cast to uint8 on the 2-D/RGB array (before grayscale stacking) ----
         if arr.dtype != np.uint8:
             if np.issubdtype(arr.dtype, np.floating) and arr.max() <= 1.0:
-                # float image already normalised to [0, 1]
                 arr = (arr.astype(np.float32) * 255.0)
             else:
-                # Higher-bit-depth integer (e.g. uint16 fluorescence) or float
-                # beyond [0, 1]: contrast-stretch per image to 0-255 using the
-                # 99.9th percentile (robust to hot pixels) instead of clipping
-                # to 255, which would saturate tissue and collapse the Otsu
-                # histogram. Percentile is computed on a strided subsample.
                 sub = arr[::8, ::8]
                 hi = float(np.percentile(sub, 99.9))
                 if hi <= 0.0:
@@ -1187,7 +1058,6 @@ class SSAMAnalysis(object):
                 arr = arr.astype(np.float32) * scale
             arr = np.clip(arr, 0, 255).astype(np.uint8)
 
-        # ---- Replicate single channel to RGB ----
         if arr.ndim == 2:
             arr = np.stack([arr, arr, arr], axis=-1)
         if arr.ndim != 3 or arr.shape[-1] < 3:
@@ -1239,25 +1109,20 @@ class SSAMAnalysis(object):
                 f"Available: {list(sdata.images.keys())}"
             )
 
-        # Pull the underlying array at native H&E pixel resolution
-        arr = self._he_array_from_sdata(sdata, image_key=image_key)  # (H, W, 3) uint8
+        arr = self._he_array_from_sdata(sdata, image_key=image_key)
         H, W = arr.shape[:2]
 
-        # Inspect the affine: image-pixel → global
         try:
             tf = _get_tf(sdata.images[image_key], to_coordinate_system='global')
             M = np.asarray(tf.to_affine_matrix(
                 input_axes=('x', 'y'), output_axes=('x', 'y')
             ))
         except Exception:
-            # No transformation info: assume already axis-aligned and aligned
-            # to the transcripts bbox. Best we can do.
             return arr
 
         A = M[:2, :2]
         t = M[:2, 2]
 
-        # ---- Resolve transcripts global bbox (needed for crop) ----
         points_key = element_name
         if points_key is None:
             if 'transcripts' in sdata.points:
@@ -1275,74 +1140,48 @@ class SSAMAnalysis(object):
             except Exception:
                 pass
 
-        # Detect the rotation angle of A (assumes rotation + isotropic scale).
-        # A col 0 = scale * (cos angle, sin angle).
         angle_deg = float(np.degrees(np.arctan2(A[1, 0], A[0, 0])))
 
-        # Snap to the nearest multiple of 90°
         nearest_k = int(round(angle_deg / 90.0)) % 4
         residual_deg = abs(angle_deg - nearest_k * 90.0)
-        # Wrap residual into [-45, 45] for the comparison
         if residual_deg > 45:
             residual_deg = 90 - residual_deg
 
         if residual_deg < 5.0:
-            # ---- Pure 90°-multiple rotation: undo it losslessly ----
             k_rot = (-nearest_k) % 4
             arr_rot = np.ascontiguousarray(np.rot90(arr, k=k_rot))
 
-            # If we couldn't resolve the transcripts bbox, return uncropped
-            # (legacy behaviour). Only happens when sdata has no points.
             if tx_min is None:
                 return arr_rot
 
-            # ---- Compute the de-rotated array's global extent via the
-            # original image's 4 pixel corners ----
             corners_px = np.array(
                 [[0.0, 0.0], [W, 0.0], [0.0, H], [W, H]], dtype=np.float64
             )
-            corners_global = (A @ corners_px.T).T + t  # (4, 2)
+            corners_global = (A @ corners_px.T).T + t
             ix0 = float(corners_global[:, 0].min())
             iy0 = float(corners_global[:, 1].min())
 
-            # Native isotropic pixel size in µm
             s = float(np.sqrt(abs(np.linalg.det(A))))
             if not np.isfinite(s) or s <= 0:
                 return arr_rot
 
             Hr, Wr = arr_rot.shape[:2]
 
-            # ---- Pixel indices in arr_rot that bound the transcripts bbox ----
             col_start = int(np.floor((tx_min - ix0) / s))
             col_end   = int(np.ceil ((tx_max - ix0) / s))
             row_start = int(np.floor((ty_min - iy0) / s))
             row_end   = int(np.ceil ((ty_max - iy0) / s))
 
             if not pad:
-                # OTSU / content use (pad=False): return ONLY the real H&E
-                # pixels inside the bbox window, clipped to the image — no
-                # padding at all. Padding of ANY constant colour adds a large
-                # artificial mode to the intensity histogram and biases the
-                # Otsu threshold (black -> too high, white -> too low). Tiles
-                # whose bbox exceeds the H&E simply contribute their real
-                # pixels, matching the legacy raw-tif Otsu behaviour.
                 vr0, vr1 = max(0, row_start), min(arr_rot.shape[0], row_end)
                 vc0, vc1 = max(0, col_start), min(arr_rot.shape[1], col_end)
                 return np.ascontiguousarray(arr_rot[vr0:vr1, vc0:vc1, :])
 
-            # ---- Pad with white if transcripts bbox extends beyond H&E ----
             pad_left   = max(0, -col_start)
             pad_top    = max(0, -row_start)
             pad_right  = max(0, col_end - Wr)
             pad_bottom = max(0, row_end - Hr)
             if pad_left or pad_top or pad_right or pad_bottom:
-                # Pad with the BACKGROUND colour so padding never masquerades
-                # as tissue. revert_image=True (H&E): background is white, and
-                # the otsu/mask path detects tissue via he_inv = 255 - gray, so
-                # black padding (he_inv=255) would masquerade as max foreground
-                # and inflate the Otsu threshold. revert_image=False (polyT):
-                # background is dark, the mask uses he_inv = gray directly, so
-                # pad with black (0) for the same reason.
                 pad_value = 255 if revert_image else 0
                 arr_rot = np.pad(
                     arr_rot,
@@ -1357,7 +1196,6 @@ class SSAMAnalysis(object):
             cropped = arr_rot[row_start:row_end, col_start:col_end, :]
             return np.ascontiguousarray(cropped)
 
-        # ---- Fallback: arbitrary rotation → rasterize onto transcripts bbox ----
         from spatialdata import rasterize as _rasterize
 
         if tx_min is None:
@@ -1502,19 +1340,12 @@ class SSAMAnalysis(object):
 
         H_he, W_he = he_img.shape[:2]
 
-        # ---- 1. H&E → binary mask ----
-        # he_inv is the tissue-bright intensity. revert_image=True inverts a
-        # bright-background image (H&E); revert_image=False uses the grayscale
-        # directly for an already tissue-bright image (polyT). Must match the
-        # revert_image / intensity passed to _otsu_thresholding for the
-        # threshold to apply to the same representation.
         he_gray = self._rgb_to_intensity(he_img, intensity=intensity)
         he_inv = (255.0 - he_gray) if revert_image else he_gray
         he_sub = np.clip(he_inv - otsu_threshold, 0.0, None)
         he_mask = (np.log1p(he_sub) > 0).astype(np.uint8)
         n_mask_pixels = int(he_mask.sum())
 
-        # ---- 2. VF grid shape ----
         if getattr(self.dataset, 'shape', None) is None:
             self._prepare_grid(
                 sdata,
@@ -1526,10 +1357,8 @@ class SSAMAnalysis(object):
             )
         vx, vy, vz = self.dataset.shape
 
-        # ---- 3. Rescale mask to VF grid ----
         he_grid = zoom(he_mask, (vy / H_he, vx / W_he), order=0) > 0
 
-        # ---- 4. Parse transcripts ----
         meta = self._parse_transcripts(
             sdata, sampling_distance=sampling_distance,
             filter_is_gene=filter_is_gene
@@ -1539,7 +1368,6 @@ class SSAMAnalysis(object):
         expression_threshold = 1 / (np.sqrt(2 * np.pi) * bandwidth) ** ndim
         norm_threshold = expression_threshold * 2
 
-        # ---- 5. Pixel-proportional sampling ----
         x_scale = y_scale = None
         for _etype, _ename, _elem in sdata.gen_elements():
             if _etype == 'points':
@@ -1549,7 +1377,6 @@ class SSAMAnalysis(object):
                     x_scale = _tf.scale[0]
                     y_scale = _tf.scale[1]
                 else:
-                    # Identity or affine without scale attr: assume scale=1
                     try:
                         _aff = _tf.to_affine_matrix(input_axes=('x', 'y'), output_axes=('x', 'y'))
                         x_scale = abs(_aff[0, 0]) if _aff.shape[0] > 0 else 1.0
@@ -1565,10 +1392,6 @@ class SSAMAnalysis(object):
         block_px = (block_um * x_scale) * (block_um * y_scale)
         n_select = min(int(n_mask_pixels / block_px * n_samples), len(ys_all))
         if n_select == 0:
-            # Blank / near-blank tile: nothing to sample. Return empty arrays
-            # so the chunked driver can skip this tile gracefully. The
-            # non-chunked driver inspects ``sample_stats['n_select']`` and
-            # surfaces an informative error to the user.
             empty_int = np.empty(0, dtype=np.int64)
             empty_nvecs = np.empty((0, 0), dtype=np.float64)
             empty_vf = np.empty(0, dtype=np.float64)
@@ -1623,7 +1446,6 @@ class SSAMAnalysis(object):
         coords = np.unique(np.stack([gx_raw, gy_raw, gz_raw], axis=1), axis=0)
         gx_raw, gy_raw, gz_raw = coords[:, 0], coords[:, 1], coords[:, 2]
 
-        # ---- 6. KDE + normalization ----
         query_voxels = np.stack([gx_raw, gy_raw, gz_raw], axis=1)
         normalized_vectors, vf_norm, genes, coordinate_offset = \
             self._compute_normalized_vectors(
@@ -1636,7 +1458,6 @@ class SSAMAnalysis(object):
                 log_transform=log_transform,
             )
 
-        # ---- 7. Filter by norm threshold ----
         keep = vf_norm > norm_threshold
         gx_he = gx_raw[keep]
         gy_he = gy_raw[keep]
@@ -1707,23 +1528,30 @@ class SSAMAnalysis(object):
             tiles containing sampled voxels instead of full-width row bands. Keep
             ``chunk_h``/``chunk_w`` integer multiples of it (defaults are). ``None``
             reverts to the legacy store == compute tile.
+
+        :param sigma_bin: Gaussian bandwidth in bin units. Alternative to
+            ``bandwidth_um``; ignored when ``bandwidth_um`` is given. Defaults to 1.
+        :type sigma_bin: float or None
+        :param size_after_normalization: Target L1 scale each voxel vector is
+            normalized to before the optional log1p.
+        :type size_after_normalization: float
+        :param device: Torch device string used for the GPU blur (e.g. ``'cuda'``).
+        :type device: str
+        :param mode: Input-regime selector; ``'auto'`` detects count vs transcript
+            SpatialData, ``'transcript'`` forces the KDE-field producer branch.
+        :type mode: str
+        :param log_transform: If True, apply log1p to the normalized field.
+        :type log_transform: bool
         """
         from ._count import compute_vf_blur
         from ._griddataset import GridDataset
         from ._io import aggregate_to_grid
 
-        # unified input: a count SpatialData (tables['table'] + images['staining'])
-        # is adapted to the lightweight GridDataset view the backend consumes. The
-        # sdata itself is remembered so the final celltype map can be written back.
         try:
             from spatialdata import SpatialData as _SD
         except Exception:  # noqa: BLE001
             _SD = ()
         if _SD and isinstance(grid, _SD):
-            # regime detection: count SpatialData → GridDataset.from_sdata succeeds;
-            # a transcript/imaging SpatialData (Xenium/MERFISH) cannot be gridded →
-            # route to the KDE field PRODUCER (`_transcript_gpu`, do_map=False) which
-            # streams the field to a tensorstore writer. `mode` forces the branch.
             _gd = None
             _is_transcript = (mode == 'transcript')
             if mode == 'auto':
@@ -1751,12 +1579,11 @@ class SSAMAnalysis(object):
             adata = grid.raw if panel is None else grid.raw[:, [g for g in panel
                                                     if g in set(grid.raw.var_names)]]
             bin_adata = aggregate_to_grid(adata, bin_um, origin=grid.origin)
-            self._count_grid = grid          # remembered for downsample_vector
+            self._count_grid = grid
         else:
             bin_adata = grid if panel is None else grid[:, [g for g in panel
                                                     if g in set(grid.var_names)]]
             bin_um = float(bin_adata.uns.get("bin_size_um", bin_um))
-        # bandwidth: prefer the µm knob; else sigma_bin (bins); else default σ=1 bin.
         if bandwidth_um is not None:
             sigma_bin = float(bandwidth_um) / float(bin_um)
         elif sigma_bin is None:
@@ -1808,6 +1635,9 @@ class SSAMAnalysis(object):
         ----------
         sdata : spatialdata.SpatialData, optional
             Forwarded to the implementation (used when ``chunked=False``).
+        grid : GridDataset, optional
+            Count-regime grid to look voxels up in the precomputed blur field.
+            When None, a ``compute_vf`` grid remembered on the analysis is used.
         auto_gpu : bool, default True
             If False, force CPU regardless of CUDA availability.
         gpu_device : str, default ``'cuda'``
@@ -1832,13 +1662,9 @@ class SSAMAnalysis(object):
                 almost entirely in one channel (e.g. blue DAPI nuclei) and
                 luminance would crush it (blue weighted only 0.114).
         """
-        # ---- count path: sample voxels from the image and look them up in the
-        #      precomputed blur field (no KDE) ----
         grid = grid if grid is not None else getattr(self, '_count_grid', None)
         zg = self.dataset.zarr_group
         is_blur = ('vf_normalized' in zg) and (zg.attrs.get('backend') == 'blur')
-        # a count SpatialData passed positionally (or a fresh kernel with no
-        # remembered grid) → adapt to the GridDataset view the lookup needs.
         if grid is None and is_blur and sdata is not None:
             try:
                 from spatialdata import SpatialData as _SD
@@ -1852,8 +1678,6 @@ class SSAMAnalysis(object):
                 self.dataset._original_input_data = sdata
         if grid is not None and is_blur:
             from ._count import select_vectors_from_image
-            # the vf grid is at the OUTPUT spacing (sampling_distance), not the
-            # blur raster (bin_size_um) — map image px → µm → output bin by it.
             grid_um = float(zg.attrs.get('sampling_distance',
                             zg.attrs.get('bin_size_um', 1.0)))
             sel_keys = ('n_samples_per_block', 'block_um', 'otsu_threshold',
@@ -1861,13 +1685,11 @@ class SSAMAnalysis(object):
                         'lookup_chunk_h', 'seed',
                         'lookup_n_workers', 'lookup_ram_gb')
             sel_kwargs = {k: kwargs[k] for k in sel_keys if k in kwargs}
-            # accept the transcript alias n_samples -> n_samples_per_block
             if 'n_samples' in kwargs and 'n_samples_per_block' not in sel_kwargs:
                 sel_kwargs['n_samples_per_block'] = kwargs['n_samples']
             select_vectors_from_image(self, grid, bin_size_um=grid_um, **sel_kwargs)
             return self._downsampled_adata()
 
-        # ---- transcript path (original KDE-at-sampled-points) ----
         from contextlib import nullcontext as _nullcontext
         if auto_gpu:
             try:
@@ -1952,9 +1774,6 @@ class SSAMAnalysis(object):
         )
 
         if not chunked:
-            # ================================================================
-            # chunked=False : sdata 하나 (H&E는 sdata.images[image_key])
-            # ================================================================
             if sdata is None:
                 raise ValueError('chunked=False requires sdata.')
 
@@ -1964,8 +1783,6 @@ class SSAMAnalysis(object):
                 revert_image=revert_image,
             )
             if otsu_threshold is None:
-                # Otsu on the un-padded real H&E pixels (pad=False); the
-                # background padding in he_img is only for mask/grid alignment.
                 otsu_img = self._he_array_axis_aligned(
                     sdata, image_key=image_key,
                     element_name=element_name, sampling_distance=sampling_distance,
@@ -1974,7 +1791,6 @@ class SSAMAnalysis(object):
                 otsu_threshold, _ = self._otsu_thresholding(
                     [otsu_img], revert_image=revert_image, intensity=intensity)
 
-            # _select_vectors 호출 (ds.shape 초기화 포함)
             self.dataset.shape = None
             gx_he, gy_he, gz_he, normalized_vectors, vf_norm_all, genes, coordinate_offset, sample_stats = \
                 self._select_vectors(he_img, sdata, otsu_threshold, **helper_kwargs)
@@ -1998,9 +1814,6 @@ class SSAMAnalysis(object):
                     print(f'  {k:40s}: {sample_stats[k]}')
 
         else:
-            # ================================================================
-            # chunked=True : sdata_dir의 *.zarr 각각에서 images[image_key] 사용
-            # ================================================================
             if sdata_dir is None:
                 raise ValueError('chunked=True requires sdata_dir.')
 
@@ -2012,21 +1825,11 @@ class SSAMAnalysis(object):
             if self.verbose:
                 print(f'downsample_vector (chunked): {len(zarr_paths)} sdata stores found.')
 
-            # ---- Step 1: 청크별 Otsu (streaming, 한 번에 한 H&E만 RAM에) ----
-            # Otsu는 grayscale 강도 히스토그램에서 임계 스칼라 하나만 뽑는 통계라
-            #   (a) 회전(np.rot90)은 히스토그램 불변 → 불필요,
-            #   (b) transcripts bbox crop도 불필요 — 그런데 _he_array_axis_aligned는
-            #       crop을 위해 get_extent(sdata.points)로 수백만 transcript를 전부
-            #       스캔(타일당 ~140s)한다. 이게 otsu 단계의 사실상 전부의 비용이었다.
-            # → raw H&E를 그대로 읽어(≈1s) stride 서브샘플 후 otsu. 임계는 마스킹 단계의
-            #   풀해상도 이미지(pad=True)에 적용되므로 마스크 해상도는 그대로 유지된다.
-            # 검증(Xenium Prime mouse brain, 6 tiles): stride=4 raw otsu가 axis-aligned
-            #   pad=False otsu와 타일별로 동일(median 79.0). ~7min → ~20s.
             _OTSU_STRIDE = 4
             otsu_vals = []
             for zp in zarr_paths:
                 s = _sd.read_zarr(zp)
-                arr = self._he_array_from_sdata(s, image_key=image_key)   # (H, W, 3) raw, no crop/rot
+                arr = self._he_array_from_sdata(s, image_key=image_key)
                 otsu_img = arr[::_OTSU_STRIDE, ::_OTSU_STRIDE, :]
                 _, single_vals = self._otsu_thresholding(
                     [otsu_img], revert_image=revert_image, intensity=intensity)
@@ -2039,7 +1842,6 @@ class SSAMAnalysis(object):
                     print(f'  {zp.stem}: otsu={v:.0f}')
                 print(f'  median otsu: {otsu_threshold}')
 
-            # ---- Step 2: 청크별 select_vectors 실행 (streaming + GPU 캐시 정리) ----
             import gc as _gc
             try:
                 import torch as _torch
@@ -2049,9 +1851,9 @@ class SSAMAnalysis(object):
 
             all_gx, all_gy, all_gz = [], [], []
             all_nvecs = []
-            all_vfnorm = []     # per-vector vf_norm (local KDE density) per chunk
+            all_vfnorm = []
             all_chunk_genes = []
-            all_offsets = []    # coordinate_offset per chunk ([x_min, y_min, z_min] in µm)
+            all_offsets = []
             all_stats = []
 
             for zp in zarr_paths:
@@ -2065,13 +1867,10 @@ class SSAMAnalysis(object):
                     revert_image=revert_image,
                 )
 
-                # 각 청크마다 ds.shape를 초기화해서 _prepare_grid가 재실행되도록 함
                 self.dataset.shape = None
                 gx, gy, gz, nvecs, vfn, chunk_genes, coord_off, stats = \
                     self._select_vectors(he_img, chunk_sdata, otsu_threshold, **helper_kwargs)
 
-                # Blank tile (no foreground above otsu): skip without contributing
-                # to the global offset / gene-union / concatenation.
                 if stats.get('n_select', 1) == 0:
                     if self.verbose:
                         print(f'    skipped (blank tile, n_mask_pixels='
@@ -2082,34 +1881,24 @@ class SSAMAnalysis(object):
                         _torch.cuda.empty_cache()
                     continue
 
-                # # --- 수정 후 삭제됨 ---
-                # if all_genes is None:
-                #     all_genes = chunk_genes
-                # elif all_genes != chunk_genes:
-                #     raise RuntimeError(
-                #         f'Gene list mismatch between chunks. all_genes has {hp.stem} genes, '
-                #         f'but chunk {hp.stem} has {chunk_genes}.'
-                #     )
 
                 all_gx.append(gx)
                 all_gy.append(gy)
                 all_gz.append(gz)
                 all_nvecs.append(nvecs)
-                all_vfnorm.append(vfn)          # row-aligned with gx/gy/gz/nvecs
+                all_vfnorm.append(vfn)
                 all_chunk_genes.append(chunk_genes)
-                all_offsets.append(coord_off)   # [x_min, y_min, z_min] in µm
+                all_offsets.append(coord_off)
                 all_stats.append(stats)
 
                 if self.verbose:
                     print(f'    kept: {stats["kept_count"]:,}  offset: {coord_off}')
 
-                # ---- per-chunk cleanup: free large H&E array, sdata refs, and GPU cache ----
                 del he_img, chunk_sdata
                 _gc.collect()
                 if _has_cuda:
                     _torch.cuda.empty_cache()
 
-            # All tiles were blank — nothing to assemble.
             if not all_offsets:
                 raise RuntimeError(
                     f'All {len(zarr_paths)} chunks were blank after otsu '
@@ -2118,8 +1907,6 @@ class SSAMAnalysis(object):
                     f'({image_key!r}) and whether the image contains signal.'
                 )
 
-            # ---- Step 3: local voxel 좌표 → global voxel 좌표 ----
-            # global origin = 전체 청크 중 가장 작은 x_min, y_min, z_min
             global_x_min = min(off[0] for off in all_offsets)
             global_y_min = min(off[1] for off in all_offsets)
             global_z_min = min(off[2] for off in all_offsets)
@@ -2138,12 +1925,6 @@ class SSAMAnalysis(object):
             gy_he = np.concatenate(gy_he_list)
             gz_he = np.concatenate(gz_he_list)
 
-            # Correct the global coordinate metadata. Each chunk's _prepare_grid
-            # persisted *its own* offset/bounds to zarr, so the LAST chunk's
-            # (single-tile) values were left behind — wrong for the merged grid.
-            # Recompute the global extent from the merged grid so that the saved
-            # metadata, a reload from zarr, and every consumer of
-            # original_coordinate_bounds (plot extents, etc.) see the full map.
             gx_max_um = global_x_min + float(gx_he.max()) * sampling_distance
             gy_max_um = global_y_min + float(gy_he.max()) * sampling_distance
             gz_max_um = global_z_min + float(gz_he.max()) * sampling_distance
@@ -2158,19 +1939,7 @@ class SSAMAnalysis(object):
                 [global_z_min, gz_max_um],
             ]
 
-            # --- 수정 후 삭제됨 ---
-            # normalized_vectors = np.concatenate(all_nvecs, axis=0)
-            # genes = all_genes
-            # ---  
 
-            # --- 수정 후 추가됨 ---
-            # ---- Align nvecs across chunks via union of gene panels ----
-            # Different chunks (especially sparse edge tiles) may observe
-            # different subsets of the panel. Take the union, sorted, and
-            # zero-pad each chunk's nvecs to the union columns. This is
-            # mathematically identical to running with the union panel from
-            # the start, because missing genes contribute 0 to both KDE
-            # values and the L1 sum used for normalization.
             genes = sorted(set().union(*all_chunk_genes))
             gene_to_idx = {g: i for i, g in enumerate(genes)}
             n_union = len(genes)
@@ -2193,10 +1962,7 @@ class SSAMAnalysis(object):
                     aligned[:, col_idx] = nvecs
                     aligned_nvecs.append(aligned)
             normalized_vectors = np.concatenate(aligned_nvecs, axis=0)
-            # vf_norm is per-row (independent of gene panel), concatenated in the
-            # same chunk order as gx_he / normalized_vectors → row-aligned.
             vf_norm_all = np.concatenate(all_vfnorm)
-            # ---
 
             sample_stats = {
                 'n_chunks': len(zarr_paths),
@@ -2208,9 +1974,6 @@ class SSAMAnalysis(object):
             if self.verbose:
                 print(f'\n  total kept (all chunks): {len(gx_he):,}')
 
-        # ================================================================
-        # 공통: zarr 저장
-        # ================================================================
         vf_norm_all = np.asarray(vf_norm_all)
         self.dataset.downsampled_vectors = (gx_he, gy_he, gz_he)
         self.dataset.normalized_vectors = normalized_vectors
@@ -2226,13 +1989,9 @@ class SSAMAnalysis(object):
 
         self.dataset.zarr_group['downsampled_vectors'] = np.stack([gx_he, gy_he, gz_he], axis=0)
         self.dataset.zarr_group['normalized_vectors'] = normalized_vectors
-        # per-vector local KDE density, row-aligned with normalized_vectors
         self.dataset.zarr_group['downsampled_vf_norm'] = vf_norm_all
         self.dataset.zarr_group['genes'] = np.array(genes)
 
-        # Persist the (corrected) coordinate metadata. In chunked mode the merge
-        # above fixed coordinate_offset / bounds to global values; re-write them
-        # so the store no longer holds the last chunk's single-tile metadata.
         for key in ('coordinate_offset', 'coordinate_bounds',
                     'original_coordinate_bounds'):
             value = getattr(self.dataset, key, None)
@@ -2300,6 +2059,29 @@ class SSAMAnalysis(object):
         Other parameters are shared by the transcript paths; see
         :meth:`map_celltypes_cpu`.
 
+        :param sdata: Transcript SpatialData to map; required in the transcript
+            regime, unused in the count regime.
+        :type sdata: spatialdata.SpatialData or None
+        :param centroids: Per-cluster centroid matrix; falls back to
+            ``self.dataset.centroids`` when None.
+        :type centroids: numpy.ndarray or None
+        :param element_name: Name of the points element to parse from ``sdata``.
+        :type element_name: str or None
+        :param exclude_gene_indices: Gene indices to drop before correlation.
+        :type exclude_gene_indices: list[int] or None
+        :param bandwidth: KDE Gaussian bandwidth in µm (transcript regime).
+        :type bandwidth: float
+        :param sampling_distance: Vector-field grid spacing in µm.
+        :type sampling_distance: float
+        :param prune_coefficient: Kernel truncation radius in bandwidth units.
+        :type prune_coefficient: float
+        :param size_after_normalization: Target L1 scale of each voxel vector.
+        :type size_after_normalization: float
+        :param log_transform: If True, apply log1p to the normalized field.
+        :type log_transform: bool
+        :param overwrite: If True, remove and recreate existing zarr outputs.
+        :type overwrite: bool
+
         Returns
         -------
         None
@@ -2307,7 +2089,6 @@ class SSAMAnalysis(object):
             ``max_correlations`` in zarr, and ``ds.celltype_maps`` /
             ``ds.max_correlations`` in memory); nothing is returned.
         """
-        # ---- count regime: map over the precomputed blur field ----
         zg = self.dataset.zarr_group
         if ('vf_normalized' in zg) and (zg.attrs.get('backend') == 'blur'):
             mk = dict(map_kwargs or {})
@@ -2325,9 +2106,6 @@ class SSAMAnalysis(object):
             else:
                 raise ValueError(f"unknown mapping method {method!r} "
                                  "(count: 'corr'|'tsvm')")
-            # results are persisted to zarr (corr → max_correlations, tsvm →
-            # max_probabilities); nothing is returned so the notebook cell
-            # doesn't dump the array.
             return None
 
         if method != 'corr':
@@ -2387,7 +2165,6 @@ class SSAMAnalysis(object):
         """
         from tqdm.auto import tqdm
 
-        # Load latest state from zarr store
         self.dataset.cluster_labels          = self.dataset.zarr_group['cluster_labels'][:]
         self.dataset.downsampled_vectors              = self.dataset.zarr_group['downsampled_vectors'][:]
         self.dataset.normalized_vectors      = self.dataset.zarr_group['normalized_vectors'][:]
@@ -2395,7 +2172,6 @@ class SSAMAnalysis(object):
         self.dataset.centroids               = self.dataset.zarr_group['centroids'][:]
         self.dataset.centroids_stdev         = self.dataset.zarr_group['centroids_stdev'][:]
 
-        # ---- centroids ----
         if centroids is None:
             if getattr(self.dataset, 'centroids', None) is None:
                 raise ValueError('centroids not found. Run cluster_vectors() first.')
@@ -2403,7 +2179,6 @@ class SSAMAnalysis(object):
         else:
             centroids = np.asarray(centroids, dtype=np.float32)
 
-        # ---- grid shape: reuse if already computed ----
         if getattr(self.dataset, 'shape', None) is None:
             self._prepare_grid(
                 sdata,
@@ -2414,7 +2189,6 @@ class SSAMAnalysis(object):
                 size_after_normalization=size_after_normalization,
             )
         else:
-            # locations must be set; if missing (e.g. fresh load), re-parse
             if not hasattr(self, 'locations') or self.locations is None:
                 self._prepare_grid(
                     sdata,
@@ -2436,7 +2210,6 @@ class SSAMAnalysis(object):
         )
         self.dataset.norm_threshold = self.dataset.expression_threshold * 2
 
-        # ---- resolve gene list ----
         grouped = self.locations.groupby('gene', sort=True)
         grouped_map = {gene: loc for gene, loc in grouped}
 
@@ -2473,7 +2246,6 @@ class SSAMAnalysis(object):
             exclude_shared = None
             centroids_use = centroids_shared
 
-        # ---- zarr setup ----
         def _safe_remove(name):
             if name in self.dataset.zarr_group:
                 del self.dataset.zarr_group[name]
@@ -2491,17 +2263,12 @@ class SSAMAnalysis(object):
         self.dataset._zarr_create_array(self.dataset.zarr_group, 'celltype_maps', (vx, vy, vz), 'i4')
         self.dataset._zarr_create_array(self.dataset.zarr_group, 'max_correlations', (vx, vy, vz), 'f4')
 
-        # gene axis of the mapped field = shared genes minus the excluded ones
-        # (matches ``centroids_use`` / the GPU path's ``use_genes``).
         use_genes = ([shared_genes[i] for i in range(len(shared_genes))
                       if i not in set(exclude_shared)]
                      if exclude_shared is not None else list(shared_genes))
         n_genes_use = int(centroids_use.shape[1])
         _cpu_vf_ts = None; _cpu_vf_zarr = None; _cpu_inflight = []
         if save_vf:
-            # opt-in: persist the on-the-fly KDE field, gene axis first (like the
-            # count backend). Prefer tensorstore's C++ async writer (bit-identical,
-            # same zarr-v3 metadata); fall back to zarr-python.
             from ._count import _tensorstore_array
             _safe_remove('vf_normalized'); _safe_remove('vf_normalized_genes')
             self.dataset.zarr_group['vf_normalized_genes'] = np.asarray(use_genes)
@@ -2521,7 +2288,6 @@ class SSAMAnalysis(object):
         import numcodecs as _nc2
         _nc2.blosc.set_nthreads(self.ncores)
 
-        # ---- chunk loop ----
         for chunk_idx in range(n_chunk):
             x0 = chunk_idx * cx
             x1 = min(vx, x0 + cx)
@@ -2569,9 +2335,6 @@ class SSAMAnalysis(object):
             self.dataset.zarr_group['vf_norm'][x0:x1, :, :] = vf_norm_chunk
 
             if save_vf:
-                # normalize the FULL field (all voxels, all shared genes), drop the
-                # excluded gene columns, then store gene-first. Independent of the
-                # kept-voxel mapping below → celltype map unaffected by save_vf.
                 vf_full = (vf_chunk
                            / np.clip(vf_norm_chunk[..., None], 1e-12, None)
                            * float(size_after_normalization))
@@ -2637,7 +2400,7 @@ class SSAMAnalysis(object):
             del local_ctmap, local_corr
             gc.collect()
 
-        for _f in _cpu_inflight:                        # flush pending tensorstore writes
+        for _f in _cpu_inflight:
             _f.result()
         import dask.array as _da
         self.dataset._vf_norm = _da.from_zarr(self.dataset.zarr_group['vf_norm'])
@@ -2648,12 +2411,18 @@ class SSAMAnalysis(object):
         """
         Post-filter cell type maps created by `map_celltypes`.
 
+        :param min_p: minimum threshold of the softmax probability, used when a
+            probability volume (``max_probabilities``) is present instead of
+            correlations.
+        :type min_p: float
         :param min_r: minimum threshold of the correlation.
         :type min_r: float
         :param min_norm: minimum threshold of the vector norm.
             If a string is given instead, then the threshold is automatically determined using
             sklearn's `threshold filter functions <https://scikit-image.org/docs/dev/api/skimage.filters.html>`_ (The functions start with `threshold_`).
         :type min_norm: str or float
+        :param fill_blobs: If True, fill enclosed holes inside the kept blobs.
+        :type fill_blobs: bool
         :param min_blob_area: The blobs with its area less than this value will be removed.
         :type min_blob_area: int
         :param filter_params: Filter parameters used for the sklearn's threshold filter functions.
@@ -2663,9 +2432,6 @@ class SSAMAnalysis(object):
         :type output_mask: np.ndarray(bool)
         """
 
-        # Pick the per-voxel score volume (probability or correlation) and its
-        # threshold once. ``get_celltype_*`` builds a full-volume array per
-        # cell type, so we read the underlying volume directly instead.
         if self.dataset.max_probabilities is not None:
             score_vol = self.dataset.max_probabilities
             if score_vol.ndim == 4:
@@ -2678,12 +2444,7 @@ class SSAMAnalysis(object):
         celltype_maps = self.dataset.celltype_maps
 
         if isinstance(min_norm, str):
-            # Adaptive per-slice threshold path (rare). Kept close to the
-            # original, but the score is read from ``score_vol`` masked by the
-            # cell-type id rather than rebuilding a full volume per cell type.
             _filter_params = filter_params.copy()
-            # _filter_params dict will be used for kwd params for filter_* functions.
-            # some functions doesn't support param 'offset', therefore remove it from here
             filter_offset = _filter_params.pop('offset', 0)
 
             mask = np.zeros(self.dataset.vf_norm.shape, dtype=bool)
@@ -2710,42 +2471,28 @@ class SSAMAnalysis(object):
                             min_norm_cut = filter_func(im, **_filter_params)
                         else:
                             highr_norm = vf_norm_z[ctcorr_mask_z]
-                            #sigma = np.std(highr_norm)
                             if len(highr_norm) == 0 or np.max(highr_norm) == np.min(highr_norm):
                                 min_norm_cut = np.max(self.dataset.vf_norm)
                             else:
                                 min_norm_cut = filter_func(highr_norm, **_filter_params)
-                    min_norm_cut += filter_offset # manually apply filter offset
+                    min_norm_cut += filter_offset
                     mask[..., z][np.logical_and(vf_norm_z > min_norm_cut, ctcorr_mask_z)] = 1
         else:
-            # Fast vectorized path for a numeric ``min_norm``. The original
-            # per-cell-type union reduces exactly to this single expression:
-            # a voxel is kept iff it has a (non-background) cell type whose
-            # score and vector-field norm both pass their thresholds.
             vf_norm = np.asarray(self.dataset.vf_norm)
-            # vf_norm is stored 2D as (n_R, n_C) while score_vol / celltype_maps
-            # are (n_C, n_R, 1). Without aligning orientation+ndim, the elementwise
-            # `&` below broadcasts to (n_C, n_R, n_C) -- O(n_C^2 * n_R), ~125GB on
-            # large maps (minutes + swap, wrong-shaped mask). Align to match.
             if vf_norm.ndim == 2 and score_vol.ndim == 3:
                 vf_norm = vf_norm.T[..., None]
             mask = (vf_norm > min_norm) & (score_vol > r_thr) & (celltype_maps != -1)
 
-        # Blob post-processing — run ONCE on the final mask instead of once per
-        # cell type on the growing cumulative mask (the original O(N_celltypes)
-        # bottleneck).
         if min_blob_area > 0:
             blob_labels = measure.label(mask, background=0)
             for bp in measure.regionprops(blob_labels):
                 if bp.area_filled < min_blob_area:
-                    mask[tuple(bp.coords.T)] = 0  # remove small blob
+                    mask[tuple(bp.coords.T)] = 0
                     continue
                 if fill_blobs and bp.area != bp.area_filled:
                     minx, miny, minz, maxx, maxy, maxz = bp.bbox
                     mask[minx:maxx, miny:maxy, minz:maxz] |= bp.image_filled
         elif fill_blobs:
-            # Fill enclosed holes in one optimized pass (GPU when available;
-            # bit-identical boolean morphology, auto CPU fallback).
             mask = _binary_fill_holes_fast(mask)
 
         filtered_ctmaps = np.array(celltype_maps, copy=True)
@@ -2756,9 +2503,6 @@ class SSAMAnalysis(object):
         self.dataset.filtered_celltype_maps = filtered_ctmaps
         self.dataset.zarr_group['filtered_celltype_maps'] = self.dataset.filtered_celltype_maps
 
-    # ------------------------------------------------------------------
-    # GPU equivalent of map_celltypes_cpu
-    # ------------------------------------------------------------------
 
     def _map_celltypes_gpu(self, sdata, centroids=None, element_name=None,
                           exclude_gene_indices=None,
@@ -2806,11 +2550,6 @@ class SSAMAnalysis(object):
             gpu_target_bytes=gpu_target_bytes,
         )
 
-    # Backward-compat aliases: the CPU/GPU implementations are now internal
-    # branches of :meth:`map_celltypes` (the single public entry point). These
-    # public names are kept so older callers (e.g. xenium notebooks that invoke
-    # ``analysis.map_celltypes_cpu(...)`` directly) keep working; prefer
-    # ``map_celltypes(..., force_cpu=...)`` in new code.
     map_celltypes_cpu = _map_celltypes_cpu
     map_celltypes_gpu = _map_celltypes_gpu
 
@@ -2847,14 +2586,12 @@ class SSAMAnalysis(object):
         if not torch.cuda.is_available():
             raise RuntimeError("map_celltypes_gpu requires a CUDA device")
 
-        # ---- load zarr state (same as map_celltypes_cpu) ----
         for key in ('cluster_labels', 'downsampled_vectors', 'normalized_vectors',
                     'filtered_cluster_labels', 'centroids', 'centroids_stdev'):
             if key in self.dataset.zarr_group:
                 setattr(self.dataset, key,
                         self.dataset.zarr_group[key][:])
 
-        # ---- centroids ----
         if centroids is None:
             if getattr(self.dataset, 'centroids', None) is None:
                 raise ValueError('centroids not found. Run cluster_vectors() first.')
@@ -2862,7 +2599,6 @@ class SSAMAnalysis(object):
         else:
             centroids = np.asarray(centroids, dtype=np.float32)
 
-        # ---- grid shape ----
         if getattr(self.dataset, 'shape', None) is None or \
                 not hasattr(self, 'locations') or self.locations is None:
             self._prepare_grid(
@@ -2884,7 +2620,6 @@ class SSAMAnalysis(object):
         self.dataset.norm_threshold = self.dataset.expression_threshold * 2
         norm_threshold = float(self.dataset.norm_threshold)
 
-        # ---- gene list / shared / exclude ----
         grouped = self.locations.groupby('gene', sort=True)
         grouped_map = {gene: loc for gene, loc in grouped}
 
@@ -2928,7 +2663,6 @@ class SSAMAnalysis(object):
             centroids_use = centroids_shared
         n_genes_use = centroids_use.shape[1]
 
-        # ---- zarr setup (same as map_celltypes_cpu) ----
         def _safe_remove(name):
             if name in self.dataset.zarr_group:
                 del self.dataset.zarr_group[name]
@@ -2945,9 +2679,6 @@ class SSAMAnalysis(object):
             self.dataset._zarr_create_array(self.dataset.zarr_group, 'celltype_maps', (vx, vy, vz), 'i4')
             self.dataset._zarr_create_array(self.dataset.zarr_group, 'max_correlations', (vx, vy, vz), 'f4')
             if save_vf:
-                # opt-in: persist the on-the-fly KDE field (gene axis first, like
-                # the count backend's vf_normalized). x is chunked 1-plane-wide so
-                # each per-chunk write [:, x0:x1] spans whole store chunks (no RMW).
                 _safe_remove('vf_normalized'); _safe_remove('vf_normalized_genes')
                 self.dataset.zarr_group.create_array(
                     'vf_normalized', shape=(n_genes_use, vx, vy, vz),
@@ -2968,11 +2699,9 @@ class SSAMAnalysis(object):
         if chunk_end is None:
             chunk_end = n_chunk
 
-        # ---- auto-size sub-chunk to fit GPU output buffer ----
         if query_subchunk_size is None:
             query_subchunk_size = max(1024, int(gpu_target_bytes // (n_genes_use * 4)))
 
-        # ---- Build flat transcript arrays for use_genes ----
         all_loc_x, all_loc_y, all_loc_z, all_gi = [], [], [], []
         for gidx_use, g in enumerate(use_genes):
             locs = np.asarray(grouped_map[g], dtype=np.float64)
@@ -2998,7 +2727,6 @@ class SSAMAnalysis(object):
             gi_np    = np.zeros(0, dtype=np.int64)
         del all_loc_x, all_loc_y, all_loc_z, all_gi
 
-        # ---- Move transcripts + centroids to GPU once ----
         loc_x_t = torch.as_tensor(loc_x_np, dtype=torch.float64, device=gpu_device)
         loc_y_t = torch.as_tensor(loc_y_np, dtype=torch.float64, device=gpu_device)
         loc_z_t = torch.as_tensor(loc_z_np, dtype=torch.float64, device=gpu_device)
@@ -3011,13 +2739,11 @@ class SSAMAnalysis(object):
         import numcodecs as _nc2
         _nc2.blosc.set_nthreads(self.ncores)
 
-        # ---- chunk loop ----
         for chunk_idx in range(chunk_start, chunk_end):
             x0 = chunk_idx * cx
             x1 = min(vx, x0 + cx)
             local_cx = x1 - x0
 
-            # Voxel center grid for this chunk (in same µm as transcripts)
             qx_grid = (np.arange(x0, x1) * sd_um).astype(np.float64)
             qy_grid = (np.arange(vy) * sd_um).astype(np.float64)
             qz_grid = (np.arange(vz) * sd_um).astype(np.float64)
@@ -3027,15 +2753,12 @@ class SSAMAnalysis(object):
             qz_flat = Qz.ravel()
             N_total = int(qx_flat.size)
 
-            # CPU-side accumulators for zarr write
             vf_norm_chunk = np.zeros((local_cx, vy, vz), dtype=np.float32)
             ctmap_chunk   = np.full((local_cx, vy, vz), -1, dtype=np.int32)
             corr_chunk    = np.full((local_cx, vy, vz), -1, dtype=np.float32)
-            # opt-in full normalized field buffer (gene axis first)
             vf_full_chunk = (np.zeros((n_genes_use, local_cx, vy, vz), dtype=np.float32)
                              if save_vf else None)
 
-            # Build cell list once per chunk (covers chunk's query bbox + transcripts)
             chunk_q_xmin = float(qx_grid.min()) if N_total > 0 else 0.0
             chunk_q_xmax = float(qx_grid.max()) if N_total > 0 else 0.0
             chunk_q_ymin = float(qy_grid.min()) if N_total > 0 else 0.0
@@ -3043,9 +2766,6 @@ class SSAMAnalysis(object):
             chunk_q_zmin = float(qz_grid.min()) if N_total > 0 else 0.0
             chunk_q_zmax = float(qz_grid.max()) if N_total > 0 else 0.0
 
-            # Filter transcripts to only those within Rw padding of this
-            # chunk's x-range. Without this the cell-list spans the full
-            # slide x-extent, which makes ``W*H*D`` arange explode (OOM).
             _Rw_pad = float(bandwidth * prune_coefficient + sd_um)
             x_lo_chunk = chunk_q_xmin - _Rw_pad
             x_hi_chunk = chunk_q_xmax + _Rw_pad
@@ -3063,7 +2783,6 @@ class SSAMAnalysis(object):
                 sd_um, bandwidth, prune_coefficient, dim,
             )
 
-            # Sub-chunk loop
             n_sub = (N_total + query_subchunk_size - 1) // query_subchunk_size
             sub_iter = range(n_sub)
             if self.verbose:
@@ -3081,21 +2800,16 @@ class SSAMAnalysis(object):
                                           n_genes_use, gpu_device)
                 vf_norm_t = kde_t.sum(dim=1)
 
-                # Decompose flat sub indices → (local_x, y, z)
                 sub_idx = np.arange(s0, s1)
                 local_x = sub_idx // (vy * vz)
                 rem = sub_idx % (vy * vz)
                 local_y = rem // vz
                 local_z = rem % vz
 
-                # Always write vf_norm
                 vf_norm_chunk[local_x, local_y, local_z] = (
                     vf_norm_t.detach().cpu().numpy().astype(np.float32, copy=False)
                 )
 
-                # opt-in: normalize the FULL field (all voxels, all use_genes) and
-                # stash it; independent of the kept-voxel mapping path below so the
-                # celltype map is byte-identical whether or not save_vf is set.
                 if save_vf:
                     vf_full_t = (kde_t
                                  / torch.clamp(vf_norm_t, min=1e-12).unsqueeze(1)
@@ -3119,10 +2833,9 @@ class SSAMAnalysis(object):
                 if log_transform:
                     data_kept_t = torch.log1p(data_kept_t)
 
-                corr_t = _pearson_corr_gpu(centroids_t, data_kept_t)  # (k, n_kept)
+                corr_t = _pearson_corr_gpu(centroids_t, data_kept_t)
                 best_corr_t, best_idx_t = corr_t.max(dim=0)
 
-                # Mask back to local positions
                 mask_np = mask_t.detach().cpu().numpy()
                 kept_local_x = local_x[mask_np]
                 kept_local_y = local_y[mask_np]
@@ -3137,7 +2850,6 @@ class SSAMAnalysis(object):
                 del kde_t, vf_norm_t, mask_t, data_kept_t, vfn_kept_t, corr_t
                 del best_corr_t, best_idx_t
 
-            # Write chunk to zarr
             self.dataset.zarr_group['vf_norm'][x0:x1, :, :]          = vf_norm_chunk
             self.dataset.zarr_group['celltype_maps'][x0:x1, :, :]    = ctmap_chunk
             self.dataset.zarr_group['max_correlations'][x0:x1, :, :] = corr_chunk
@@ -3150,30 +2862,12 @@ class SSAMAnalysis(object):
             gc.collect()
             torch.cuda.empty_cache()
 
-        # ---- final attach (single-machine convenience) ----
         if attach:
             import dask.array as _da
             self.dataset._vf_norm = _da.from_zarr(self.dataset.zarr_group['vf_norm'])
             self.dataset.celltype_maps = self.dataset.zarr_group['celltype_maps'][:]
             self.dataset.max_correlations = self.dataset.zarr_group['max_correlations'][:]
 
-    # ==================================================================
-    # Transcript field: producer / consumer split (GPU)
-    #
-    #   PRODUCER  `_kde_field_iter_gpu`  — KDE the field chunk-by-chunk,
-    #             yielding per x-slab the vf_norm + the KEPT (signal) voxels'
-    #             normalized·log1p gene vectors (+ the full field when a caller
-    #             wants to persist it). No centroids, no mapping.
-    #   CONSUMER  the mapping loop (`_transcript_gpu` below) — Pearson-max via
-    #             the SHARED `_pearson_max_gpu` kernel, identical to the count
-    #             path's `map_corr`. Optionally tees the full field to a
-    #             tensorstore writer (save_vf) in the SAME pass.
-    #
-    # This is the transcript analogue of compute_vf(count)+map_corr: the field
-    # representation (L1-normalized·scale·log1p) and the Pearson-max are the SAME
-    # objects the count path uses, so results are independent of how/where the
-    # field was produced.
-    # ==================================================================
     def _prepare_transcript_field(self, sdata, *, centroids, element_name,
                                   exclude_gene_indices, bandwidth, sampling_distance,
                                   prune_coefficient, size_after_normalization,
@@ -3186,8 +2880,6 @@ class SSAMAnalysis(object):
                     'filtered_cluster_labels', 'centroids', 'centroids_stdev'):
             if key in self.dataset.zarr_group:
                 setattr(self.dataset, key, self.dataset.zarr_group[key][:])
-        # produce-only (compute_vf imaging, no mapping): centroids may be absent —
-        # the KDE field is centroid-independent, so use ALL present genes.
         produce_only = centroids is None and getattr(self.dataset, 'centroids', None) is None
         if produce_only:
             centroids = None
@@ -3247,7 +2939,6 @@ class SSAMAnalysis(object):
                 use_genes = list(shared_genes); centroids_use = centroids_shared
         n_genes_use = len(use_genes)
 
-        # flat transcript arrays for use_genes → GPU
         all_x, all_y, all_z, all_g = [], [], [], []
         for gidx_use, g in enumerate(use_genes):
             locs = np.asarray(grouped_map[g], dtype=np.float64)
@@ -3408,7 +3099,6 @@ class SSAMAnalysis(object):
             st['cx'] = int(cx)
             st['n_chunk'] = (vx + int(cx) - 1) // int(cx)
 
-        # ---- array setup ----
         if create_arrays:
             if overwrite:
                 for nm in ('vf_norm', 'celltype_maps', 'max_correlations',
@@ -3419,7 +3109,6 @@ class SSAMAnalysis(object):
             if do_map:
                 self.dataset._zarr_create_array(zg, 'celltype_maps', (vx, vy, vz), 'i4')
                 self.dataset._zarr_create_array(zg, 'max_correlations', (vx, vy, vz), 'f4')
-        # vf_normalized writer (tensorstore, zarr fallback)
         vf_ts = None; vf_zarr = None
         if save_vf and create_arrays:
             _safe_remove('vf_normalized'); _safe_remove('vf_normalized_genes')
@@ -3432,7 +3121,7 @@ class SSAMAnalysis(object):
             if vf_ts is None:
                 vf_zarr = zg.create_array('vf_normalized', shape=shape, chunks=chunks,
                                           dtype='f4', fill_value=0.0)
-        elif save_vf:                                  # distributed: write pre-created array
+        elif save_vf:
             vf_zarr = zg['vf_normalized']
 
         centroids_t = (torch.as_tensor(st['centroids_use'], dtype=torch.float32,
@@ -3471,9 +3160,6 @@ class SSAMAnalysis(object):
                 self.dataset.celltype_maps = zg['celltype_maps'][:]
                 self.dataset.max_correlations = zg['max_correlations'][:]
 
-    # ------------------------------------------------------------------
-    # Distributed map_celltypes_cpu helpers
-    # ------------------------------------------------------------------
 
     def init_map_celltypes(self, sdata, centroids=None, element_name=None,
                                exclude_gene_indices=None,
@@ -3497,6 +3183,11 @@ class SSAMAnalysis(object):
             Same as ``map_celltypes_cpu``; recorded so workers can use
             identical values.
 
+        :param element_name: Name of the points element to parse from ``sdata``.
+        :type element_name: str or None
+        :param exclude_gene_indices: Gene indices to drop before correlation.
+        :type exclude_gene_indices: list[int] or None
+
         Returns
         -------
         dict
@@ -3505,7 +3196,6 @@ class SSAMAnalysis(object):
                'prune_coefficient': float,
                'size_after_normalization': float, 'log_transform': bool}``
         """
-        # ---- load zarr state ----
         self.dataset.cluster_labels          = self.dataset.zarr_group['cluster_labels'][:]
         self.dataset.downsampled_vectors              = self.dataset.zarr_group['downsampled_vectors'][:]
         self.dataset.normalized_vectors      = self.dataset.zarr_group['normalized_vectors'][:]
@@ -3513,7 +3203,6 @@ class SSAMAnalysis(object):
         self.dataset.centroids               = self.dataset.zarr_group['centroids'][:]
         self.dataset.centroids_stdev         = self.dataset.zarr_group['centroids_stdev'][:]
 
-        # ---- centroids ----
         if centroids is None:
             if getattr(self.dataset, 'centroids', None) is None:
                 raise ValueError('centroids not found. Run cluster_vectors() first.')
@@ -3521,7 +3210,6 @@ class SSAMAnalysis(object):
         else:
             centroids = np.asarray(centroids, dtype=np.float32)
 
-        # ---- grid ----
         if getattr(self.dataset, 'shape', None) is None or \
                 not hasattr(self, 'locations') or self.locations is None:
             self._prepare_grid(sdata, element_name=element_name,
@@ -3537,7 +3225,6 @@ class SSAMAnalysis(object):
         self.dataset.bandwidth = bandwidth
         self.dataset.ndim = 2 if vz == 1 else 3
 
-        # ---- gene list ----
         grouped = self.locations.groupby('gene', sort=True)
         grouped_map = {gene: loc for gene, loc in grouped}
 
@@ -3557,7 +3244,6 @@ class SSAMAnalysis(object):
         if len(shared_genes) == 0:
             raise ValueError('No common genes between input data and centroids.')
 
-        # ---- zarr init ----
         def _safe_remove(name):
             if name in self.dataset.zarr_group:
                 del self.dataset.zarr_group[name]
@@ -3573,7 +3259,6 @@ class SSAMAnalysis(object):
         self.dataset._zarr_create_array(self.dataset.zarr_group, 'celltype_maps', (vx, vy, vz), 'i4')
         self.dataset._zarr_create_array(self.dataset.zarr_group, 'max_correlations', (vx, vy, vz), 'f4')
 
-        # ---- chunk info ----
         cx, n_chunk = self.calc_chunk(vx, vy, vz, len(shared_genes), mode='map_celltypes_cpu')
         if cx is None or cx <= 0:
             raise RuntimeError('Cannot determine chunk size.')
@@ -3645,7 +3330,6 @@ class SSAMAnalysis(object):
             Results are written to the zarr store slices
             ``[x0:x1, :, :]`` for each processed chunk.
         """
-        # ---- GPU dispatch: per-worker chunk range on the supplied device ----
         use_gpu = False
         if gpu_device is not None and not force_cpu:
             try:
@@ -3671,7 +3355,6 @@ class SSAMAnalysis(object):
 
         from tqdm.auto import tqdm
 
-        # ---- load zarr state ----
         self.dataset.cluster_labels          = self.dataset.zarr_group['cluster_labels'][:]
         self.dataset.downsampled_vectors              = self.dataset.zarr_group['downsampled_vectors'][:]
         self.dataset.normalized_vectors      = self.dataset.zarr_group['normalized_vectors'][:]
@@ -3679,7 +3362,6 @@ class SSAMAnalysis(object):
         self.dataset.centroids               = self.dataset.zarr_group['centroids'][:]
         self.dataset.centroids_stdev         = self.dataset.zarr_group['centroids_stdev'][:]
 
-        # ---- centroids ----
         if centroids is None:
             if getattr(self.dataset, 'centroids', None) is None:
                 raise ValueError('centroids not found. Run cluster_vectors() first.')
@@ -3687,7 +3369,6 @@ class SSAMAnalysis(object):
         else:
             centroids = np.asarray(centroids, dtype=np.float32)
 
-        # ---- grid / locations ----
         if getattr(self.dataset, 'shape', None) is None or \
                 not hasattr(self, 'locations') or self.locations is None:
             self._prepare_grid(sdata, element_name=element_name,
@@ -3707,7 +3388,6 @@ class SSAMAnalysis(object):
         )
         self.dataset.norm_threshold = self.dataset.expression_threshold * 2
 
-        # ---- gene list ----
         grouped = self.locations.groupby('gene', sort=True)
         grouped_map = {gene: loc for gene, loc in grouped}
 
@@ -3752,7 +3432,6 @@ class SSAMAnalysis(object):
             print(f'map_celltypes_partial: processing chunks '
                   f'{chunk_start}..{chunk_end - 1} (cx={cx}, vx={vx})')
 
-        # ---- chunk loop ----
         for local_idx, chunk_idx in enumerate(range(chunk_start, chunk_end)):
             x0 = chunk_idx * cx
             x1 = min(vx, x0 + cx)

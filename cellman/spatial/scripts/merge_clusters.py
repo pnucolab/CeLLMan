@@ -64,7 +64,6 @@ import zarr
 from sklearn import preprocessing
 
 
-# Labels / decisions that are NOT callable cells -> dropped from the celltype map.
 DROP_LABELS = {'Background', 'Unknown', 'needs_subclustering', 'unresolved_subclustering'}
 DROP_DECISIONS = {'Background', 'Unknown', 'needs_subclustering', 'unresolved_subclustering'}
 
@@ -135,19 +134,11 @@ def main():
     if not os.path.isdir(store_dir):
         sys.exit(f'[error] store dir not found: {store_dir}')
 
-    # Default --annotate-out to the standard annotation_out/ subdir when present,
-    # so cluster_path / decision metadata can be recovered without an explicit flag
-    # (finalize writes only cellman_annotation into the h5ad obs).
     if args.annotate_out is None:
         default_ao = os.path.join(store_dir, 'annotation_out')
         if os.path.isdir(default_ao):
             args.annotate_out = default_ao
 
-    # Annotate-mode writes the annotated h5ad into the annotate-out dir (finalize
-    # names it after the INPUT, e.g. `mouse_brain_cls_annotated.h5ad`, not the
-    # default `ssam_clusters_annotated.h5ad`). Resolve it by searching, in order,
-    # the annotate-out dir then the store root: first the exact --h5ad-name, then —
-    # if unset by name — auto-discover a lone `*_annotated.h5ad`.
     search_dirs = [d for d in (args.annotate_out, store_dir,
                                os.path.join(store_dir, 'annotation_out')) if d]
     h5ad_path = None
@@ -156,7 +147,7 @@ def main():
         if os.path.isfile(cand):
             h5ad_path = cand
             break
-    if h5ad_path is None:                       # named file absent → glob *_annotated.h5ad
+    if h5ad_path is None:
         import glob as _glob
         for d in search_dirs:
             hits = sorted(_glob.glob(os.path.join(d, '*_annotated.h5ad')))
@@ -194,7 +185,6 @@ def main():
     print(f'[cluster-merger] label col : {args.column}')
     celltype = obs[args.column].astype(str).values
 
-    # --- per-cell cluster_path: from obs, else recovered from annotate-out state ---
     if 'cluster_path' in obs.columns:
         cluster_path = obs['cluster_path'].astype(str).values
     elif args.annotate_out:
@@ -212,13 +202,12 @@ def main():
         sys.exit('[error] obs lacks cluster_path. Pass --annotate-out <dir> to recover it '
                  'from _annotate_state.json.')
 
-    # --- decision metadata: from obs, else from annotate-out decisions, else legacy ---
     has_dec = ('decision' in obs.columns and 'subclass_resolved' in obs.columns
                and 'celltype_term_id' in obs.columns)
     if args.legacy:
         decision = np.array(['celltype'] * n_total)
         subclass_resolved = np.ones(n_total, dtype=bool)
-        term_id = celltype  # legacy: group by label string via term_id slot
+        term_id = celltype
         print('[cluster-merger] mode: LEGACY (--legacy; group by cellman_annotation string, '
               'every named celltype -> one cluster)')
     elif has_dec:
@@ -240,11 +229,10 @@ def main():
     else:
         decision = np.array(['celltype'] * n_total)
         subclass_resolved = np.ones(n_total, dtype=bool)
-        term_id = celltype  # legacy: group by label string via term_id slot
+        term_id = celltype
         print('[cluster-merger] mode: LEGACY (no decision columns; group by cellman_annotation string)')
 
-    # --- 1. one record per cluster_path leaf (consistency-checked) ---
-    cp_info = {}  # cp -> dict(ct, dec, sr, tid)
+    cp_info = {}
     for i in range(n_total):
         cp = cluster_path[i]
         rec = dict(ct=celltype[i], dec=decision[i], sr=bool(subclass_resolved[i]),
@@ -257,29 +245,27 @@ def main():
     n_pre = len(cp_info)
     print(f'[cluster-merger] {n_pre} pre-merge clusters (cluster_path leaves)')
 
-    # --- 2. classify each leaf: drop / merge / keep-separate ---
-    merge_units = defaultdict(list)   # term_id -> [cp...]   (subclass_resolved celltypes)
-    keep_units = []                   # [cp...]              (class-final / unresolved: each its own unit)
-    excluded = []                     # [(cp, ct, reason)]
+    merge_units = defaultdict(list)
+    keep_units = []
+    excluded = []
     for cp, r in cp_info.items():
         ct, dec, sr, tid = r['ct'], r['dec'], r['sr'], r['tid']
         if ct in DROP_LABELS or dec in DROP_DECISIONS:
             excluded.append((cp, ct, f'drop:{dec if has_dec else ct}'))
         elif dec == 'celltype' and sr and tid:
-            merge_units[tid].append(cp)               # confirmed subclass -> merge by term_id
-        elif dec == 'celltype':                       # class-final / unresolved subclass -> keep separate
+            merge_units[tid].append(cp)
+        elif dec == 'celltype':
             keep_units.append(cp)
-        else:                                         # unexpected decision -> drop conservatively
+        else:
             excluded.append((cp, ct, f'drop:unexpected_decision:{dec}'))
 
-    # --- 3. build ordered post-merge units ---
     def leiden_of(cp):
         try:
             return int(cp.split('.')[0])
         except ValueError:
             return 1 << 30
 
-    units = []  # dict(label, term_id, decision, subclass_resolved, review, cps)
+    units = []
     for tid, cps in merge_units.items():
         labs = {cp_info[cp]['ct'] for cp in cps}
         label = sorted(labs, key=lambda s: (len(s), s))[0]
@@ -309,7 +295,6 @@ def main():
             if u['review']:
                 print(f'    {u["cps"][0]:>10}  {u["label"]}  (term_id={u["term_id"] or "-"})')
 
-    # --- 4. assign new contiguous labels ---
     new_labels = np.full(n_total, -1, dtype=np.int64)
     print('\n[cluster-merger] post-merge cluster assignments:')
     for new_id, u in enumerate(units):
@@ -326,7 +311,6 @@ def main():
 
     adata.file.close()
 
-    # --- 5. slice arrays / recompute centroids ---
     print('[cluster-merger] loading normalized_vectors and downsampled_vectors ...')
     nv = np.asarray(z['normalized_vectors'])
     lm = np.asarray(z['downsampled_vectors'])
@@ -376,7 +360,7 @@ def main():
                 'celltype_term_id': u['term_id'],
                 'decision': u['decision'],
                 'subclass_resolved': u['subclass_resolved'],
-                'review': u['review'],   # True = class-final kept separate; inspect before trusting as a subtype
+                'review': u['review'],
                 'original_clusters': json.dumps(u['cps']),
                 'n_member_clusters': len(u['cps']),
             })

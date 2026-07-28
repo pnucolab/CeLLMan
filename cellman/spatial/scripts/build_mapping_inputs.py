@@ -243,7 +243,7 @@ def compute_centroids(nv, labels, n_clusters, chunk):
             continue
         block = np.asarray(nv[start:stop])[sel].astype(np.float64, copy=False)
         norms = np.linalg.norm(block, axis=1, keepdims=True)
-        block = block / np.where(norms == 0, 1.0, norms)      # row L2, as merge did
+        block = block / np.where(norms == 0, 1.0, norms)
         np.add.at(acc, lab[sel], block)
         np.add.at(acc_sq, lab[sel], block ** 2)
         np.add.at(counts, lab[sel], 1)
@@ -290,10 +290,6 @@ def main():
     print(f'[build-mapping] label col : {args.column}   (n_vectors={n_total})')
 
     if args.leiden_column in obs.columns:
-        # Coerced, not cast: this column is whatever the user clustered with, so it need
-        # not be numeric (string cluster names, or empty for vectors the clustering left
-        # out). Non-numeric values get a sentinel id so they simply sort last. Used ONLY
-        # to order the output celltype ids -- never for grouping.
         leiden = pd.to_numeric(obs[args.leiden_column].astype(str), errors='coerce') \
                    .fillna(1 << 30).astype(np.int64).values
     else:

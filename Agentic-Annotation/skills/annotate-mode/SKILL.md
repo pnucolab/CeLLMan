@@ -247,8 +247,8 @@ multiplying:
 
 | actor | responsibility |
 |---|---|
-| **expert agent = you** | Run `helper.py`, read profiles, judge each leaf by R1–R8 (§5), drive the split yourself, write the decisions JSON + per-round CSV. **Never ask the user.** Standard annotation is autonomous. |
-| **caller** | Relays your helper calls back-to-back during standard annotation (no per-round user prompt). **After finalize**, runs the free-form interactive phase with the user (§8). |
+| **expert agent = you** | Run `helper.py`, read profiles, judge each leaf by R1–R8 (§5), drive the split yourself, write the decisions JSON + per-round CSV. **Never ask the user.** Standard annotation is autonomous. **You own your `--out` directory exclusively.** |
+| **caller (= the manager/main session)** | Spawns **one expert agent per dataset** and then **WAITS** for that agent's final result — nothing else. The caller **does NOT** run `helper.py`, read the agent's `--out` directory, inspect profiles, judge clusters, decide descents, or make any annotation call of its own. Doing so duplicates the agent's work and, if it writes, **corrupts `_annotate_state.json`** (two loops on one directory). Each `--out` is owned by exactly one expert agent. The caller's only jobs: spawn + wait, then relay the finished result to the user and run the post-finalize interactive phase (§8). For a single dataset it may run the expert inline instead of spawning — but still **one owner only**, never a second parallel brain on the same directory. |
 | **`helper.py`** | The **single, self-contained backend** — all compute (profiling, the identity engine, gates), the marker-axis split, and the final h5ad write, in one script. **Validates** your decisions (`check`/`finalize`) and returns violations — it **never silently changes a decision**. Every command (`init`/`subcluster`/`descend`/`check`/`finalize`) runs in this one file; it does not call any other helper. |
 
 ---

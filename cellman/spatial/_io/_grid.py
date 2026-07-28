@@ -19,14 +19,12 @@ def aggregate_to_grid(adata: ad.AnnData, bin_um: float,
     aligned. Returns a bin-level AnnData with ``obs['array_row'/'array_col']``
     and ``obsm['spatial'] = (col, row)``.
 
-    Parameters
-    ----------
-    adata : AnnData
-        Point/bin-level counts with ``obsm['spatial']`` in µm.
-    bin_um : float
-        Lattice bin size in µm.
-    origin : (float, float), optional
-        Shared ``(x0, y0)`` µm origin. Defaults to ``spatial.min(0)``.
+    :param adata: Point/bin-level counts with ``obsm['spatial']`` in µm.
+    :type adata: anndata.AnnData
+    :param bin_um: Lattice bin size in µm.
+    :type bin_um: float
+    :param origin: Shared ``(x0, y0)`` µm origin. Defaults to ``spatial.min(0)``.
+    :type origin: tuple of float, optional
     """
     sp = np.asarray(adata.obsm["spatial"])
     if origin is None:
@@ -63,13 +61,14 @@ def read_square_bin_gem(gem_path: str, bin_size: int = 1) -> ad.AnnData:
     ``bin_size`` is in DNB units (1 DNB = 0.5 µm); ``uns['bin_size_um']`` is set
     accordingly. ``obsm['spatial']`` is stored as integer (col, row) bin indices;
     physical µm = index × ``bin_size_um``.
+
+    :param gem_path: Path to the gzipped GEM TSV file.
+    :type gem_path: str
+    :param bin_size: Square-bin size in DNB units (1 DNB = 0.5 µm).
+    :type bin_size: int
     """
     import pandas as pd
 
-    # NOTE: the pyarrow engine parses this ~1.7x faster (52s vs 88s on a 164M-row
-    # GEM) but ignores ``dtype`` — it reads x/y/counts as int64 and peaks at
-    # 18.2 GB RSS vs 7.9 GB here. On this shared box that tradeoff regressed real
-    # runs, so keep the memory-lean C engine.
     df = pd.read_csv(gem_path, sep="\t",
                      dtype={"x": np.int32, "y": np.int32, "MIDCounts": np.int32})
     gcol = "geneID" if "geneID" in df.columns else df.columns[0]
@@ -97,13 +96,22 @@ def read_square_bin_gem(gem_path: str, bin_size: int = 1) -> ad.AnnData:
 def fit_affine_lstsq(array_col, array_row, px_col, px_row) -> np.ndarray:
     """Least-squares affine ``(col, row, 1) -> (px_x, px_y)``, return inverse (2,3).
 
-    Used by platforms that give a per-bin lattice→pixel correspondence table
-    (e.g. Visium HD ``tissue_positions``: array_col/array_row → pxl_col/pxl_row).
+    Used by platforms that give a per-bin lattice-to-pixel correspondence table
+    (e.g. Visium HD ``tissue_positions``: array_col/array_row to pxl_col/pxl_row).
     Fit the correspondence on the SAME lattice the vector field uses.
+
+    :param array_col: Lattice column indices of the correspondence points.
+    :type array_col: array-like
+    :param array_row: Lattice row indices of the correspondence points.
+    :type array_row: array-like
+    :param px_col: Pixel x (column) coordinates of the correspondence points.
+    :type px_col: array-like
+    :param px_row: Pixel y (row) coordinates of the correspondence points.
+    :type px_row: array-like
     """
     A = np.c_[np.asarray(array_col), np.asarray(array_row), np.ones(len(array_col))]
     cx, *_ = np.linalg.lstsq(A, np.asarray(px_col), rcond=None)
     cy, *_ = np.linalg.lstsq(A, np.asarray(px_row), rcond=None)
-    fwd = np.array([cx, cy])                                   # (2,3): [col,row,1]->[px_x,px_y]
+    fwd = np.array([cx, cy])
     inv = np.linalg.inv(np.vstack([fwd, [0, 0, 1]]))[:2, :3]
     return inv

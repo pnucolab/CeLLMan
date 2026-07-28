@@ -169,6 +169,6 @@ def _pearson_max_gpu(centroids_t, data_t):
     path (KDE field streamed chunk-by-chunk) — identical Pearson-max so results
     do not depend on how the field was produced. Returns int32 idx, float32 corr.
     """
-    corr = _pearson_corr_gpu(centroids_t, data_t)          # (k, n)
+    corr = _pearson_corr_gpu(centroids_t, data_t)
     best_corr, best_idx = corr.max(dim=0)
     return best_idx.to(torch.int32), best_corr.to(torch.float32)

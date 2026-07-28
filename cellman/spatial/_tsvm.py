@@ -1,62 +1,61 @@
-"""TSVM-based celltype mapping for CeLLMan spatial (notebook-level, no package edits).
+"""TSVM-based celltype mapping for CeLLMan spatial.
 
-Drop-in alternative to ``map_celltypes_correlation`` (centroid-Pearson template
-matching) that replaces the mapping step with a **multiclass Transductive SVM**
-trained in a PCA latent space, then applied inductively over the field.
-
-Kernel: **RBF by default** (``kernel='rbf'``), realized as an explicit Random
-Fourier Feature map on the PCA-50 coords -- so the machine below stays the same
-linear Crammer-Singer solver on lifted features and the field cache stays small
-and valid. ``kernel='linear'`` restores the original behaviour. Full-gene mode
-(``n_components=None``) is linear-only. See the RFF section for why an explicit
-feature map is used instead of an exact kernel SVM.
+Alternative to ``map_celltypes_correlation`` (centroid-Pearson template matching)
+that replaces the mapping step with a multiclass Transductive SVM. The default
+algorithm is a classic transductive SVM solved by LABEL SWITCHING over the whole
+signal field, with an RBF kernel; ``map_celltypes(method='tsvm')`` uses it.
 
 Why not plain centroid-correlation
 ----------------------------------
 Correlation assigns each voxel the celltype whose single centroid it most
-resembles (cosine on mean-centered profiles). It learns no discriminative
-weights and cannot abstain. A margin classifier learns what *separates*
-celltypes and gives a calibrated confidence (top1-top2 margin) for abstention.
+resembles (cosine on mean-centered profiles). It learns no discriminative weights.
+A margin classifier learns what separates celltypes and yields a per-voxel
+confidence (the top-class softmax probability) for optional filtering.
 
-Formulation (multiclass, calibrated)
-------------------------------------
-We use the **Crammer-Singer multiclass SVM** margin, NOT one-vs-rest hat-loss:
-OvR + the classic TSVM hat-loss ``max(0,1-|f|)`` leaves the per-class scores
-uncalibrated, so the multiclass ``argmax`` collapses onto a dominant class.
-Crammer-Singer optimizes a single coherent margin across all k classes.
+Kernel
+------
+RBF by default (``kernel='rbf'``), realized as an explicit Random Fourier Feature
+map on the PCA-50 coords, so the model stays a compact (k, D) linear machine that
+streams over ~1e7 voxels (an exact kernel SVM would need K(field, support-vectors)
+per apply). ``kernel='linear'`` restores the un-lifted behaviour. Full-gene mode
+(``n_components=None``) is linear-only.
 
-The transductive (unlabeled-field) signal follows TSVM's **low-density
-separation** principle, expressed in a multiclass-safe way:
-  - entropy minimization on unlabeled posteriors  -> boundaries avoid dense
-    regions (the multiclass analog of pushing the margin off the data);
-  - a **class-balancing constraint** KL(mean_u softmax || labeled prior) -> the
-    unlabeled marginal matches the labeled class frequencies, preventing the
-    collapse the balancing constraint also guards against in classic TSVM.
-Both unlabeled terms are annealed in (weight 0 -> 1), the standard remedy for
-the non-convex transductive objective. With the unlabeled weight at 0 the
-trainer reduces to a supervised Crammer-Singer linear SVM.
+Algorithm (``algo='labelswitch'``, the default)
+-----------------------------------------------
+Classic label-switching transductive SVM (Joachims-style), realized for a large
+field: the WHOLE signal field is the transductive pool, every voxel carries a hard
+tentative label, and those labels are switched each round under a class-balancing
+constraint while the unlabeled weight anneals 0 -> 1. Block-coordinate descent:
+
+  W-step  : fix the tentative labels y~, minimize the Crammer-Singer multiclass
+            hinge over labeled + unlabeled(y~) + L2.
+  y~-step : fix (W, b), re-score the whole field and re-assign every label under
+            the balancing constraint (per-class dual variables) -- the label switch.
+
+Practical realizations of the textbook algorithm: multiclass via Crammer-Singer,
+RBF via RFF, the QP sub-problem via Adam SGD, and the balancing constraint via
+per-class dual variables. ``algo='soft'`` selects the earlier S3VM relaxation
+(``train_tsvm``: soft entropy/balancing penalties on a fixed sample, no label
+switching), kept for comparison.
 
 Pipeline
 --------
-1. labeled  = ``normalized_vectors`` (downsampled, annotated) + ``cluster_labels``
-              (already merged celltype index 0..k-1; row i of ``centroids``).
-2. unlabeled = a random subsample of field voxels (``vf_normalized`` where
-               ``vf_norm > threshold``) — the transductive pool.
-3. PCA (fit on labeled) -> d dims (default 50, matches cluster_vectors).
-4. Train (Crammer-Singer + entropy + balancing, annealed). Init from projected
-   centroids so the supervised start is near the correlation solution.
-5. Inductive apply: stream ``vf_normalized`` row-chunk by row-chunk (exactly like
-   ``map_celltypes_correlation``), project to PCA, score ``Z @ W.T + b``, take the
-   argmax; the top-class softmax probability goes to ``max_probabilities`` and
-   drives abstention (-> Unknown, -1) when below ``tau``. Output zarr layout
-   mirrors the correlation path (``celltype_maps`` + a per-voxel score volume) so
-   ``filter_celltypemaps`` / ``plot_celltypes_map`` keep working — the score lands
-   in ``max_probabilities`` (not ``max_correlations``), so ``filter_celltypemaps``
-   thresholds it with ``min_p`` rather than ``min_r``.
-
-True transduction needs the test points at fit time, but the full field is too
-large (here 3808 x 3081 x 6361 ~ 75 GB); we fit transductively on a field
-*subsample* and apply the learned hyperplanes inductively (S3VM-induced).
+1. labeled   = ``normalized_vectors`` (downsampled, annotated) + ``cluster_labels``
+               (celltype index 0..k-1; row i of ``centroids``).
+2. unlabeled = every field voxel (``vf_normalized``) whose ``vf_norm`` is above the
+               training floor; the whole field is the transductive pool.
+3. PCA (fit on labeled) -> d dims (default 50), cached over the field once so
+   training and apply reuse the projected field.
+4. Train by label switching; init from projected centroids (near the correlation
+   solution).
+5. Inductive apply: classify every voxel with ``vf_norm > 0`` (SSAM-faithful);
+   the top-class softmax probability goes to ``max_probabilities``. Output zarr
+   layout mirrors the correlation path (``celltype_maps`` + a per-voxel score
+   volume) so ``filter_celltypemaps`` / ``plot_celltypes_map`` keep working -- the
+   score lands in ``max_probabilities`` (not ``max_correlations``), so
+   ``filter_celltypemaps`` thresholds it with ``min_p`` rather than ``min_r``.
+   Abstention at map time is OFF by default; thresholding weak voxels is
+   ``filter_celltypemaps``' job.
 """
 
 import numpy as np
@@ -65,9 +64,6 @@ import dask.array as da
 from tqdm.auto import tqdm
 
 
-# ----------------------------------------------------------------------------
-# Per-voxel normalization (matches the correlation baseline's Pearson preproc)
-# ----------------------------------------------------------------------------
 def _row_normalize(Xt):
     """Per-voxel: mean-center across genes, then L2-normalize. (n, g) -> (n, g).
 
@@ -83,9 +79,6 @@ def _row_normalize(Xt):
     return Xc / torch.clamp(Xc.norm(dim=1, keepdim=True), min=1e-12)
 
 
-# ----------------------------------------------------------------------------
-# PCA (GPU, fit on labeled vectors)
-# ----------------------------------------------------------------------------
 def fit_pca(X, n_components=50, device="cuda", seed=0):
     """Fit PCA via low-rank SVD on GPU. Returns (mean (g,), comps (d,g)) tensors.
 
@@ -102,8 +95,7 @@ def fit_pca(X, n_components=50, device="cuda", seed=0):
     Xc = Xt - mean
     q = min(Xc.shape[1], n_components + 10)
     _, _, V = torch.pca_lowrank(Xc, q=q, center=False)
-    comps = V[:, :n_components].T.contiguous()          # (d, g)
-    # fix per-component sign (largest-magnitude entry positive) for a stable basis
+    comps = V[:, :n_components].T.contiguous()
     sign = torch.sign(comps[torch.arange(comps.shape[0]), comps.abs().argmax(dim=1)])
     comps = comps * sign.unsqueeze(1)
     del Xt, Xc
@@ -123,27 +115,6 @@ def project(X, mean, comps):
     return (_row_normalize(Xt) - mean) @ comps.T
 
 
-# ----------------------------------------------------------------------------
-# RBF kernel via Random Fourier Features (Rahimi & Recht 2007)
-# ----------------------------------------------------------------------------
-# WHY RFF AND NOT AN EXACT KERNEL SVM. This whole pipeline is "map a voxel to a
-# small feature vector, then one compact GEMM (k, d), streamed over a field of
-# ~1e7 voxels". An exact kernel machine's decision function is a sum over SUPPORT
-# VECTORS, f(x) = sum_i a_i K(x, x_i) + b, so the model stops being a compact
-# (k, d) matrix and every apply needs K(field, SVs) -- which would force a rewrite
-# of all three apply paths, the field cache and the transductive terms.
-#
-# An EXPLICIT RBF feature map avoids all of that: z(x) = sqrt(2/D) cos(W x + beta)
-# with W ~ N(0, 2*gamma*I) satisfies z(x).z(y) ~= exp(-gamma ||x-y||^2), so the
-# RBF classifier is just the SAME linear machine on lifted features. train_tsvm,
-# the Crammer-Singer hinge, the entropy / class-balancing terms, the abstention
-# and the field PCA cache are all unchanged -- only the feature width grows d->D.
-# Cost is negligible where it matters: the field sweep is bound by zstd
-# decompression, not the GPU (see map_celltypes_tsvm), so the extra GEMM is free.
-#
-# gamma is data-derived (median heuristic) rather than guessed, and Omega/beta are
-# drawn from a CPU generator so the map is byte-identical across devices/runs --
-# the same reproducibility discipline the persisted PCA basis follows.
 def rff_gamma_median(Z, n_sample=4096, seed=0):
     """Median heuristic for the RBF bandwidth: gamma = 1 / (2 * median_dist^2).
 
@@ -184,9 +155,6 @@ def rff_apply(Z, Omega, beta):
     return float(np.sqrt(2.0 / Omega.shape[0])) * torch.cos(Z @ Omega.T + beta)
 
 
-# ----------------------------------------------------------------------------
-# Unlabeled field subsampling (the transductive pool)
-# ----------------------------------------------------------------------------
 def sample_unlabeled_field(ds, mean, comps, *, vf_norm_threshold,
                            n_target=200_000, chunk_h=128, device="cuda", seed=0):
     """Randomly subsample field voxels above threshold and return their PCA coords.
@@ -200,37 +168,37 @@ def sample_unlabeled_field(ds, mean, comps, *, vf_norm_threshold,
     default) for a zero-scan fit.
     """
     zg = ds.zarr_group
-    vf_z = zg["vf_normalized"]                          # (n_G, n_R, n_C)
+    vf_z = zg["vf_normalized"]
     n_G, n_R, n_C = vf_z.shape
-    norm = np.asarray(zg["vf_norm"][:])                 # (n_R, n_C)
+    norm = np.asarray(zg["vf_norm"][:])
     rng = np.random.default_rng(seed)
     starts = list(range(0, n_R, chunk_h))
-    rng.shuffle(starts)                                 # spread sampling spatially
+    rng.shuffle(starts)
 
     Z_chunks, n_have = [], 0
     pbar = tqdm(starts, desc="sample_unlabeled")
     for r0 in pbar:
         r1 = min(r0 + chunk_h, n_R)
         h = r1 - r0
-        sig = norm[r0:r1] > vf_norm_threshold           # (h, n_C)
+        sig = norm[r0:r1] > vf_norm_threshold
         if not sig.any():
             continue
         sig_flat = sig.reshape(-1)
-        block = np.asarray(vf_z[:, r0:r1, :]).reshape(n_G, h * n_C)     # (g, h*n_C)
-        gb = torch.as_tensor(block, device=device)                     # filter+proj on GPU
+        block = np.asarray(vf_z[:, r0:r1, :]).reshape(n_G, h * n_C)
+        gb = torch.as_tensor(block, device=device)
         sm = torch.as_tensor(sig_flat, device=device)
-        Z = (_row_normalize(gb.T[sm]) - mean) @ comps.T                # (n_sig, d)
+        Z = (_row_normalize(gb.T[sm]) - mean) @ comps.T
         Z_chunks.append(Z)
         n_have += Z.shape[0]
         del block, gb, sm
         torch.cuda.empty_cache()
         pbar.set_postfix(have=n_have)
-        if n_have >= n_target:                           # early stop
+        if n_have >= n_target:
             break
     if not Z_chunks:
         return torch.empty(0, comps.shape[0], device=device)
     Zu = torch.cat(Z_chunks, dim=0)
-    if Zu.shape[0] > n_target:                           # trim to target
+    if Zu.shape[0] > n_target:
         idx = torch.as_tensor(rng.choice(Zu.shape[0], n_target, replace=False),
                               device=Zu.device)
         Zu = Zu[idx]
@@ -244,20 +212,17 @@ def sample_unlabeled_from_cache(ds, *, key="tsvm_field_pca", vf_norm_threshold,
     transductive pool: the actual distribution the map will be applied to.
     """
     zg = ds.zarr_group
-    cache = zg[key]                                      # (d, n_R, n_C) already projected
+    cache = zg[key]
     d = cache.shape[0]
     norm = np.asarray(zg["vf_norm"][:]).reshape(-1)
     sig_idx = np.where(norm > vf_norm_threshold)[0]
     rng = np.random.default_rng(seed)
     take = np.sort(rng.choice(sig_idx, min(n_target, sig_idx.size), replace=False))
-    Zf = np.asarray(cache[:]).reshape(d, -1)             # (d, N)  ~few GB
-    Zu = Zf[:, take].T                                   # (n_take, d)
+    Zf = np.asarray(cache[:]).reshape(d, -1)
+    Zu = Zf[:, take].T
     return torch.as_tensor(np.ascontiguousarray(Zu), device=device)
 
 
-# ----------------------------------------------------------------------------
-# Multiclass transductive SVM (Crammer-Singer + low-density + balancing)
-# ----------------------------------------------------------------------------
 def train_tsvm(Zl, yl, k, Zu=None, *, W_init=None,
                lam=1e-4, ent=0.3, balance=1.0,
                anneal_steps=4, inner_iters=200, lr=0.1, device="cuda",
@@ -301,10 +266,10 @@ def train_tsvm(Zl, yl, k, Zu=None, *, W_init=None,
     for si, w_u in enumerate(schedule):
         for it in range(inner_iters):
             opt.zero_grad()
-            F = Zl @ W.T + b                              # (L, k)
+            F = Zl @ W.T + b
             true_s = F.gather(1, yl[:, None]).squeeze(1)
             Fm = F.clone()
-            Fm[ar, yl] = -1e9                             # mask true class
+            Fm[ar, yl] = -1e9
             loss = torch.relu(1.0 + Fm.max(dim=1).values - true_s).mean()
             loss = loss + 0.5 * lam * (W * W).sum()
             if has_u and w_u > 0:
@@ -321,67 +286,228 @@ def train_tsvm(Zl, yl, k, Zu=None, *, W_init=None,
     return W.detach(), b.detach()
 
 
-# ----------------------------------------------------------------------------
-# Top-level: fit
-# ----------------------------------------------------------------------------
+@torch.no_grad()
+def _balanced_assign(S, prior, iters=40, lr=0.5):
+    """Assign each row of ``S`` (n,k scores) a label = argmax(S + delta), choosing the
+    per-class offsets ``delta`` (Lagrange multipliers of the balancing constraint) so
+    the class proportions match ``prior``. Dual ascent: raise delta for under-
+    represented classes. Returns (labels (n,), delta (k,))."""
+    k = S.shape[1]
+    n = S.shape[0]
+    delta = torch.zeros(k, device=S.device, dtype=torch.float32)
+    lab = None
+    for _ in range(iters):
+        lab = (S + delta).argmax(1)
+        counts = torch.bincount(lab, minlength=k).float() / n
+        delta -= lr * (counts - prior)
+    return lab, delta
+
+
+@torch.no_grad()
+def _field_scores_into(Zu_pca, omega, beta, W, b, out, chunk=1_000_000):
+    """Score every unlabeled point into ``out`` (n,k) in place. ``Zu_pca`` are PCA
+    coords on GPU; the RFF lift is applied per chunk so the (n,D) matrix is never
+    resident (it would be D/d times the field). chunk=1M keeps the transient RFF
+    tensors (matmul + cos, ~2*chunk*D*4 bytes) small enough for a 24 GB card."""
+    for s in range(0, Zu_pca.shape[0], chunk):
+        e = min(s + chunk, Zu_pca.shape[0])
+        Zr = rff_apply(Zu_pca[s:e], omega, beta) if omega is not None else Zu_pca[s:e]
+        out[s:e] = (Zr @ W.T + b).to(out.dtype)
+        del Zr
+
+
+def _train_labelswitch(Zl_r, yl, k, Zu_pca, omega, beta, *, W_init=None, lam=1e-4,
+                       Cu=1.0, anneal_steps=4, switch_rounds=4, inner=40, lr=0.1,
+                       u_batch=1_000_000, switch_tol=0.005, assign_iters=40,
+                       device="cuda", seed=0, verbose=True):
+    """Classic label-switching multiclass TSVM.
+
+    Zl_r    : labeled features, ALREADY RFF-lifted (L, D)
+    Zu_pca  : unlabeled PCA coords (n_u, d) on GPU; lifted to RFF per chunk here
+    omega,beta : RFF params (None -> linear kernel, lift is identity)
+
+    Block-coordinate descent, C_u annealed 0->Cu:
+      W-step  : fix tentative labels y~, minimize labeled hinge + C_u*unlabeled hinge(y~)
+                + L2 (SGD minibatch on the fixed y~).
+      y~-step : fix (W,b), re-score the WHOLE field and re-assign every label under the
+                balancing constraint (the label switch).
+    """
+    yl = torch.as_tensor(np.asarray(yl), device=device).long()
+    D = Zl_r.shape[1]
+    ar = torch.arange(Zl_r.shape[0], device=device)
+    prior = torch.bincount(yl, minlength=k).float()
+    prior = prior / prior.sum()
+    n_u = Zu_pca.shape[0]
+
+    W = (W_init.clone().to(device).float() if W_init is not None
+         else torch.zeros(k, D, device=device)).requires_grad_(True)
+    b = torch.zeros(k, device=device, requires_grad=True)
+    opt = torch.optim.Adam([W, b], lr=lr)
+
+    def _hinge(Zr, yy):
+        F = Zr @ W.T + b
+        true_s = F.gather(1, yy[:, None]).squeeze(1)
+        Fm = F.clone()
+        Fm[torch.arange(F.shape[0], device=device), yy] = -1e9
+        return torch.relu(1.0 + Fm.max(1).values - true_s).mean()
+
+    for _ in range(300):
+        opt.zero_grad()
+        (_hinge(Zl_r, yl) + 0.5 * lam * (W * W).sum()).backward()
+        opt.step()
+
+    S = torch.empty(n_u, k, device=device, dtype=torch.float16)
+    _field_scores_into(Zu_pca, omega, beta, W.detach(), b.detach(), S)
+    ytil, _ = _balanced_assign(S.float(), prior, iters=assign_iters)
+
+    gen = torch.Generator(device=device).manual_seed(int(seed))
+    for ai, frac in enumerate(np.linspace(0.0, 1.0, anneal_steps)):
+        cu = Cu * frac
+        for r in range(switch_rounds):
+            for _ in range(inner):
+                opt.zero_grad()
+                loss = _hinge(Zl_r, yl) + 0.5 * lam * (W * W).sum()
+                if cu > 0:
+                    idx = torch.randint(0, n_u, (min(u_batch, n_u),), generator=gen, device=device)
+                    Zr = rff_apply(Zu_pca[idx], omega, beta) if omega is not None else Zu_pca[idx]
+                    loss = loss + cu * _hinge(Zr, ytil[idx])
+                loss.backward()
+                opt.step()
+            _field_scores_into(Zu_pca, omega, beta, W.detach(), b.detach(), S)
+            ytil_new, _ = _balanced_assign(S.float(), prior, iters=assign_iters)
+            switched = float((ytil_new != ytil).float().mean())
+            ytil = ytil_new
+            if verbose:
+                with torch.no_grad():
+                    tr = float(((Zl_r @ W.T + b).argmax(1) == yl).float().mean())
+                print(f"  [ls] anneal {ai+1}/{anneal_steps} Cu={cu:.2f} round {r+1}: "
+                      f"switched={100*switched:.2f}%  train_acc={tr:.4f}")
+            if switched < switch_tol:
+                break
+    del S
+    torch.cuda.empty_cache()
+    return W.detach(), b.detach()
+
+
+def load_unlabeled_from_cache(ds, *, key="tsvm_field_pca", vf_norm_threshold, device="cuda"):
+    """Load the FULL transductive pool (every signal voxel) from the PCA cache as
+    (n_u, d) PCA coords on ``device``. Unlike ``sample_unlabeled_from_cache`` this
+    takes ALL voxels above the floor — the whole field is the transductive set."""
+    zg = ds.zarr_group
+    cache = zg[key]
+    d = cache.shape[0]
+    norm = np.asarray(zg["vf_norm"][:]).reshape(-1)
+    sig = norm > vf_norm_threshold
+    Zf = np.asarray(cache[:]).reshape(d, -1)[:, sig].T
+    return torch.as_tensor(np.ascontiguousarray(Zf), device=device)
+
+
 def fit_celltype_tsvm(ds, *, n_components=50, n_unlabeled=200_000,
                       vf_norm_threshold=None, lam=1e-4, ent=0.0, balance=2.0,
                       anneal_steps=4, inner_iters=200, lr=0.1,
                       device="cuda", seed=0, use_centroid_init=True,
                       use_unlabeled=True, unlabeled_source="cache",
-                      abstain_q=0.15, chunk_h=128,
-                      kernel="rbf", rff_dim=1024, gamma=None, rff_seed=0):
+                      abstain_q=0.0, chunk_h=128,
+                      kernel="rbf", rff_dim=1024, gamma=None, rff_seed=0,
+                      algo="labelswitch", Cu=1.0, switch_rounds=4, ls_inner=40,
+                      train_floor="principled"):
     """Fit PCA + multiclass TSVM from the store's labeled vectors and field pool.
 
     Returns a model dict and caches it on ``ds._tsvm_model``.
 
-    Key design (fixes the CAF-collapse): the transductive pool is the **real
-    field** (``unlabeled_source='cache'``), so the class-balancing constraint acts
-    on the distribution we actually colour and pulls predicted field proportions
-    toward the labeled class priors -- a single class can no longer swallow the
-    field. The overconfidence-inducing entropy term is OFF by default (``ent=0``).
+    Algorithm (``algo``)
+    --------------------
+    * ``'labelswitch'`` (DEFAULT) — the classic transductive SVM by LABEL SWITCHING:
+      the WHOLE signal field is the transductive pool, every voxel carries a HARD
+      tentative label, and those labels are switched each round under Joachims'
+      balancing constraint while ``C_u`` anneals 0->1 (see ``_train_labelswitch``).
+      This is the faithful transductive algorithm.
+    * ``'soft'`` — the earlier S3VM relaxation (``train_tsvm``): soft entropy/balancing
+      penalties on a fixed ``n_unlabeled`` sample, no tentative labels. Kept for
+      comparison; not transductive in the label-switching sense.
 
-    Parameters
-    ----------
-    n_components : int or None
-        PCA latent dim (default 50). ``None`` -> **full-gene mode**: no PCA, a LINEAR
-        classifier on the row-normalized full-gene vectors (``kernel='rbf'`` is not
-        supported there -- see ``kernel``). PCA-50 + *linear* caps training fidelity
-        to the labels at ~0.88 (it drops low-variance class-discriminative
-        directions); full genes restore it to ~0.95. Trade-off: the field can't be
-        pre-projected into a small cache, so mapping STREAMS the field per apply.
-    kernel : {'rbf', 'linear'}
-        ``'rbf'`` (default) lifts the PCA coords through an explicit Random Fourier
-        Feature map, making the Crammer-Singer machine a **kernel** SVM while every
-        downstream step (training, transduction, streaming apply, abstention, the
-        field PCA cache) stays byte-for-byte the same shape of computation.
-        This is the intended way to beat the PCA-50 *linear* 0.88 ceiling while
-        KEEPING the small cacheable PCA field representation -- i.e. a cheap stand-in
-        for full-gene mode, which reaches ~0.95 only by streaming the field.
-        NOTE the measured caveat: full-gene *linear* already matches the **kNN**
-        ceiling (~0.95), and kNN is strongly non-linear -- so the residual error
-        looks like label noise / genuine ambiguity, not a linearity limit. Expect
-        RBF to help in PCA space, not to push past that ceiling.
-    rff_dim : int
-        Number of random features D (default 1024). Higher = closer to the exact RBF
-        kernel; training memory is O(L*D), the apply cost is hidden by field I/O.
-    gamma : float or None
-        RBF bandwidth in ``exp(-gamma||x-y||^2)``. ``None`` -> median heuristic on the
-        labeled PCA coords. Tune WITH ``ent``: a large gamma plus entropy
-        minimization is the classic low-density-separation collapse mode (the
-        class-balancing term guards it, but they interact).
-    rff_seed : int
-        Seed for the RFF draw; the map is reproducible across devices.
-    use_unlabeled : bool
-        False -> supervised (no-transduction) variant.
-    unlabeled_source : {'cache', 'field'}
-        ``'cache'`` (default): sample real field voxels from the PCA cache
-        (instant; builds the cache once if missing). ``'field'``: sample fresh
-        voxels by decompressing the field (slow).
-    abstain_q : float
-        Abstention strength. A field voxel is left **Unknown** when its top-class
-        confidence is below the ``abstain_q`` quantile of labeled confidences
-        (0.10 = medium: more ambiguous than the least-confident ~10% of labels).
+    ``train_floor`` sets the vf_norm floor for the TRAINING unlabeled set. Near-zero
+    voxels become arbitrary unit vectors after row-normalization, and label switching
+    would then push boundaries at random, so they are excluded from TRAINING (apply
+    still classifies every vf_norm>0 voxel). ``'principled'`` = 2/(sqrt(2pi)*sigma)^2
+    (>= two transcripts' worth of blurred mass); ``'store'`` = the stored
+    select_vf_norm_threshold; or a float.
+
+    :param ds: Dataset/store exposing ``zarr_group`` with labeled vectors, cluster
+        labels, centroids and the field; the fitted model is cached on ``ds._tsvm_model``.
+    :type ds: SSAMDataset
+    :param n_components: PCA latent dim (default 50). ``None`` selects full-gene mode:
+        no PCA, a linear classifier on the row-normalized full-gene vectors
+        (``kernel='rbf'`` is not supported there). PCA-50 + linear caps training fidelity
+        at ~0.88 (it drops low-variance class-discriminative directions); full genes
+        restore it to ~0.95 but the field can no longer be pre-projected into a small
+        cache, so mapping streams the field per apply.
+    :type n_components: int or None
+    :param n_unlabeled: Size of the unlabeled sample for the ``'soft'`` algo (ignored by
+        ``'labelswitch'``, which uses the whole field).
+    :type n_unlabeled: int
+    :param vf_norm_threshold: vf_norm floor recorded on the model; ``None`` reads the
+        stored select/map threshold from the group attrs.
+    :type vf_norm_threshold: float or None
+    :param lam: L2 regularization weight on the classifier weights.
+    :type lam: float
+    :param ent: Entropy-minimization weight for the ``'soft'`` algo.
+    :type ent: float
+    :param balance: Class-balancing weight for the ``'soft'`` algo.
+    :type balance: float
+    :param anneal_steps: Number of unlabeled-weight (or ``C_u``) annealing steps.
+    :type anneal_steps: int
+    :param inner_iters: Inner optimization iterations per anneal step (``'soft'`` algo and
+        full-gene cross-entropy schedule).
+    :type inner_iters: int
+    :param lr: Adam learning rate for the classifier optimization.
+    :type lr: float
+    :param device: Torch device for fitting.
+    :type device: str
+    :param seed: RNG seed for PCA and unlabeled sampling.
+    :type seed: int
+    :param use_centroid_init: Initialize the classifier weights from the projected
+        centroids (a correlation-like warm start) when True.
+    :type use_centroid_init: bool
+    :param use_unlabeled: When False, fit the supervised (no-transduction) variant.
+    :type use_unlabeled: bool
+    :param unlabeled_source: ``'cache'`` (default) samples real field voxels from the PCA
+        cache (instant, builds it once if missing); ``'field'`` samples fresh voxels by
+        decompressing the field (slow).
+    :type unlabeled_source: str
+    :param abstain_q: Abstention strength stored on the model; a field voxel is left
+        Unknown when its top-class confidence is below the ``abstain_q`` quantile of
+        labeled confidences.
+    :type abstain_q: float
+    :param chunk_h: Row-chunk height used when building the field PCA cache.
+    :type chunk_h: int
+    :param kernel: ``'rbf'`` (default) lifts the PCA coords through an explicit Random
+        Fourier Feature map, making the Crammer-Singer machine a kernel SVM while every
+        downstream step (training, transduction, streaming apply, abstention, the field
+        PCA cache) stays the same shape of computation; ``'linear'`` restores the plain
+        linear machine. Full-gene mode is linear-only.
+    :type kernel: str
+    :param rff_dim: Number of random Fourier features D (default 1024). Higher is closer
+        to the exact RBF kernel; training memory is O(L*D), the apply cost is hidden by
+        field I/O.
+    :type rff_dim: int
+    :param gamma: RBF bandwidth in ``exp(-gamma||x-y||^2)``. ``None`` uses the median
+        heuristic on the labeled PCA coords.
+    :type gamma: float or None
+    :param rff_seed: Seed for the RFF draw; the map is reproducible across devices.
+    :type rff_seed: int
+    :param algo: ``'labelswitch'`` (default, faithful transductive) or ``'soft'`` (S3VM
+        relaxation). See the Algorithm section above.
+    :type algo: str
+    :param Cu: Final unlabeled-hinge weight for the ``'labelswitch'`` algo (annealed 0->Cu).
+    :type Cu: float
+    :param switch_rounds: Label-switch rounds per anneal step (``'labelswitch'`` algo).
+    :type switch_rounds: int
+    :param ls_inner: Inner W-step SGD iterations per switch round (``'labelswitch'`` algo).
+    :type ls_inner: int
+    :param train_floor: vf_norm floor for the TRAINING unlabeled set: ``'principled'``,
+        ``'store'`` or a float (see above).
+    :type train_floor: str or float
     """
     kernel = str(kernel).lower()
     if kernel not in ("linear", "rbf"):
@@ -393,12 +519,8 @@ def fit_celltype_tsvm(ds, *, n_components=50, n_unlabeled=200_000,
             "point (full-gene already reaches the kNN ceiling, and its field cannot be "
             "cached). Use n_components=50 with kernel='rbf'.")
     zg = ds.zarr_group
-    X = np.asarray(zg["normalized_vectors"][:])          # (L, g)
-    y = np.asarray(zg["cluster_labels"][:])              # (L,) merged celltype idx
-    # -1 = not a callable cell (Background / Unknown / unresolved, or a clustering
-    # outlier). Drop those rows here so the labeled set never has to be materialized
-    # as a sliced copy of normalized_vectors in the store: the supervised fit, the
-    # PCA basis and the centroid init all see only real labels.
+    X = np.asarray(zg["normalized_vectors"][:])
+    y = np.asarray(zg["cluster_labels"][:])
     keep = np.asarray(y) >= 0
     if not keep.all():
         X, y = X[keep], np.asarray(y)[keep]
@@ -408,24 +530,10 @@ def fit_celltype_tsvm(ds, *, n_components=50, n_unlabeled=200_000,
         vf_norm_threshold = float(zg.attrs.get("select_vf_norm_threshold",
                                   zg.attrs.get("map_vf_norm_threshold", 0.0)))
 
-    # ----------------------------------------------------------------------
-    # FULL-GENE mode (n_components=None): skip PCA, classify on the row-normalized
-    # full-gene vectors. PCA-50 keeps high-VARIANCE axes but discards the low-
-    # variance class-DISCRIMINATIVE directions a LINEAR boundary needs, capping
-    # training fidelity at ~0.88; full genes restore it to ~0.95 (= the kNN / full-
-    # gene-logistic ceiling). Cost: the field can't be pre-projected into a small
-    # cache, so map_celltypes_tsvm STREAMS the field per apply (like correlation).
-    # ----------------------------------------------------------------------
     if n_components is None:
         print(f"[fit] labeled={X.shape}  k={k}  FULL-GENE (no PCA)  thr={vf_norm_threshold:.4f}")
-        Zl = _row_normalize(torch.as_tensor(X, device=device).float())   # (L, g)
+        Zl = _row_normalize(torch.as_tensor(X, device=device).float())
         yt = torch.as_tensor(np.asarray(y), device=device).long()
-        # Cross-entropy (softmax) regression, NOT the Crammer-Singer hinge: the goal
-        # of full-gene mode is to FIT the CeLLMan labels faithfully, and the hinge
-        # tolerates margin slack (caps ~0.92) while cross-entropy drives training
-        # fidelity to the ~0.95 ceiling. The transductive balance/entropy terms
-        # (anti-collapse) are not needed once the magnitude bug is fixed and the
-        # full-gene classes are well separated, so they are dropped here.
         d = Zl.shape[1]
         if use_centroid_init:
             cents = _row_normalize(torch.as_tensor(np.asarray(zg["centroids"][:]),
@@ -435,9 +543,6 @@ def fit_celltype_tsvm(ds, *, n_components=50, n_unlabeled=200_000,
         else:
             W = torch.zeros(k, d, device=device, requires_grad=True)
         b = torch.zeros(k, device=device, requires_grad=True)
-        # CE-specific optimizer settings (the hinge-tuned lr/lam defaults do not apply):
-        # lr=0.05 + NO L2 (lam=0) reaches the ~0.95 full-gene fidelity ceiling; even a
-        # tiny L2 caps it lower (it shrinks the discriminative weights we want here).
         ce_lr, ce_iters = 0.05, max(inner_iters * anneal_steps, 1500)
         opt = torch.optim.Adam([W, b], lr=ce_lr)
         for it in range(ce_iters):
@@ -455,13 +560,7 @@ def fit_celltype_tsvm(ds, *, n_components=50, n_unlabeled=200_000,
         return model
 
     print(f"[fit] labeled={X.shape}  k={k}  pca={n_components}  thr={vf_norm_threshold:.4f}")
-    # Persist the PCA basis so it is byte-identical across runs/devices: this keeps
-    # the field-PCA cache fingerprint stable (pca_lowrank's randomized SVD differs
-    # per CUDA device, which would otherwise force a cache rebuild every run).
     mkey, ckey = "tsvm_pca_mean", "tsvm_pca_comps"
-    # The persisted basis is keyed by a normalization version: a basis written by an
-    # older (non-row-normalized) build has the same shape but lives in a different
-    # space, so we MUST recompute rather than silently reuse it.
     PCA_ROWNORM_VER = 2
     have = (ckey in zg and tuple(zg[ckey].shape) == (n_components, X.shape[1])
             and int(zg.attrs.get("tsvm_pca_rownorm_ver", 0)) == PCA_ROWNORM_VER)
@@ -478,31 +577,39 @@ def fit_celltype_tsvm(ds, *, n_components=50, n_unlabeled=200_000,
         zg[ckey] = comps.cpu().numpy().astype(np.float32)
         zg.attrs["tsvm_pca_rownorm_ver"] = PCA_ROWNORM_VER
         print("[fit] computed & persisted PCA basis (row-normalized)")
-    Zl = project(X, mean, comps)                         # (L, d)
+    Zl = project(X, mean, comps)
+
+    sigma_bin = float(zg.attrs.get("sigma_bin", 1.0))
+    if train_floor == "principled":
+        floor = 2.0 / (np.sqrt(2 * np.pi) * sigma_bin) ** 2
+    elif train_floor == "store":
+        floor = float(vf_norm_threshold)
+    else:
+        floor = float(train_floor)
 
     Zu = None
     if use_unlabeled:
-        if unlabeled_source == "cache":
-            model_tmp = dict(mean=mean, comps=comps)     # ensure cache exists (build once)
-            build_field_pca_cache(ds, model_tmp, chunk_h=chunk_h, device=device)
-            Zu = sample_unlabeled_from_cache(ds, vf_norm_threshold=vf_norm_threshold,
-                                             n_target=n_unlabeled, device=device, seed=seed)
+        build_field_pca_cache(ds, dict(mean=mean, comps=comps), chunk_h=chunk_h, device=device)
+        torch.cuda.empty_cache()
+        if algo == "labelswitch":
+            Zu = load_unlabeled_from_cache(ds, vf_norm_threshold=floor, device=device)
+            print(f"[fit] transductive pool = FULL field {tuple(Zu.shape)} "
+                  f"(train-floor={floor:.4f})")
         elif unlabeled_source == "field":
-            Zu = sample_unlabeled_field(ds, mean, comps, vf_norm_threshold=vf_norm_threshold,
+            Zu = sample_unlabeled_field(ds, mean, comps, vf_norm_threshold=floor,
                                         n_target=n_unlabeled, device=device, seed=seed)
+            print(f"[fit] unlabeled sample={tuple(Zu.shape)} source=field")
         else:
-            raise ValueError("unlabeled_source must be 'cache' or 'field'")
-        print(f"[fit] unlabeled pool={tuple(Zu.shape)}  source={unlabeled_source}")
+            Zu = sample_unlabeled_from_cache(ds, vf_norm_threshold=floor,
+                                             n_target=n_unlabeled, device=device, seed=seed)
+            print(f"[fit] unlabeled sample={tuple(Zu.shape)} source=cache")
 
-    # ---- RBF: lift the PCA coords into RFF space; everything below is unchanged ----
     omega = beta_rff = None
     if kernel == "rbf":
         if gamma is None:
             gamma = rff_gamma_median(Zl, seed=rff_seed)
             print(f"[fit] gamma (median heuristic) = {gamma:.6g}")
         omega, beta_rff = rff_params(Zl.shape[1], rff_dim, gamma, seed=rff_seed, device=device)
-        # Persist the draw so a re-map reproduces the identical feature map (same
-        # policy as the persisted PCA basis). Small: (D, d) floats.
         for kk, arr in (("tsvm_rff_omega", omega), ("tsvm_rff_beta", beta_rff)):
             if kk in zg:
                 del zg[kk]
@@ -511,36 +618,41 @@ def fit_celltype_tsvm(ds, *, n_components=50, n_unlabeled=200_000,
         zg.attrs["tsvm_rff_gamma"] = float(gamma)
         zg.attrs["tsvm_rff_dim"] = int(rff_dim)
         zg.attrs["tsvm_rff_seed"] = int(rff_seed)
-        Zl = rff_apply(Zl, omega, beta_rff)              # (L, D)
-        if Zu is not None:
+        Zl = rff_apply(Zl, omega, beta_rff)
+        if Zu is not None and algo == "soft":
             Zu = rff_apply(Zu, omega, beta_rff)
-        print(f"[fit] RBF via RFF: d={omega.shape[1]} -> D={rff_dim}  "
-              f"labeled={tuple(Zl.shape)}")
+        print(f"[fit] RBF via RFF: d={omega.shape[1]} -> D={rff_dim}  labeled={tuple(Zl.shape)}")
     else:
         zg.attrs["tsvm_kernel"] = "linear"
 
     W_init = None
     if use_centroid_init:
-        cents = np.asarray(zg["centroids"][:])           # (k, g)
-        Wc = project(cents, mean, comps)                 # (k, d)
+        cents = np.asarray(zg["centroids"][:])
+        Wc = project(cents, mean, comps)
         if kernel == "rbf":
-            # matched filter per class in RFF space -- same intent as the linear case
-            # (start near the correlation solution), just in the lifted features.
-            Wc = rff_apply(Wc, omega, beta_rff)          # (k, D)
+            Wc = rff_apply(Wc, omega, beta_rff)
         Wc = Wc / torch.clamp(Wc.norm(dim=1, keepdim=True), min=1e-12)
         W_init = Wc * 0.1
 
-    W, b = train_tsvm(Zl, y, k, Zu=Zu, W_init=W_init, lam=lam, ent=ent,
-                      balance=balance, anneal_steps=anneal_steps,
-                      inner_iters=inner_iters, lr=lr, device=device)
+    if algo == "labelswitch":
+        W, b = _train_labelswitch(Zl, y, k, Zu, omega, beta_rff, W_init=W_init, lam=lam,
+                                  Cu=Cu, anneal_steps=anneal_steps, switch_rounds=switch_rounds,
+                                  inner=ls_inner, lr=lr, device=device, seed=seed)
+    elif algo == "soft":
+        W, b = train_tsvm(Zl, y, k, Zu=Zu, W_init=W_init, lam=lam, ent=ent,
+                          balance=balance, anneal_steps=anneal_steps,
+                          inner_iters=inner_iters, lr=lr, device=device)
+    else:
+        raise ValueError("algo must be 'labelswitch' or 'soft'")
 
-    # Abstention is calibrated on the FIELD at map time (field confidences sit
-    # lower than labeled ones once balancing spreads predictions); abstain_q is
-    # the fraction of signal field voxels to leave Unknown.
-    print(f"[fit] abstain_q={abstain_q} (Unknown = most-ambiguous {abstain_q:.0%} of field)")
+    with torch.no_grad():
+        tr = float(((Zl @ W.T + b).argmax(1) == torch.as_tensor(y, device=device).long()).float().mean())
+    print(f"[fit] algo={algo}  train_acc={tr:.4f}  abstain_q={abstain_q} "
+          f"({'off' if abstain_q <= 0 else 'on'} at map time; filtering is filter_celltypemaps' job)")
     model = dict(W=W, b=b, mean=mean, comps=comps, k=k,
                  vf_norm_threshold=float(vf_norm_threshold), n_components=n_components,
-                 abstain_q=float(abstain_q),
+                 abstain_q=float(abstain_q), algo=algo,
+                 apply_floor=0.0,
                  kernel=kernel, rff_omega=omega, rff_beta=beta_rff,
                  gamma=(float(gamma) if kernel == "rbf" else None),
                  rff_dim=(int(rff_dim) if kernel == "rbf" else None))
@@ -548,9 +660,6 @@ def fit_celltype_tsvm(ds, *, n_components=50, n_unlabeled=200_000,
     return model
 
 
-# ----------------------------------------------------------------------------
-# Field <-> PCA cache  (project the field ONCE; reuse for all classifier tuning)
-# ----------------------------------------------------------------------------
 def _pca_fingerprint(comps):
     """Cheap stable id for a PCA basis (n_components + checksum)."""
     c = comps.detach().float()
@@ -590,16 +699,12 @@ def build_field_pca_cache(ds, model=None, *, key="tsvm_field_pca",
     for r0 in tqdm(list(range(0, n_R, chunk_h)), desc="build_field_pca_cache"):
         r1 = min(r0 + chunk_h, n_R)
         h = r1 - r0
-        block = np.asarray(vf_z[:, r0:r1, :]).reshape(n_G, h * n_C)     # (n_G, h*n_C)
-        gb = torch.as_tensor(block, device=device)                     # -> GPU (g, n)
-        # Per-voxel normalize IN PLACE on the gene-major block (each column = one
-        # voxel): mean-center across genes + L2. Avoids the (n, g) transpose copy.
+        block = np.asarray(vf_z[:, r0:r1, :]).reshape(n_G, h * n_C)
+        gb = torch.as_tensor(block, device=device)
         gb -= gb.mean(dim=0, keepdim=True)
         gb /= torch.clamp(gb.norm(dim=0, keepdim=True), min=1e-12)
-        # Project without materializing the big (n, g) `(gb.T - mean)` tensor:
-        #   (gb.T - mean) @ comps.T == (comps @ gb).T - comps @ mean   ((d, n) is small)
-        Z = (comps @ gb).T - (comps @ mean)                            # (h*n_C, d) on GPU
-        Zc = Z.T.reshape(d, h, n_C).contiguous().cpu().numpy()         # (d, h, n_C)
+        Z = (comps @ gb).T - (comps @ mean)
+        Zc = Z.T.reshape(d, h, n_C).contiguous().cpu().numpy()
         cache[:, r0:r1, :] = Zc
         del block, gb, Z, Zc
         torch.cuda.empty_cache()
@@ -608,9 +713,6 @@ def build_field_pca_cache(ds, model=None, *, key="tsvm_field_pca",
     return fp
 
 
-# ----------------------------------------------------------------------------
-# Top-level: inductive apply (mirrors map_celltypes_correlation I/O)
-# ----------------------------------------------------------------------------
 def _signal_col_runs(col_any, cw, max_gap_chunks=2):
     """Chunk-aligned column ranges covering every True in ``col_any``.
 
@@ -650,15 +752,40 @@ def map_celltypes_tsvm(ds, model=None, *, tau_conf=None, chunk_h=128, device="cu
       - ``{prefix}celltype_maps``     int32 (vx=col, vy=row, vz=1), -1 = background/Unknown
       - ``{prefix}max_probabilities`` f4    (top-class softmax confidence in [0,1];
         ``filter_celltypemaps`` thresholds it with ``min_p``, not ``min_r``)
-    A voxel is **Unknown (-1)** when its confidence < ``tau_conf`` (abstention).
-    ``tau_conf`` defaults to the value calibrated at fit time from labeled
-    confidences (``model['tau_conf']``); pass a float to override, or 0 to keep
-    every signal voxel. With ``write_prefix=''`` this overwrites the standard keys
-    (downstream-compatible); use ``write_prefix='tsvm_'`` to keep both maps.
+    A voxel is Unknown (-1) when its confidence < ``tau_conf`` (abstention).
 
     Speed: with ``use_cache=True`` the field is PCA-projected once into a small
     cache (``cache_key``); re-mapping then reads only the cache and classifies on
-    GPU in seconds. (``tau`` is a deprecated alias, ignored.)
+    GPU in seconds.
+
+    :param ds: Dataset/store whose ``zarr_group`` holds the field; results are written
+        back into it (and onto ``ds`` when ``set_ds_attrs``).
+    :type ds: SSAMDataset
+    :param model: Fitted model dict from :func:`fit_celltype_tsvm`; ``None`` uses the one
+        cached on ``ds._tsvm_model``.
+    :type model: dict or None
+    :param tau_conf: Confidence threshold for abstention; ``None`` uses the fit-time
+        calibrated value, a float overrides, 0 keeps every signal voxel.
+    :type tau_conf: float or None
+    :param chunk_h: Row-chunk height for streaming the field / cache.
+    :type chunk_h: int
+    :param device: Torch device for scoring.
+    :type device: str
+    :param overwrite: Delete any existing output arrays before writing.
+    :type overwrite: bool
+    :param write_prefix: Prefix for the output keys; ``''`` overwrites the standard keys
+        (downstream-compatible), ``'tsvm_'`` keeps both the correlation and TSVM maps.
+    :type write_prefix: str
+    :param set_ds_attrs: When True (and ``write_prefix`` is ``''``), also set the maps and
+        shape attributes on ``ds``.
+    :type set_ds_attrs: bool
+    :param use_cache: Reuse/build the small PCA field cache for a fast re-map (ignored in
+        full-gene mode, which always streams).
+    :type use_cache: bool
+    :param cache_key: Zarr key of the PCA field cache.
+    :type cache_key: str
+    :param tau: Deprecated alias, ignored.
+    :type tau: float or None
     """
     if model is None:
         model = getattr(ds, "_tsvm_model", None)
@@ -669,11 +796,8 @@ def map_celltypes_tsvm(ds, model=None, *, tau_conf=None, chunk_h=128, device="cu
     mean = None if full_gene else model["mean"].to(device)
     comps = None if full_gene else model["comps"].to(device)
     k = model["k"]
-    thr = model["vf_norm_threshold"]
-    abstain_q = float(model.get("abstain_q", 0.15))
-    # RBF (RFF) feature map, if the model was fitted with kernel='rbf'. The lift is
-    # applied at scoring time only -- the field PCA cache still stores d-dim coords,
-    # so it stays valid and small.
+    thr = float(model.get("apply_floor", model["vf_norm_threshold"]))
+    abstain_q = float(model.get("abstain_q", 0.0))
     omega = model.get("rff_omega")
     beta_rff = model.get("rff_beta")
     is_rbf = omega is not None and beta_rff is not None
@@ -689,11 +813,11 @@ def map_celltypes_tsvm(ds, model=None, *, tau_conf=None, chunk_h=128, device="cu
 
     zg = ds.zarr_group
     n_G, n_R, n_C = zg["vf_normalized"].shape
-    norm = np.asarray(zg["vf_norm"][:])                   # (n_R, n_C)
+    norm = np.asarray(zg["vf_norm"][:])
     sd = float(getattr(ds, "sampling_distance", zg.attrs.get("bin_size_um", 1.0)))
-    sig_mask = torch.as_tensor(norm > thr, device=device).reshape(-1)   # (n_R*n_C,)
+    sig_mask = torch.as_tensor(norm > thr, device=device).reshape(-1)
     if full_gene:
-        use_cache = False                                 # no PCA cache in full-gene mode
+        use_cache = False
 
     def _classify(Z_all, score_chunk=1_000_000):
         """Z_all (n_R*n_C, d) on GPU -> (M, conf, tc) ; abstain by field quantile.
@@ -708,17 +832,18 @@ def map_celltypes_tsvm(ds, model=None, *, tau_conf=None, chunk_h=128, device="cu
         best = torch.empty(N, device=Z_all.device, dtype=torch.int32)
         for s in range(0, N, score_chunk):
             e = min(s + score_chunk, N)
-            p = torch.softmax(_score(Z_all[s:e]), dim=1)   # (n, k)
+            p = torch.softmax(_score(Z_all[s:e]), dim=1)
             c, bi = p.max(dim=1)
             conf[s:e] = c
             best[s:e] = bi.to(torch.int32)
             del p, c, bi
-        # confidence threshold = abstain_q quantile over SIGNAL field voxels
         if tau_conf is not None:
             tc = float(tau_conf)
+        elif abstain_q <= 0:
+            tc = -1.0
         else:
             sc = conf[sig_mask]
-            if sc.numel() > 2_000_000:                    # subsample for quantile
+            if sc.numel() > 2_000_000:
                 sc = sc[torch.randperm(sc.numel(), device=sc.device)[:2_000_000]]
             tc = float(torch.quantile(sc, abstain_q).item())
         keep = sig_mask & (conf >= tc)
@@ -728,19 +853,9 @@ def map_celltypes_tsvm(ds, model=None, *, tau_conf=None, chunk_h=128, device="cu
                 conf.cpu().numpy().astype(np.float32).reshape(n_R, n_C), tc)
 
     if full_gene:
-        # FULL-GENE: stream the field, classify on row-normalized full-gene voxels.
-        # Per chunk, normalize each voxel (column) in place and score W @ gb (small
-        # (k, n_cols) GEMM -> no big transpose copy). Confidences are kept for the
-        # whole field, so field-quantile abstention is applied AFTER the sweep.
         vf_z = zg["vf_normalized"]
         M  = np.full((n_R, n_C), -1, dtype=np.int32)
         Mg = np.full((n_R, n_C), -1.0, dtype=np.float32)
-        # The sweep is bound by zstd decompression of the field, not by the GPU, so
-        # the only real lever is decompressing less: read each row block as the
-        # COLUMN RUNS that actually contain signal instead of the whole row. Runs are
-        # snapped out to the field's column-chunk width so no chunk is ever decoded
-        # twice, and runs separated by a small gap are merged (a few large reads beat
-        # many small ones). Typical tissue leaves ~half the tiles empty -> ~2x.
         cw = int(vf_z.chunks[2]) or 1
         for r0 in tqdm(list(range(0, n_R, chunk_h)), desc="map_celltypes_tsvm[full]"):
             r1 = min(r0 + chunk_h, n_R); h = r1 - r0
@@ -749,11 +864,11 @@ def map_celltypes_tsvm(ds, model=None, *, tau_conf=None, chunk_h=128, device="cu
                 continue
             for c0, c1 in _signal_col_runs(sig.any(axis=0), cw):
                 w = c1 - c0
-                block = np.asarray(vf_z[:, r0:r1, c0:c1]).reshape(n_G, h * w)  # (g, n_cols)
+                block = np.asarray(vf_z[:, r0:r1, c0:c1]).reshape(n_G, h * w)
                 gb = torch.as_tensor(block, device=device)
-                gb -= gb.mean(dim=0, keepdim=True)                       # per-voxel row-normalize
+                gb -= gb.mean(dim=0, keepdim=True)
                 gb /= torch.clamp(gb.norm(dim=0, keepdim=True), min=1e-12)
-                S = (W @ gb).T + b                                       # (n_cols, k)
+                S = (W @ gb).T + b
                 p = torch.softmax(S, dim=1)
                 conf, best = p.max(dim=1)
                 sub = sig[:, c0:c1]
@@ -763,7 +878,6 @@ def map_celltypes_tsvm(ds, model=None, *, tau_conf=None, chunk_h=128, device="cu
                 g_sub = Mg[r0:r1, c0:c1]; g_sub[sub] = cn[sub]; Mg[r0:r1, c0:c1] = g_sub
                 del block, gb, S, p, conf, best
             torch.cuda.empty_cache()
-        # field-quantile abstention (whole-field confidences now available)
         if tau_conf is not None:
             tc = float(tau_conf)
         else:
@@ -774,17 +888,35 @@ def map_celltypes_tsvm(ds, model=None, *, tau_conf=None, chunk_h=128, device="cu
         M[(Mg >= 0.0) & (Mg < tc)] = -1
     elif use_cache:
         build_field_pca_cache(ds, model, key=cache_key, chunk_h=chunk_h, device=device)
-        cache = zg[cache_key]                             # (d, n_R, n_C)
+        cache = zg[cache_key]
         d = cache.shape[0]
-        Zf = torch.as_tensor(np.asarray(cache[:]), device=device)        # (d, n_R, n_C) ~ small
-        Z_all = Zf.reshape(d, n_R * n_C).T.contiguous()  # (N, d)
-        M, Mg, tc = _classify(Z_all)
-        del Zf, Z_all
-        torch.cuda.empty_cache()
+        M = np.full(n_R * n_C, -1, dtype=np.int32)
+        Mg = np.full(n_R * n_C, -1.0, dtype=np.float32)
+        for r0 in tqdm(list(range(0, n_R, chunk_h)), desc="map_celltypes_tsvm[cache]"):
+            r1 = min(r0 + chunk_h, n_R)
+            Zc = np.ascontiguousarray(np.asarray(cache[:, r0:r1, :]).reshape(d, -1).T)
+            Z = torch.as_tensor(Zc, device=device)
+            p = torch.softmax(_score(Z), dim=1)
+            c, bi = p.max(dim=1)
+            off = r0 * n_C
+            M[off:off + Z.shape[0]] = bi.to(torch.int32).cpu().numpy()
+            Mg[off:off + Z.shape[0]] = c.cpu().numpy().astype(np.float32)
+            del Zc, Z, p, c, bi
+            torch.cuda.empty_cache()
+        M = M.reshape(n_R, n_C); Mg = Mg.reshape(n_R, n_C)
+        sig = norm > thr
+        M[~sig] = -1; Mg[~sig] = -1.0
+        if tau_conf is not None:
+            tc = float(tau_conf)
+        elif abstain_q <= 0:
+            tc = -1.0
+        else:
+            sc = Mg[sig]
+            if sc.size > 2_000_000:
+                sc = np.random.default_rng(0).choice(sc, 2_000_000, replace=False)
+            tc = float(np.quantile(sc, abstain_q)) if sc.size else -1.0
+        M[(Mg >= 0.0) & (Mg < tc)] = -1
     else:
-        # streaming fallback: project on GPU per chunk (no slow CPU transpose/gather).
-        # Field-quantile abstention needs the whole field at once -> here we only
-        # honour an explicit tau_conf (else keep all signal voxels).
         tc = float(tau_conf) if tau_conf is not None else 0.0
         vf_z = zg["vf_normalized"]
         d = comps.shape[0]
@@ -799,8 +931,8 @@ def map_celltypes_tsvm(ds, model=None, *, tau_conf=None, chunk_h=128, device="cu
             block = np.asarray(vf_z[:, r0:r1, :]).reshape(n_G, h * n_C)
             gb = torch.as_tensor(block, device=device)
             sm = torch.as_tensor(sig.reshape(-1), device=device)
-            Z = (_row_normalize(gb.T[sm]) - mean) @ comps.T  # (n_sig, d)
-            p = torch.softmax(_score(Z), dim=1)              # RFF lift when kernel='rbf'
+            Z = (_row_normalize(gb.T[sm]) - mean) @ comps.T
+            p = torch.softmax(_score(Z), dim=1)
             conf, best = p.max(dim=1)
             best = best.to(torch.int32)
             best[conf < tc] = -1
@@ -816,11 +948,11 @@ def map_celltypes_tsvm(ds, model=None, *, tau_conf=None, chunk_h=128, device="cu
     print(f"[map] assigned {n_assigned} voxels (tau_conf={tc:.3f})")
 
     cm_3d = M.T[:, :, None].astype(np.int32)
-    mp_3d = Mg.T[:, :, None].astype(np.float32)      # top-class SOFTMAX probability
+    mp_3d = Mg.T[:, :, None].astype(np.float32)
     vx, vy, vz = cm_3d.shape
     cm_key = f"{write_prefix}celltype_maps"
-    mp_key = f"{write_prefix}max_probabilities"       # softmax → the min_p filter slot
-    mc_key = f"{write_prefix}max_correlations"        # stale sibling from a prior corr run
+    mp_key = f"{write_prefix}max_probabilities"
+    mc_key = f"{write_prefix}max_correlations"
     if overwrite:
         for nm in (cm_key, mp_key, mc_key):
             if nm in zg:
@@ -835,8 +967,6 @@ def map_celltypes_tsvm(ds, model=None, *, tau_conf=None, chunk_h=128, device="cu
         ds.shape = (vx, vy, vz)
         ds.x_scale = 1.0
         ds.y_scale = 1.0
-        # softmax confidence lives in max_probabilities so filter_celltypemaps
-        # uses min_p (its probability threshold), not min_r (correlation).
         ds.max_correlations = None
         ds.original_coordinate_bounds = [[0.0, vx * sd], [0.0, vy * sd], [0.0, 0.0]]
         ds.celltype_maps = cm_3d
@@ -846,9 +976,6 @@ def map_celltypes_tsvm(ds, model=None, *, tau_conf=None, chunk_h=128, device="cu
     return cm_3d, mp_3d
 
 
-# ----------------------------------------------------------------------------
-# Package wrapper: fit + apply in one call, for SSAMAnalysis.map_celltypes(method='tsvm')
-# ----------------------------------------------------------------------------
 def map_tsvm(analysis, *, n_components=50, device="cuda", overwrite=True,
              fit_kwargs=None, apply_kwargs=None):
     """Fit a TSVM on the store's labeled vectors and map the whole field.
@@ -862,11 +989,22 @@ def map_tsvm(analysis, *, n_components=50, device="cuda", overwrite=True,
     with a non-linear boundary. ``n_components=None`` selects full-gene mode, which is
     LINEAR-only and streams the field per apply -- pass
     ``fit_kwargs={'kernel': 'linear'}`` with it.
+
+    :param analysis: Analysis object exposing ``dataset`` (the store fit and mapped here).
+    :type analysis: SSAMAnalysis
+    :param n_components: PCA latent dim passed to :func:`fit_celltype_tsvm`; ``None``
+        selects full-gene (linear) mode. May also be supplied inside ``fit_kwargs``.
+    :type n_components: int or None
+    :param device: Torch device for both fit and apply.
+    :type device: str
+    :param overwrite: Passed to :func:`map_celltypes_tsvm` to overwrite existing outputs.
+    :type overwrite: bool
+    :param fit_kwargs: Extra keyword arguments forwarded to :func:`fit_celltype_tsvm`.
+    :type fit_kwargs: dict or None
+    :param apply_kwargs: Extra keyword arguments forwarded to :func:`map_celltypes_tsvm`.
+    :type apply_kwargs: dict or None
     """
     ds = analysis.dataset
-    # tsvm consumes the stored 3D count field (n_G, R, C). The transcript KDE
-    # field is 4D (n_G, vx, vy, vz) and the transcript regime is 'corr'-only
-    # (see map_celltypes) — guard rather than silently mis-shape a 4D field.
     if "vf_normalized" in ds.zarr_group and ds.zarr_group["vf_normalized"].ndim != 3:
         raise NotImplementedError(
             "map_tsvm supports the 3D count vector field only; the stored field is "
@@ -874,11 +1012,9 @@ def map_tsvm(analysis, *, n_components=50, device="cuda", overwrite=True,
             "map_celltypes(method='corr') for imaging data.")
     fit_kwargs = dict(fit_kwargs or {})
     apply_kwargs = dict(apply_kwargs or {})
-    # map_celltypes() has no n_components parameter of its own, so accept it inside
-    # fit_kwargs (otherwise it collides with the explicit keyword below).
     n_components = fit_kwargs.pop("n_components", n_components)
     if n_components is None:
-        fit_kwargs.setdefault("kernel", "linear")   # full-gene mode is linear-only
+        fit_kwargs.setdefault("kernel", "linear")
     fit_kwargs.setdefault("device", device)
     apply_kwargs.setdefault("device", device)
     apply_kwargs.setdefault("overwrite", overwrite)

@@ -25,7 +25,14 @@ LOADERS = {
 
 
 def load(platform: str, *args, **kwargs):
-    """Dispatch to a count-platform loader by name (case-insensitive)."""
+    """Dispatch to a count-platform loader by name (case-insensitive).
+
+    :param platform: Platform name (a key of ``LOADERS``); matched
+        case-insensitively with ``-`` normalized to ``_``.
+    :type platform: str
+    :param args: Positional arguments forwarded to the selected loader.
+    :param kwargs: Keyword arguments forwarded to the selected loader.
+    """
     key = platform.lower().replace("-", "_")
     if key not in LOADERS:
         raise ValueError(f"unknown count platform {platform!r}; "

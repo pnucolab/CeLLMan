@@ -28,9 +28,6 @@ from anndata import AnnData
 DEFAULT_HVG_N = 5000
 DEFAULT_HVG_SUB = 100_000
 
-# Technical / low-information gene denylists by species. Ribosomal, mitochondrial,
-# hemoglobin, and (mouse) predicted-gene / Riken; (human) lncRNA / antisense /
-# pseudogene naming patterns that add noise but no cell-type signal.
 _DENY_MOUSE_PREFIX = ("mt-", "Rps", "Rpl", "Hba", "Hbb")
 _DENY_HUMAN_PREFIX = ("MT-", "RPS", "RPL", "MRPL", "MRPS", "HBA", "HBB")
 _DENY_HUMAN_RE = re.compile(
@@ -47,7 +44,6 @@ def _denier(species: str):
             return (g.startswith(_DENY_HUMAN_PREFIX) or g == "MALAT1"
                     or bool(_DENY_HUMAN_RE.search(g)))
         return _denied
-    # default: mouse
     def _denied(g: str) -> bool:
         return (g.startswith(_DENY_MOUSE_PREFIX) or bool(re.match(r"Gm\d", g))
                 or g.endswith("Rik"))
@@ -63,6 +59,9 @@ def resolve_server(server_url: Optional[str] = None) -> Optional[str]:
     one ``Agentic-Annotation/scripts/helper.py`` reads); ``CELLONTO_API`` is
     kept for older setups. No server address is baked into source — pass the URL
     explicitly or set ``CELLONTO_SERVER_URL`` (e.g. ``https://cellman.pnucolab.com``).
+
+    :param server_url: explicit base URL; takes priority over the environment variables.
+    :type server_url: str or None
     """
     return (server_url
             or os.environ.get("CELLONTO_SERVER_URL")
@@ -86,6 +85,19 @@ def fetch_ontology_markers(species: str, organ: str,
     Negative / Defining by default). Returns an empty set (with a warning) when
     the server is unresolved / unreachable / the module is missing — the caller
     then proceeds HVG-only.
+
+    :param species: species name for the ontology module.
+    :type species: str
+    :param organ: organ name for the ontology module.
+    :type organ: str
+    :param server_url: KG REST base URL; resolved via :func:`resolve_server` when ``None``.
+    :type server_url: str or None
+    :param slots: term slots to collect genes from (e.g. Required / Supporting / Negative / Defining).
+    :type slots: Iterable[str]
+    :param timeout: HTTP request timeout in seconds.
+    :type timeout: float
+    :param verbose: print progress and warnings.
+    :type verbose: bool
     """
     url = resolve_server(server_url)
     if url is None:
@@ -98,7 +110,7 @@ def fetch_ontology_markers(species: str, organ: str,
                             timeout=timeout)
         resp.raise_for_status()
         onto = resp.json()
-    except Exception as e:  # noqa: BLE001 — any failure ⇒ graceful HVG-only
+    except Exception as e:  # noqa: BLE001
         if verbose:
             print(f"[panel][WARN] ontology fetch failed → HVG-only: {e}")
         return set()
@@ -123,6 +135,19 @@ def select_hvg(adata: AnnData, n_top_genes: int = DEFAULT_HVG_N,
     ``adata`` should be a coarse-bin aggregation (denser bins give a cleaner
     variance estimate than fine/sparse bins). Falls back to all genes if the
     matrix has fewer than ``n_top_genes`` genes.
+
+    :param adata: bins used for HVG selection (coarse-bin aggregation recommended).
+    :type adata: AnnData
+    :param n_top_genes: number of highly variable genes to select.
+    :type n_top_genes: int
+    :param n_sub: number of bins subsampled for the variance estimate.
+    :type n_sub: int
+    :param species: species name, used to pick the technical-gene denylist.
+    :type species: str
+    :param seed: RNG seed for the subsample.
+    :type seed: int
+    :param verbose: print the selected HVG count.
+    :type verbose: bool
     """
     denied = _denier(species)
     if adata.n_vars <= n_top_genes:

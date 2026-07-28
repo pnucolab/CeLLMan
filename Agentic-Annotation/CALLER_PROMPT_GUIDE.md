@@ -7,6 +7,14 @@ runs `init → judge → descend → finalize` autonomously to write `obs['cellm
 - **`tissue`** is `species, organ`. It may be free text — the agent resolves it to the KG module.
 - The ontology server is automatic (built into `helper.py`); you give no URL.
 
+> **Caller rules (important — especially on Codex's manager/worker model).** The caller's ONLY job is
+> to **spawn one agent per dataset and wait** for each agent's final result. The caller must **not**
+> annotate anything itself: do not read an agent's `out` directory, run `helper.py`, inspect
+> profiles, judge clusters, or decide descents. Each `out` is owned **exclusively** by its agent —
+> a second brain touching it duplicates work and, on any write, corrupts `_annotate_state.json`
+> (two loops on one directory). For a **single** dataset, just spawn one agent (or run it inline) and
+> wait — do not also work the same directory in parallel.
+
 ---
 
 ## Claude Code
@@ -17,6 +25,8 @@ Invoke the skill with `/annotate-mode`:
 /annotate-mode Annotate the h5ad files below using the annotate-expert agent.
 Run each dataset as an INDEPENDENT agent IN PARALLEL — one agent per dataset, each with its
 OWN --out directory.
+Do NOT annotate, read any out directory, or run helper.py yourself — only spawn the agents and
+wait for their results; each out directory belongs to its agent alone.
 
 Datasets:
   [1] input  : mouse_brain.h5ad
@@ -40,6 +50,8 @@ Invoke the skill with `$annotate-mode`; the expert agent is `annotate_expert`:
 $annotate-mode Annotate the h5ad files below using the annotate_expert agent.
 Run each dataset as an INDEPENDENT agent IN PARALLEL — one agent per dataset, each with its
 OWN --out directory.
+Do NOT annotate, read any out directory, or run helper.py yourself — only spawn the agents and
+wait for their results; each out directory belongs to its agent alone.
 
 Datasets:
   [1] input  : mouse_brain.h5ad

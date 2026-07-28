@@ -82,6 +82,10 @@ PARALLEL / ISOLATION.
 - You are one agent for one dataset. Your --out is yours alone; never share it. Do not read, wait
   on, or coordinate with other datasets' agents. Datasets that resolve to the same module are still
   fully independent — each fetches its own slim-index and writes its own --out.
+- You are the SOLE owner of the annotation loop on your --out. The caller/manager that spawned you
+  must NOT read your --out, run helper.py on it, or make its own judgments — it only waits for your
+  final result. If you observe another process touching your --out, stop and report it (two loops on
+  one directory corrupt _annotate_state.json). Run to finalize; you produce the answer, not the caller.
 
 FORBIDDEN: ontology write / build / cross-module handling in one run / improvised metric scorer /
 forced labeling / picking a chimera's winner / Unknown without >=3 enumerated candidates /

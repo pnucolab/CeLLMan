@@ -21,28 +21,55 @@ incdir_numpy = run_command(py,
   check: true
 ).stdout().strip()
 
+# Compiler-specific flags. MSVC (cl.exe / clang-cl, the default toolchain on
+# native Windows) uses a different flag syntax than GCC/Clang, so we branch on the
+# argument syntax and, for good measure, only add flags the compiler accepts
+# (get_supported_arguments test-compiles each one). This lets the same tree build
+# on Linux/macOS (GCC/Clang) and native Windows (MSVC).
+cpp = meson.get_compiler('cpp')
+is_msvc = cpp.get_argument_syntax() == 'msvc'
+
 cpp_args = []
 link_args = []
 
-# SIMD (AVX-512F) — auto-enabled on x86_64
+# SIMD (AVX-512F) — auto-enabled on x86_64. Unsupported flags are dropped and the
+# AVX-512 paths in utils.cpp stay behind their runtime cpuid guard (check_avx512f).
 simd_opt = get_option('simd')
 if simd_opt.enabled() or (simd_opt.auto() and host_machine.cpu_family() == 'x86_64')
-  cpp_args += ['-mavx512f']
-  link_args += ['-mavx512f']
+  if is_msvc
+    simd_flags = ['/arch:AVX512']
+  else
+    simd_flags = ['-mavx512f']
+  endif
+  cpp_args += cpp.get_supported_arguments(simd_flags)
+  if not is_msvc
+    link_args += cpp.get_supported_link_arguments(simd_flags)
+  endif
 endif
 
+# Optimization level is set by buildtype (release -> -O3 on GCC/Clang, /O2 on MSVC),
+# so we do NOT add an explicit -O3 here (MSVC would reject it). Only opt-in extras:
 if get_option('buildtype') == 'release'
-  cpp_args += ['-O3']
+  extra_args = []
   if get_option('fast-math')
-    cpp_args += ['-ffast-math']
+    if is_msvc
+      extra_args += ['/fp:fast']
+    else
+      extra_args += ['-ffast-math']
+    endif
   endif
-  if get_option('native-arch')
-    cpp_args += ['-march=native']
+  if get_option('native-arch') and not is_msvc
+    extra_args += ['-march=native']  # no MSVC equivalent
   endif
+  cpp_args += cpp.get_supported_arguments(extra_args)
 endif
 
 if get_option('debug-symbols')
-  cpp_args += ['-g']
+  if is_msvc
+    cpp_args += cpp.get_supported_arguments(['/Z7'])
+  else
+    cpp_args += cpp.get_supported_arguments(['-g'])
+  endif
 endif
 
 # C++ extension module (compiled from c/utils.cpp; installed as unnamed.utils)

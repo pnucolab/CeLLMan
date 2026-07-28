@@ -1,8 +1,8 @@
 option('simd', type: 'feature', value: 'auto',
        description: 'Enable SIMD optimizations (AVX512F)')
 
-option('openmp', type: 'feature', value: 'enabled',
-       description: 'Enable OpenMP support')
+option('openmp', type: 'feature', value: 'auto',
+       description: 'Enable OpenMP support (auto: use it when the toolchain provides it, else the single-thread fallback in utils.cpp)')
 
 option('fast-math', type: 'boolean', value: true,
        description: 'Enable fast math optimizations')

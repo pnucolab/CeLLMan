@@ -62,9 +62,53 @@ uv pip install --no-build-isolation -e './CeLLMan[gpu]' --index-strategy unsafe-
   --extra-index-url https://download.pytorch.org/whl/cu128
 ```
 
-The C++ extension (`cellman.spatial.utils`) is compiled by meson — you need a C++17 compiler
-with OpenMP. `Agentic-Annotation/` is a plain directory inside `CeLLMan/`, **not** a submodule;
-the clone above already contains it.
+The commands above are for **Linux / macOS**. The C++ extension (`cellman.spatial.utils`) is
+compiled by meson — you need a C++17 compiler. OpenMP and AVX-512 are used when available and
+fall back gracefully when they are not (`-Dopenmp=disabled` / `-Dsimd=disabled` force them off).
+`Agentic-Annotation/` is a plain directory inside `CeLLMan/`, **not** a submodule; the clone
+above already contains it.
+
+### Windows (native, PowerShell)
+
+The build works on native Windows with MSVC — meson selects the right compiler flags
+automatically (`/arch:AVX512`, `/fp:fast`). You need two prerequisites first:
+
+1. **Visual Studio Build Tools** with the *Desktop development with C++* workload
+   (provides the MSVC `cl.exe` compiler). Install from
+   <https://visualstudio.microsoft.com/downloads/> → *Tools for Visual Studio* → *Build Tools*.
+2. **uv** — if `uv` is "not recognized", it is not installed / not on `PATH`:
+   ```powershell
+   powershell -ExecutionPolicy ByPass -c "irm https://astral.sh/uv/install.ps1 | iex"
+   ```
+   Then **open a new PowerShell window** and check `uv --version`.
+
+Then, from your analysis project directory:
+
+```powershell
+git clone https://github.com/<ORG>/CeLLMan.git      # creates .\CeLLMan
+
+uv venv .venv --python 3.11
+.venv\Scripts\Activate.ps1            # PowerShell activate (NOT `source .../activate`)
+
+uv pip install meson-python meson ninja numpy
+uv pip install --no-build-isolation -e .\CeLLMan     # CPU
+```
+
+Notes:
+- If `Activate.ps1` is blocked by the execution policy, run
+  `Set-ExecutionPolicy -Scope Process -ExecutionPolicy Bypass` first, then activate.
+- Run the two `uv pip install` commands from a shell where the MSVC toolchain is on `PATH` —
+  either the **"x64 Native Tools Command Prompt for VS"** (then start `powershell` inside it),
+  or a normal PowerShell after the Build Tools installer has registered the compiler. If the
+  build reports "compiler not found", the C++ Build Tools workload is missing.
+- **GPU on native Windows is not supported** — the GPU extras depend on `triton`, which has no
+  Windows wheels. For GPU on a Windows machine, use WSL2 (below).
+
+### WSL2 (Windows, recommended for GPU)
+
+WSL2 gives you a real Linux environment inside Windows, so the Linux/macOS commands above work
+unchanged, including the `[gpu]` extras with an NVIDIA driver + WSL CUDA. This is the simplest
+route if you want GPU acceleration on a Windows host.
 
 ### Register the skills with your LLM host
 

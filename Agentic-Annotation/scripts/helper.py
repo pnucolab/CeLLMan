@@ -13,7 +13,7 @@ Design notes:
     (standard) / obs['cellman_free_annotation'] (user interaction))
 
 Subcommands:
-  init       --h5ad --cluster-col --out [--ontology-url | --ontology] [--use-rep X_scVI|auto|recompute]
+  init       --h5ad --cluster-col --out [--ontology-url | --ontology] [--use-rep <obsm key>|recompute]
   subcluster --out --paths '["4","11"]' --resolution 0.2 [--gpu 0] [--ontology ...]
   finalize   --out --decisions <json> [--output <path>]
 """
@@ -33,7 +33,7 @@ def _resolve_server(server_url=None):
     return (server_url or os.environ.get("CELLONTO_SERVER_URL") or DEFAULT_ONTOLOGY_SERVER).rstrip("/")
 
 def _dedup_parents(idx):
-    """Guard against a KG build defect (2026-06-17): a term's P (parent list) can contain the same
+    """Guard against a KG build defect: a term's P (parent list) can contain the same
     parent twice (observed: 28/373 terms in mouse_whole_brain had P=['X','X']). The children index and
     subtype_groups iterate `for p in P` without dedup, so the same child is counted twice -> a term with a
     single child yields a bogus '>=2 siblings' subtype_group, and children_resolvable picks up duplicates
@@ -182,7 +182,7 @@ def _derive_lineages(idx):
     """lineage = a root node of the hierarchy (no parent). lineage markers = only that root node's **own**
     required set (canonical pan-LINEAGE transmitters: glut->Slc17a7/6/8, GABA->Gad1/2 & Slc32a1,
     DA->Th/Ddc/Slc6a3 ...).
-    ★ Do NOT sweep up root + descendants (2026-06-13): sweeping mixes pan-NEURONAL (Camk2a) and subtype
+    ★ Do NOT sweep up root + descendants: sweeping mixes pan-NEURONAL (Camk2a) and subtype
     markers attached to descendants into the lineage set, so it points at 'neuron' rather than at 'which
     lineage' — that is why cluster 38 was called glut via Camk2a despite Slc17a7=0. Narrowing to the
     root's own R leaves only transmitters and keeps the lineage call clean.
@@ -289,7 +289,7 @@ def _context_axis_eval(lineage_label, ca, fon, lf, pin, gidx_U, lean_ratio=1.15,
     ambient in segmented data) and propose dominant pole -> subtype. The lineage is already fixed by
     graph_evidence from intrinsic markers (never changed here) — poles apply only to the subtype axis.
     Off-panel context markers are skipped.
-    ★ WEAK-LEAN (2026-06-21): zonation is a continuum, so the signal is weak — demanding a strong lead
+    ★ WEAK-LEAN: zonation is a continuum, so the signal is weak — demanding a strong lead
     would drop most leaves to the bare class. Therefore (a) the score is graded (a sum of fon with no hard
     ON threshold, so faint ambient still counts), and (b) if one pole leads clearly (>=lean_ratio x) even
     while *weak*, that pole is assigned (pole_confidence=low; >=1.5x -> medium). If both are genuinely
@@ -378,7 +378,7 @@ def _state_axis_eval(sa, fon, lf, pin, gidx_U, frac=0.30, lf_on=1.5, pin_min=0.2
             n_onpanel+=1
             enr=(fon[i]>=frac) or (lf[i]>=lf_on and pin[i]>=pin_min)   # ENRICHED (R1), not mere detection
             if enr: on.append(str(g)); score+=float(max(lf[i],0.0))
-        # ★ COVERAGE gate (2026-07-29): a coherent program lights up (nearly) ALL its on-panel markers.
+        # ★ COVERAGE gate: a coherent program lights up (nearly) ALL its on-panel markers.
         #   Co-regulated markers (FOS/JUN/JUNB…) rise together, so the old "any ≥2" = 1 signal and let
         #   artifacts through; instead require ≥ceil(coverage*n_onpanel) of the MEASURABLE markers ENRICHED,
         #   and skip states with <min_onpanel measurable markers (too few to confirm a program). Panel-based,
@@ -593,7 +593,7 @@ def _build_ident_maps(octx, genes, pan_n=12):
     share={}                                            # marker specificity: #terms whose disc lists each gene
     for dc in term_disc.values():
         for g in dc: share[g]=share.get(g,0)+1
-    # ★ HIERARCHY-AWARE specificity (region_share, 2026-06-13): a marker's true specificity is how many
+    # ★ HIERARCHY-AWARE specificity (region_share): a marker's true specificity is how many
     #   distinct REGION-GROUPS (depth-1 children of a class) it spans — NOT how many terms list it. A region
     #   master TF (Tcf7l2→thalamus, Satb2→neocortex) is shared across that region's OWN subtypes (high `share`)
     #   yet appears under only ~1 region-group ⇒ region_share≈1 ⇒ it IS exclusive AT THE REGION LEVEL. This is
@@ -692,11 +692,11 @@ def _absent_region_groups(X, genes, octx, gmu, gsd, thr=REGION_PRESENT_THR):
 def _graph_evidence(fon, lf, pin, IDM, octx, frac=0.30, lf_on=1.5, pin_min=0.25, SPEC_REGION_MAX=2,
                     mean=None, auc=None, auc_hi=0.85, auc_pos=0.65, anchor_floor_ratio=0.5, floor_pct=90, restrict_root=None,
                     absent_rg=None, pin_floor=None, fon_floor=None):
-    """★ GRAPH-DESCENT EVIDENCE (not a verdict) — the redesigned identity substrate (2026-06-12).
+    """★ GRAPH-DESCENT EVIDENCE (not a verdict) — the redesigned identity substrate.
     The agent is the expert; the KG it built is its memory. helper provides EVIDENCE, the agent reasons.
     Anchors = specific terms whose OWN **exclusive** markers are ON and negatives clean, ranked by exclusive
     support, each with its ancestor `path` so the agent can STOP at a region when the subtype is ambiguous.
-    **Exclusivity is HIERARCHY-AWARE (`region_share`, 2026-06-13):** a marker counts as exclusive for a term
+    **Exclusivity is HIERARCHY-AWARE (`region_share`):** a marker counts as exclusive for a term
     when it spans ≤SPEC_REGION_MAX distinct region-groups — so a region master TF (Tcf7l2→thalamus, shared
     across thalamic subtypes but absent from cortex/hippocampus) IS exclusive at the region level and lets the
     region node anchor; a pan/broad marker (Slc17a7, Calb2) spans many regions and is excluded. scRNA-
@@ -707,7 +707,7 @@ def _graph_evidence(fon, lf, pin, IDM, octx, frac=0.30, lf_on=1.5, pin_min=0.25,
     lab=IDM["lab"]; tier=IDM["tier"]; genes=IDM.get("genes"); P=IDM.get("P",{})
     lin_idx=IDM["lin_idx"]; lin_class=IDM["lin_class"]; terms=octx.get("terms",{})
     region_of=IDM.get("region_of",{})
-    # ★ TWO predicates (2026-06-13 region-coherent redesign, replaces the absolute noise-floor gate):
+    # ★ TWO predicates (region-coherent redesign, replaces the absolute noise-floor gate):
     #   on_present — ABSOLUTE PRESENCE (detected across the cluster), used for LINEAGE. A pan-within-lineage
     #     transmitter (Slc17a7 in cortex: pin~1) shows little FOLD vs the transmitter-rich global background, so
     #     enrichment would wrongly miss it → lineage=None → whole descent dies. Presence fixes it.
@@ -814,7 +814,7 @@ def _graph_evidence(fon, lf, pin, IDM, octx, frac=0.30, lf_on=1.5, pin_min=0.25,
             if nxt is None: break
             chain.append(nxt); seen.add(nxt)
         return [lab.get(x,x) for x in chain[::-1]]
-    # ★ PARENT-CONSTRAINED descent (2026-06-14): restrict_root = the parent's resolved term (its dominant
+    # ★ PARENT-CONSTRAINED descent: restrict_root = the parent's resolved term (its dominant
     #   region-group, or its lineage class) when THIS leaf is a SUBCLUSTER. The child may then only be that term
     #   or its KG DESCENDANTS — a subcluster of a neocortical cluster can ONLY be a neocortical subtype, never
     #   pontine/cerebellar (the 8µm force-fit bug: cl41 cortex fragments → "pontine"). THIS is why the KG is a
@@ -849,7 +849,7 @@ def _graph_evidence(fon, lf, pin, IDM, octx, frac=0.30, lf_on=1.5, pin_min=0.25,
     #   The glia>=2 requirement blocks single-marker noise.
     _neur_enriched=any(_is_neur(ln) and any(on_anchor(g) for g in idxs) for ln,idxs in lin_idx.items())
     _nn_on=any((not _is_neur(ln)) and ln in lin_class and sum(1 for g in idxs if on_anchor(g))>=2 for ln,idxs in lin_idx.items())
-    # ★ COMPARATIVE non-neuronal dominance (2026-07-15): on dense/KDE spatial data (Stereo-seq) glial identity
+    # ★ COMPARATIVE non-neuronal dominance: on dense/KDE spatial data (Stereo-seq) glial identity
     #   markers (Mbp/Plp1/Slc1a2) have a HIGH ambient baseline — detected in ~ALL cells — so a REAL oligo/astro
     #   cluster's markers cap at auc~0.75-0.78, BELOW on_anchor's absolute 0.85 ⇒ _nn_on fails ⇒ glia excluded
     #   from the lineage pool ⇒ the cluster is mislabeled to the ambient neuronal transmitter's lineage
@@ -976,7 +976,7 @@ def _graph_evidence(fon, lf, pin, IDM, octx, frac=0.30, lf_on=1.5, pin_min=0.25,
         gg=set(disc.get(rg,())); rdf=set(defn.get(rg,()))
         for t in rg_terms.get(rg,()): gg|=set(disc.get(t,())); rdf|=set(defn.get(t,()))
         gg=[g for g in gg if share.get(g,99)<=SPEC_REGION_MAX]
-        # RC3 (2026-06-14): region-exclusive markers count via on_anchor (auc≥0.85 branch), so a quiet-but-enriched
+        # RC3: region-exclusive markers count via on_anchor (auc≥0.85 branch), so a quiet-but-enriched
         #   region marker (Fezf2→neocortical, auc 0.90 yet detected<25%) resolves the region in sparse 2µm data —
         #   else a deep-cortical (L5) leaf loses neocortical to hippocampal (shared Slc17a7/Pcp4) and is mislabeled.
         #   gg is already region-exclusive (share≤SPEC_REGION_MAX) and ≥2 concordant required ⇒ no lone-blip region.
@@ -984,7 +984,7 @@ def _graph_evidence(fon, lf, pin, IDM, octx, frac=0.30, lf_on=1.5, pin_min=0.25,
         if len(onm)>=2:
             rg_score[rg]=sum(lvl(g) for g in onm)
             rg_hasdf[rg]=any(on_anchor(g) for g in rdf if share.get(g,99)<=SPEC_REGION_MAX)
-    # ★ COMPARATIVE region establishment (2026-07-15): the strict pass above needs ≥2 region-exclusive markers
+    # ★ COMPARATIVE region establishment: the strict pass above needs ≥2 region-exclusive markers
     #   at on_anchor (auc≥0.85 OR fon≥0.30). On dense KDE spatial data (Stereo-seq) a region master TF
     #   (Satb2→neocortical) caps at auc~0.70 and the layer markers are DILUTED at the mixed-cluster level
     #   (Cux2/Rorb/Fezf2 each high only in their own layer's subset) ⇒ NO region scores ⇒ dominant_region empty
@@ -1179,7 +1179,7 @@ def _graph_evidence(fon, lf, pin, IDM, octx, frac=0.30, lf_on=1.5, pin_min=0.25,
         verdict=("clear_top" if len(ties)==1 else "ambiguous_tie")
     anchor_labels=[a["label"] for a in anchors]
     pathlabels={l for a in anchors[:6] for l in a.get("path",[])}|set(anchor_labels[:6])
-    # ★ ConfusionPair gate (2026-06-14): a cp is matched by its terms (if the slim-index serves them) OR by its
+    # ★ ConfusionPair gate: a cp is matched by its terms (if the slim-index serves them) OR by its
     #   pair_label "<A> vs <B>" tokens against anchor labels (the served terms are often empty). If the TOP anchor
     #   and its cp-PARTNER BOTH anchor — both consistent, neither's specific markers exclude the other (e.g. FC &
     #   CA2 share Pcp4/Amigo2/Rgs14) — the identity is NOT marker-resolvable ⇒ confusion_unresolved. The agent then
@@ -1248,7 +1248,7 @@ def _graph_evidence(fon, lf, pin, IDM, octx, frac=0.30, lf_on=1.5, pin_min=0.25,
                                           "action":action,"mixture":bool(td and pd),"resolves_to":resolves,
                                           "top_distinct_on":td[:6],"partner_distinct_on":pd[:6]}
     if confusion_unresolved: verdict="confusion_unresolved"
-    # ★ MIXTURE detection (SHOULD_SPLIT_MIXTURE, 2026-06-14): even when the leaf terminalizes at a region/class
+    # ★ MIXTURE detection (SHOULD_SPLIT_MIXTURE): even when the leaf terminalizes at a region/class
     #   (no single subtype anchors strongly), if ≥2 of the dominant region's child subtypes each have their OWN
     #   exclusive marker WEAKLY co-present (auc≥WEAK_AUC=0.6 — below the strict on_anchor 0.85, OR fold/df-ON via
     #   on_anchor), the leaf is an UNDER-CLUSTERED MIXTURE that the strict anchor gate missed because the markers
@@ -1297,7 +1297,7 @@ def _graph_evidence(fon, lf, pin, IDM, octx, frac=0.30, lf_on=1.5, pin_min=0.25,
 
 def _bimodal_split(Xleaf, IDM, octx, lineage_label, genes_arr,
                    corr_thr=-0.30, min_pole_frac=0.15, min_present_frac=0.10, min_cells=80):
-    """★ BIMODAL-SPLIT backstop (entry-trigger gap, 2026-06-23). The cluster-level mixture
+    """★ BIMODAL-SPLIT backstop (entry-trigger gap). The cluster-level mixture
     detector (`graph_evidence.mixture_subtypes`) MISSES a *balanced* 50/50 mix of two
     SIBLING-region subtypes: each pole's markers are diluted below the fold/auc bar AND the 2nd
     pole sits OUTSIDE `dominant_region`, so neither the mixture loop nor the finalize gate flags
@@ -1455,7 +1455,7 @@ def _mimicry_terms(idx):
     return out
 def _state_terms(idx):
     """Extract every state term in the module (tier=state, or a dev/reactive keyword).
-    ★ disease is a hint, not a filter (2026-06-22): these terms are always surfaced per leaf as
+    ★ disease is a hint, not a filter: these terms are always surfaced per leaf as
     disease_candidates even when --disease is unset, so the agent can assign that state when its markers
     dominate (SKILL §7). When disease IS given, they are intersected with _disease_terms and flagged
     hint=True. Returns {tid:{L,D,R,S,DF}}."""
@@ -1490,14 +1490,14 @@ def _identity_scores(fon, lf, M, pin=None, frac=0.30, lf_high=2.0, lf_on=1.5, pi
     if pin is None: pin=fon          # pin not provided → fold branch effectively inert (conservative)
     SPEC_SHARE_MAX=3; SPEC_COV_MIN=0.5
     def W(g): return 1.0/max(share.get(g,0),1)                  # marker specificity weight (1/#terms listing it)
-    # ★ ON (RC2, 2026-06-14): detection-based (fon / fold+pin) OR — for a term's OWN low-share SPECIFIC marker
+    # ★ ON (RC2): detection-based (fon / fold+pin) OR — for a term's OWN low-share SPECIFIC marker
     #   (share≤SPEC_SHARE_MAX) — strong rank-enrichment (auc≥auc_hi). The auc branch rescues quiet-but-enriched
     #   subtype markers in SPARSE spatial data (2µm: Rorb auc 0.98 / Fezf2 0.90 / Dcx 0.72 yet detected <25% so
     #   fold+pin fails) so L4/L5/immature-granule resolve. GUARD: auc path applies ONLY to low-share specific
     #   markers — broad/shared genes (Slc17a7/Pcp4, share>3) still require real detection ⇒ no spillover force-fit.
     def _on(g): return fon[g]>=frac or (lf[g]>=lf_on and pin[g]>=pin_min) or \
                        (auc is not None and auc[g]>=auc_hi and share.get(g,99)<=SPEC_SHARE_MAX)
-    # ★ DEFINING-MARKER CANDIDACY (2026-06-23). CASE = a type whose discriminative identity rests on a
+    # ★ DEFINING-MARKER CANDIDACY. CASE = a type whose discriminative identity rests on a
     #   region-BROAD defining marker (the *type itself* recurs across regions — interneuron neurochemical
     #   classes Sst/Pvalb/Vip, glia, immune, vascular). The pan/region_share filter strips such markers from
     #   `disc` (kept only in `defn`), so the type has too few non-pan `disc` markers to be built as a candidate
@@ -1511,7 +1511,7 @@ def _identity_scores(fon, lf, M, pin=None, frac=0.30, lf_high=2.0, lf_on=1.5, pi
     #   present in cortex/amygdala) on a non-CA1 leaf has its OTHER specifics OFF ⇒ spec_cov<0.5 ⇒ still nulled,
     #   and its dec is dwarfed by the real competitor ⇒ guard A rejects. (Region-defined types are unaffected:
     #   their DF, e.g. Fezf2/Rorb, is low-share and already in `disc`.)
-    # ★ DOMINANT broad-DEFINING marker (2026-06-23). A region-BROAD defining marker (share>SPEC_SHARE_MAX —
+    # ★ DOMINANT broad-DEFINING marker. A region-BROAD defining marker (share>SPEC_SHARE_MAX —
     #   exactly the marker region_share strips from `disc`: Sst/Pvalb/Vip…, because the *type* recurs across
     #   regions) counts as that term's evidence ONLY when it DOMINATES the cluster, measured by strong vs-rest
     #   enrichment (auc≥auc_hi) i.e. it is a top up-marker — not a weak/ambient fold. This rescues an Sst+
@@ -1582,7 +1582,7 @@ def _identity_scores(fon, lf, M, pin=None, frac=0.30, lf_high=2.0, lf_on=1.5, pi
     # GUARD: DF-override only among COHERENT terms (n_on>=2, neg==0, non-state). A lone defining marker
     # firing on ambient/neuropil signal in an over-split fragment (e.g. Rgs14→CA2) must NOT confirm a type
     # without ≥1 corroborating marker — this prevents spurious DF over-calls (the 8µm CA2 balloon).
-    # GUARD A+B (2026-06-11): a LEAKY defining marker (curated as one term's DF/specific in the ontology but
+    # GUARD A+B: a LEAKY defining marker (curated as one term's DF/specific in the ontology but
     # biologically also expressed elsewhere — e.g. Wfs1 listed only on CA1 yet present in cortex/amygdala)
     # must not hijack a higher-evidence competitor. A DF-override candidate is kept ONLY if CORROBORATED:
     #   (A) dec-competition — its decisive marker is >= DF_DEC_FRAC × the best coherent same-lineage
@@ -1620,7 +1620,7 @@ def _identity_scores(fon, lf, M, pin=None, frac=0.30, lf_high=2.0, lf_on=1.5, pi
     ranked=(sorted(coh, key=lambda c:(c["spec_pass"], c["_root"]==dom_root, c["dec"], c["wspec"]), reverse=True)[:5]
             or sorted(cand, key=lambda c:(c["spec_pass"], c["dec"], c["wspec"], c["n_on"]), reverse=True)[:5])
     if top is not None and top not in ranked: ranked=[top]+ranked[:4]
-    # ★ STATE VISIBILITY (2026-06-22, disease=hint-not-filter): state/disease terms are excluded from the
+    # ★ STATE VISIBILITY (disease=hint-not-filter): state/disease terms are excluded from the
     #   chimera/`top` core (above) to keep their broad markers from force-fitting normal cells. But if a state
     #   term has its OWN valid evidence (n_on>=2, no specific-neg leak, spec_pass), it must be VISIBLE so the
     #   agent can call it when its markers dominate — even with --disease omitted. Surface strong state terms in
@@ -1649,7 +1649,7 @@ def _identity_scores(fon, lf, M, pin=None, frac=0.30, lf_high=2.0, lf_on=1.5, pi
 def _rankcols(M): return np.asarray(rankdata(M, method="average", axis=0), dtype=np.float64)
 
 def _exclusive_mixture(Xleaf, IDM, octx, lineage_label, genes_arr, split_frac=0.15, min_cells=80, hi_thr=None):
-    """★ MUTUAL-EXCLUSIVITY mixture (2026-06-24, CASE+RULE, no hardcoding).
+    """★ MUTUAL-EXCLUSIVITY mixture (CASE+RULE, no hardcoding).
     CASE: the leaf stopped at one lineage CLASS (class_floor/ambiguous), yet two sibling subtypes of that
       lineage are MUTUALLY EXCLUSIVE — X's positive (R/DF) marker is Y's NEGATIVE marker and vice versa.
       A single cell cannot carry both (CD4 vs CD8: CD4SP R=CD4, neg=CD8 / CD8SP R=CD8, neg=CD4), so when the
@@ -1928,7 +1928,7 @@ def _profile_leaves(X, genes, leaf_arr, leaves, ont_gene_set, ont_protected,
             if _lin_root is not None:
                 _lr=_root.get(_lin_root,_lin_root); _dfp=[tid for tid in _dfp if _root.get(tid)==_lr]
             entry["df_present"]=sorted({_lab.get(tid,tid) for tid in _dfp})
-            # ★ BIMODAL-SPLIT backstop (2026-06-23): per-cell anti-correlated sibling programs that the
+            # ★ BIMODAL-SPLIT backstop: per-cell anti-correlated sibling programs that the
             #   cluster-level mixture detector missed (balanced 50/50 mix of sibling-region subtypes —
             #   arterial/venous EC, alveolar/adventitial fibroblast). Only when NO subtype confidently
             #   anchored (verdict≠clear_top) AND mixture_subtypes empty (the case it missed). Region-
@@ -2146,15 +2146,16 @@ def cmd_init(a):
     #   Clustering-based annotation takes the user's clustering (from a notebook or elsewhere) as given.
     leaves=sorted(set(cps.tolist()),
                   key=lambda s:[int(x) for x in s.split(".")] if s.replace('.','').isdigit() else [10**9,s])
-    # ★ subcluster representation (use_rep): neighbors for a subcluster are recomputed on an integrated
-    #   embedding (scVI etc.). With 'auto' (the default) an integrated embedding is auto-detected in obsm;
-    #   with 'recompute'/'none' the fallback is normalize + log1p + PCA rather than raw.
-    #   (Raw-count PCA is dominated by stress and library size and fails to split identities, so it is no
-    #   longer the default.)
+    # ★ subcluster representation (use_rep): which obsm embedding the subcluster kNN is built on, used
+    #   only when a marker axis cannot be built (the PCA fallback in cmd_subcluster).
+    #   Unset -> X_pca, and normalize + log1p + PCA recomputed per subset when obsm has no X_pca.
+    #   An integrated embedding (X_scVI, X_pca_harmony, ...) is NEVER picked implicitly: it changes which
+    #   splits are reachable, so it has to be named. Pass the obsm key to use one.
+    #   The recompute fallback log-normalizes rather than using raw counts, which are dominated by stress
+    #   and library size and fail to split identities.
     rep=a.use_rep
     if rep in (None,"auto",""):
-        rep=next((c for c in ("X_scVI","X_scANVI","X_scanvi","X_pca_harmony","X_harmony","X_pca","X_PCA")
-                  if c in adata.obsm), None)
+        rep="X_pca" if "X_pca" in adata.obsm else None
     elif rep in ("recompute","none","raw","RECOMPUTE"):
         rep=None
     elif rep not in adata.obsm:
@@ -2291,9 +2292,8 @@ def _hcmd_subcluster(a):
         sub=adata[mask].copy()
         npc=min(50, sub.n_vars-1, max(2, sub.n_obs-1))
         nn=min(int(st.get("sc_n_neighbors",15)),sub.n_obs-1)  # ★ n_neighbors persisted at init (15 when unset)
-        # ★ With use_rep, neighbors are recomputed on the subset of the integrated embedding (scVI etc.),
-        #   preserving identity and staying consistent with the top level. Without it, normalize_total + log1p +
-        #   PCA precede neighbors instead of raw (avoiding the library-size / stress dominance of raw-count PCA).
+        # ★ use_rep (resolved at init) builds neighbors on that obsm key restricted to the subset; otherwise
+        #   normalize_total + log1p + PCA precede neighbors, since raw-count PCA is dominated by library size.
         use_rep=rep if (rep and rep in sub.obsm) else None
         # ★ metric consistent with the initial clustering (persisted at init). Applies only on the recompute path.
         sc_metric=st.get("sc_metric","euclidean")
@@ -2345,7 +2345,7 @@ def _hcmd_subcluster(a):
     for r in range(1,st["round"]):
         pf=os.path.join(a.out,f"cluster_gene_profiles_round{r}.json")
         if os.path.exists(pf): prior.update(json.load(open(pf)))
-    # ★ PARENT-CONSTRAINED subclustering (2026-06-14): each parent's children may only be the parent's KG
+    # ★ PARENT-CONSTRAINED subclustering: each parent's children may only be the parent's KG
     #   subtree. restrict_root = the parent's resolved DOMINANT REGION-GROUP (single) so genuine SIBLINGS stay
     #   findable (CA1 inside a CA3 cluster — both under hippocampal pyramidal); if the parent had 0 or multiple
     #   dominant regions, fall back to its LINEAGE class (still blocks cross-lineage cortex→GABA/oligo). A child
@@ -2888,7 +2888,7 @@ def _finalize_review(decisions, st, out, max_depth=1, large_min_n=1500):
             _common={r for r,c in _rc.items() if c>=2}
             _mix_inreg=[m for m,r in _mix_regs if r in _common]
         mixture_trigger=_lin_ok and ((_cu.get("action")=="split") or (len(_mix_inreg)>=2))
-        # ★ BIMODAL backstop trigger (2026-06-23): per-cell anti-correlated sibling programs (≥2) the
+        # ★ BIMODAL backstop trigger: per-cell anti-correlated sibling programs (≥2) the
         #   mean-based mixture detector missed (balanced sibling-region mix). Region-independent, so it
         #   needs no _mix_inreg region check; _lin_ok still guards cross-lineage ambient.
         _bim=p.get("bimodal_subtypes") or []
@@ -2902,7 +2902,7 @@ def _finalize_review(decisions, st, out, max_depth=1, large_min_n=1500):
                 if k.get("n_nonpan_present",0)<1 or lab in strong or "DEPRECATED" in lab: continue
                 if (lab2D.get(lab) or "normal")!="normal": continue
                 strong.append(lab)
-            # ★ REGION-FLOOR descend backstop (2026-07-15): when the leaf is REGION-ESTABLISHED (dominant_region
+            # ★ REGION-FLOOR descend backstop: when the leaf is REGION-ESTABLISHED (dominant_region
             #   set), its children_resolvable are that region's OWN subtypes — cross-region ambient false children
             #   are already excluded by region-gating — so a bare-region floor with ≥2 resolvable region-children
             #   was simply NOT descended, and must be HELD even without aggregate DF-confirm (dilution hides a
@@ -2973,7 +2973,7 @@ def _finalize_review(decisions, st, out, max_depth=1, large_min_n=1500):
                       "reason_code":d.get("reason_code",""),"resolvable_children":strong[:8],
                       "n_expected":nexp,"start_resolution":start_res})
     cands.sort(key=lambda c:-c["n_cells"])
-    # ★ FLOORED-OVER-ANCHOR backstop (2026-07-15): the agent floored a leaf to a CLASS/region-group ancestor
+    # ★ FLOORED-OVER-ANCHOR backstop: the agent floored a leaf to a CLASS/region-group ancestor
     #   even though the engine's OWN verdict was `clear_top` with a deeper subtype anchor carrying ≥2 of its
     #   OWN exclusive markers ON (SKILL R2/R3 = REAL) and NO strong negative leak. This is a RELABEL, not a
     #   split — no re-clustering, so ZERO over-fragmentation risk (unlike a marker-axis descend, which on dense
@@ -3017,7 +3017,7 @@ def _finalize_review(decisions, st, out, max_depth=1, large_min_n=1500):
             "excl_on":int(_a.get("excl_on",0)),"excl_markers":_a.get("excl_markers_on") or [],
             "df_on":int(_a.get("df_on",0) or 0)})
     floored_over.sort(key=lambda c:-c["n_cells"])
-    # ★ DF-PRESENT SUBTYPE backstop (2026-07-15): a leaf floored to a class/group whose `df_present` names a
+    # ★ DF-PRESENT SUBTYPE backstop: a leaf floored to a class/group whose `df_present` names a
     #   DEEPER same-lineage subtype whose SPECIFIC (low-share) defining marker is fold-ON (≥3× enriched, detected
     #   ≥25% — a genuine signal, not ambient). The floored_over_anchor scan above misses this because the top
     #   ANCHOR is not that subtype: in a tiny ambient-dominated fragment (rare cortical interneurons on dense
@@ -3086,7 +3086,7 @@ def _finalize_review(decisions, st, out, max_depth=1, large_min_n=1500):
                 "hijack_anchor":(_anchs[0].get("label") if _anchs else None)})
             break
     df_present_sub.sort(key=lambda c:-c["n_cells"])
-    # ★ MUST-DESCEND — the un-bypassable "always descend before floor" enforcement (2026-07-15). The other
+    # ★ MUST-DESCEND — the un-bypassable "always descend before floor" enforcement. The other
     #   backstops key on a pre-descend SIGNAL (df_present / children_resolvable / a clear_top anchor), but a
     #   subtype is DILUTED at the whole-cluster mean — a real Fibrous astrocyte (Gfap auc 0.53 across the mixed
     #   astrocyte pool, 0.99 only AFTER the split concentrates it) shows NOTHING at round 1, so no signal-based
@@ -3116,7 +3116,7 @@ def _finalize_review(decisions, st, out, max_depth=1, large_min_n=1500):
         if not _tid or _tid not in _kid_parents: continue                   # its class/region node has KG children to descend into
         must_descend.append({"cluster_path":lf,"n_cells":n,"label":str(d.get("label","")).strip()})
     must_descend.sort(key=lambda c:-c["n_cells"])
-    # ★ PRINCIPLED resolution (2026-06-15): Leiden resolution γ has NO closed-form map to #clusters or which
+    # ★ PRINCIPLED resolution: Leiden resolution γ has NO closed-form map to #clusters or which
     #   subtypes split — it is data-dependent (Traag 2019; γ in CPM = a DENSITY THRESHOLD, in modularity scales the
     #   null model w/ a resolution-limit √(2m) that UNDER-resolves sub-types inside a large cluster — the 2µm blob
     #   bug). So a formula like 0.12·n was unfounded, and the 0.5 cap throttled it. REDESIGN: γ is not PREDICTED,
@@ -3205,7 +3205,7 @@ def cmd_finalize(a):
             print(f"  [relabel?] {c['cluster_path']} n={c['n_cells']} '{c['floored_label']}' → '{c['anchor_label']}' "
                   f"(excl_on={c['excl_on']}: {', '.join(c['excl_markers'][:4])})", flush=True)
         sys.exit(3)
-    # ★ DF-PRESENT SUBTYPE HOLD (2026-07-15): same-lineage subtype whose SPECIFIC defining marker is fold-ON
+    # ★ DF-PRESENT SUBTYPE HOLD: same-lineage subtype whose SPECIFIC defining marker is fold-ON
     #   (df_present) but was buried under a cross-lineage ambient anchor → RELABEL, not split.
     dfs=review.get("df_present_subtype") or []
     if dfs and not a.accept_large and not a.force:
@@ -3257,7 +3257,7 @@ def cmd_finalize(a):
                     _mm=_e.get("state_marker_means")
                     if _mm: _state_means[_p]=_mm
             except Exception: pass
-    # ★ STATE LINEAGE GATE (2026-07-09): a lineage-restricted state (M2=myeloid, EMT/mesenchymal=epithelial,
+    # ★ STATE LINEAGE GATE: a lineage-restricted state (M2=myeloid, EMT/mesenchymal=epithelial,
     #   estrogen-response=luminal — declared via st.applies_to in the slim-index `sa`) is kept ONLY when the
     #   FINAL base celltype OR one of its IS_A ancestors is in applies_to. Global states (empty applies_to)
     #   always pass. Applied here (authoritative, on the FINAL base label — works on finalize-only re-run),
@@ -3281,7 +3281,7 @@ def cmd_finalize(a):
     def _state_ok(state_name, base_lins):
         appl=_sa_appl.get(str(state_name).strip().lower())
         return (not appl) or bool(base_lins & appl)      # empty applies_to = GLOBAL state → always ok
-    # ★ WITHIN-BASE STATE GATE (2026-07-29): a program state is kept only when ≥2 of its markers are enriched vs
+    # ★ WITHIN-BASE STATE GATE: a program state is kept only when ≥2 of its markers are enriched vs
     #   SIBLING leaves of the SAME final base celltype — not merely vs the whole dataset. auc/lf (vs-rest) cannot
     #   tell a base-lineage-identity gene (macrophage C1q, Apoe) — uniform across the celltype yet high vs the
     #   dataset — from a genuine program (MKI67, high only in the cycling subset); only within-base variation can.
@@ -3413,14 +3413,14 @@ def _helper_cli():
                     help="Downgrade the input-matrix checks (X=lognorm / var_names=symbol) to warnings and proceed. Use only when you know the input is non-standard.")
     pi.add_argument("--disease",default=None,help="Disease context of the input data (e.g. 'brain cancer'). State terms for that disease are surfaced per leaf as disease_candidates (§7).")
     pi.add_argument("--use-rep",dest="use_rep",default="auto",
-                    help="Representation used to compute neighbors during subcluster (an obsm key, e.g. X_scVI). "
-                         "Default 'auto' = auto-detect an integrated embedding in obsm (X_scVI > scANVI > harmony > pca). "
-                         "'recompute' = redo normalize_total + log1p + PCA. When an integrated embedding exists, using it is recommended (it preserves identity-driven splits).")
+                    help="obsm key the subcluster kNN is built on, used only when a marker axis cannot be built. "
+                         "Unset = X_pca, falling back to a per-subset normalize_total + log1p + PCA when obsm has no X_pca. "
+                         "Name an integrated embedding (e.g. X_scVI, X_pca_harmony) to use one — none is ever chosen implicitly. "
+                         "'recompute' = ignore obsm and always redo normalize_total + log1p + PCA.")
     # ★ subcluster metric / n_neighbors: inputs that keep the subcluster consistent with the initial
     #   clustering (cluster_vectors).
     #   A subcluster recompute always log-normalizes (+ PCA).
-    #   When use_rep (an integrated embedding) is found, metric is ignored and that embedding is used with
-    #   euclidean.
+    #   When use_rep resolves to an obsm key, metric is ignored and that embedding is used with euclidean.
     pi.add_argument("--subcluster-metric",dest="sc_metric",default=None,
                     help="kNN metric for subcluster (correlation|euclidean). Defaults to correlation (assuming log-normalized input).")
     pi.add_argument("--subcluster-n-neighbors",dest="sc_n_neighbors",type=int,default=None,
@@ -3509,7 +3509,7 @@ def _candidate_axis(terms, cand_tids, var_up):
 def _marker_axis_leiden(sub, axis_genes, gUp, resolution, nn, backend, mod):
     """Subset sub (AnnData) to axis_genes only -> centering-free 90th-percentile scaling (0-preserving) ->
     kNN -> Leiden.
-    ★ NO-SIGNAL GUARD (2026-07-09): cells that switch on none of the axis genes (an all-zero row) are
+    ★ NO-SIGNAL GUARD: cells that switch on none of the axis genes (an all-zero row) are
     excluded from clustering and returned as **'u' (unassigned)**, so the caller floors them to the parent
     (bare class). Why: (1) when all-zero cells are numerous the kNN graph collapses and degenerates into one
     cluster per cell (oligo, 26504); (2) force-assigning a cell that switches on no region marker into some

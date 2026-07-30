@@ -9,19 +9,19 @@ __pycache__/
 *.orig
 *_BACKUP_*.tar.gz
 
-# meson / C 확장 빌드 산출물
+# meson / C extension build artifacts
 build/
 builddir/
 *.so
 *.o
 .mesonpy-*/
 
-# 환경
+# environment
 .venv/
 .env
 !*.example.env
 
-# 비공개 데이터 (CLAUDE.md 원칙: 데이터/h5ad는 repo에 넣지 않는다)
+# datasets are never committed — they live outside the repo and notebooks reference them by path
 *.h5ad
 *.npz
 *.zarr/

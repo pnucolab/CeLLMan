@@ -128,7 +128,7 @@ def _tensorstore_array(group_dir, name, shape, chunks):
 
 
 def _tensorstore_vf(group_dir, n_G, out_R, out_C, sh, sw):
-    """Back-compat thin wrapper: the 3D count ``vf_normalized`` writer."""
+    """Thin wrapper naming the 3D count ``vf_normalized`` shape and chunking."""
     return _tensorstore_array(group_dir, "vf_normalized",
                               (n_G, out_R, out_C), (n_G, sh, sw))
 
@@ -161,7 +161,7 @@ def compute_vf_blur(analysis, bin_adata, *, sigma_bin: float = 1.0,
     always full) so a sparse voxel gather (``select_vectors_from_image`` /
     ``downsample_vector``) decodes only the tiles that actually contain a sampled
     voxel instead of whole full-width row bands. Give an int (square side) or a
-    ``(h, w)`` tuple; ``None`` reverts to the legacy store == compute tile. For
+    ``(h, w)`` tuple; ``None`` makes the on-disk chunk match the compute tile. For
     alignment (no read-modify-write on interior writes) ``chunk_h`` and ``chunk_w``
     should be integer multiples of the store tile (the defaults 64/512 vs 32 are).
 
@@ -183,7 +183,7 @@ def compute_vf_blur(analysis, bin_adata, *, sigma_bin: float = 1.0,
     :type prune_coefficient: float
     :param size_after_normalization: L1 scale applied before ``log1p``.
     :type size_after_normalization: float
-    :param store_chunk: on-disk spatial chunk (int square side, ``(h, w)`` tuple, or ``None`` for legacy).
+    :param store_chunk: on-disk spatial chunk (int square side, ``(h, w)`` tuple, or ``None`` to match the compute tile).
     :type store_chunk: int or tuple or None
     :param device: torch device string.
     :type device: str

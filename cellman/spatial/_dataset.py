@@ -639,8 +639,8 @@ class Dataset(object):
                                           centroid_indices=[], colors=None, cmap='jet',
                                           rotate=0, min_r=0.6, set_alpha=False, z=None,
                                           image_name="cellman_celltype_map"):
-        """Back-compat shim: ``plot_celltypes_map(save_to_spatialdata=True)`` routes
-        here to :meth:`write_celltype_map` (labels + RGB image + annotating table)."""
+        """``plot_celltypes_map(save_to_spatialdata=True)`` routes here, which
+        delegates to :meth:`write_celltype_map` (labels + RGB image + annotating table)."""
         try:
             self.write_celltype_map(colors=colors, cmap=cmap, background=background,
                                     z=z, min_r=min_r, set_alpha=set_alpha)

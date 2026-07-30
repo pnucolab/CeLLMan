@@ -1386,7 +1386,7 @@ class Analysis(object):
             SQUARE tiles let a sparse ``downsample_vector`` gather decode only the
             tiles containing sampled voxels instead of full-width row bands. Keep
             ``chunk_h``/``chunk_w`` integer multiples of it (defaults are). ``None``
-            reverts to the legacy store == compute tile.
+            makes the on-disk chunk match the compute tile instead.
 
         :param sigma_bin: Gaussian bandwidth in bin units. Alternative to
             ``bandwidth_um``; ignored when ``bandwidth_um`` is given. Defaults to 1.
@@ -2489,12 +2489,12 @@ class Analysis(object):
             Target VRAM budget for the per-sub-chunk output buffer.
         Other parameters are identical to :meth:`map_celltypes_cpu`.
 
-        Now backed by the producer/consumer split: KDE field production
+        Built on a producer/consumer split: KDE field production
         (:meth:`_kde_field_iter_gpu`) is separated from the shared Pearson-max
         mapper (``_pearson_max_gpu``, identical to the count path), with the full
         normalized field optionally teed to a tensorstore writer (``save_vf``) in
-        the same streaming pass. Numerically equivalent to the legacy fused core
-        (vf_norm bit-identical; correlation diff <1e-5 from matmul batching).
+        the same streaming pass. Correlations are computed in matmul batches, so
+        they can differ from an unbatched reduction by <1e-5.
         """
         return self._transcript_gpu(
             sdata, do_map=True, save_vf=save_vf,
@@ -2510,328 +2510,12 @@ class Analysis(object):
     map_celltypes_cpu = _map_celltypes_cpu
     map_celltypes_gpu = _map_celltypes_gpu
 
-    def _map_celltypes_gpu_core(self, sdata, *, chunk_start=None, chunk_end=None,
-                                cx=None, create_arrays=True, attach=True,
-                                centroids=None, element_name=None,
-                                exclude_gene_indices=None,
-                                bandwidth=2.5, sampling_distance=1.0,
-                                prune_coefficient=4.3, size_after_normalization=10,
-                                log_transform=True, overwrite=True,
-                                gpu_device='cuda', query_subchunk_size=None,
-                                gpu_target_bytes=int(1e9), save_vf=False):
-        """Shared GPU mapping core over a chunk range ``[chunk_start, chunk_end)``.
-
-        Backs both :meth:`map_celltypes_gpu` (full run, single machine:
-        ``create_arrays=True, attach=True``) and the GPU branch of
-        :meth:`map_celltypes_partial` (per-worker range:
-        ``create_arrays=False, attach=False``, ``cx`` supplied by
-        :meth:`init_map_celltypes`). When ``cx`` is None it is computed
-        via :meth:`calc_chunk`; otherwise the supplied value is used so
-        all workers agree on the chunk grid.
-        """
-        from tqdm.auto import tqdm
-        try:
-            import torch
-            from ._mapping_gpu import (
-                _kde_setup_celllist, _kde_run_subchunk, _pearson_corr_gpu,
-            )
-        except ImportError as e:
-            raise ImportError(
-                "map_celltypes_gpu requires torch + triton + "
-                "._mapping_gpu."
-            ) from e
-        if not torch.cuda.is_available():
-            raise RuntimeError("map_celltypes_gpu requires a CUDA device")
-
-        for key in ('cluster_labels', 'downsampled_vectors', 'normalized_vectors',
-                    'centroids'):
-            if key in self.dataset.zarr_group:
-                setattr(self.dataset, key,
-                        self.dataset.zarr_group[key][:])
-
-        if centroids is None:
-            if getattr(self.dataset, 'centroids', None) is None:
-                raise ValueError('centroids not found. Pass h5ad=<annotated .h5ad> to map_celltypes to build them.')
-            centroids = np.asarray(self.dataset.centroids, dtype=np.float32)
-        else:
-            centroids = np.asarray(centroids, dtype=np.float32)
-
-        if getattr(self.dataset, 'shape', None) is None or \
-                not hasattr(self, 'locations') or self.locations is None:
-            self._prepare_grid(
-                sdata, element_name=element_name,
-                bandwidth=bandwidth, sampling_distance=sampling_distance,
-                prune_coefficient=prune_coefficient,
-                size_after_normalization=size_after_normalization,
-            )
-
-        vx, vy, vz = (int(self.dataset.shape[0]),
-                      int(self.dataset.shape[1]),
-                      int(self.dataset.shape[2]))
-
-        self.dataset.bandwidth = bandwidth
-        self.dataset.ndim = 2 if vz == 1 else 3
-        self.dataset.expression_threshold = (
-            1 / (np.sqrt(2 * np.pi) * bandwidth) ** self.dataset.ndim
-        )
-        self.dataset.norm_threshold = self.dataset.expression_threshold * 2
-        norm_threshold = float(self.dataset.norm_threshold)
-
-        grouped = self.locations.groupby('gene', sort=True)
-        grouped_map = {gene: loc for gene, loc in grouped}
-
-        if getattr(self.dataset, 'genes', None) is None:
-            genes = sorted(grouped_map.keys())
-            self.dataset.genes = genes
-        else:
-            genes = list(self.dataset.genes)
-
-        if centroids.shape[1] != len(genes):
-            raise ValueError(
-                f'centroids gene dim ({centroids.shape[1]}) != gene count ({len(genes)})'
-            )
-
-        shared_gene_indices = [i for i, g in enumerate(genes) if g in grouped_map]
-        shared_genes = [genes[i] for i in shared_gene_indices]
-        missing_genes = [g for g in genes if g not in grouped_map]
-        if len(shared_genes) == 0:
-            raise ValueError('No common genes between input data and centroids.')
-        if missing_genes and self.verbose:
-            print(f'map_celltypes_gpu: dropping {len(missing_genes)} missing genes '
-                  f'(e.g. {missing_genes[:5]})')
-
-        centroids_shared = centroids[:, shared_gene_indices]
-
-        if exclude_gene_indices is not None:
-            idx_to_local = {gi: li for li, gi in enumerate(shared_gene_indices)}
-            exclude_shared = sorted(
-                idx_to_local[i] for i in exclude_gene_indices if i in idx_to_local
-            )
-        else:
-            exclude_shared = None
-
-        if exclude_shared:
-            keep_in_shared = [i for i in range(len(shared_genes))
-                              if i not in set(exclude_shared)]
-            use_genes = [shared_genes[i] for i in keep_in_shared]
-            centroids_use = centroids_shared[:, keep_in_shared]
-        else:
-            use_genes = list(shared_genes)
-            centroids_use = centroids_shared
-        n_genes_use = centroids_use.shape[1]
-
-        def _safe_remove(name):
-            if name in self.dataset.zarr_group:
-                del self.dataset.zarr_group[name]
-
-        if create_arrays:
-            if overwrite:
-                for name in ('vf_norm', 'celltype_maps', 'max_correlations',
-                             'vf_normalized', 'vf_normalized_genes'):
-                    _safe_remove(name)
-            import numcodecs as _numcodecs
-            _safe_remove('genes')
-            self.dataset.zarr_group['genes'] = np.asarray(genes)
-            self.dataset._zarr_create_array(self.dataset.zarr_group, 'vf_norm', (vx, vy, vz), 'f4')
-            self.dataset._zarr_create_array(self.dataset.zarr_group, 'celltype_maps', (vx, vy, vz), 'i4')
-            self.dataset._zarr_create_array(self.dataset.zarr_group, 'max_correlations', (vx, vy, vz), 'f4')
-            if save_vf:
-                _safe_remove('vf_normalized'); _safe_remove('vf_normalized_genes')
-                self.dataset.zarr_group.create_array(
-                    'vf_normalized', shape=(n_genes_use, vx, vy, vz),
-                    chunks=(n_genes_use, 1, vy, vz), dtype='f4', fill_value=0.0)
-                self.dataset.zarr_group['vf_normalized_genes'] = np.asarray(use_genes)
-        elif save_vf and 'vf_normalized' not in self.dataset.zarr_group:
-            raise ValueError("save_vf=True with create_arrays=False requires "
-                             "'vf_normalized' to be pre-created (distributed path).")
-
-        cx_calc, _ = self.calc_chunk(vx, vy, vz, n_genes_use, mode='map_celltypes_cpu')
-        if cx is None:
-            cx = cx_calc
-        if cx is None or cx <= 0:
-            raise RuntimeError('Cannot determine chunk size.')
-        n_chunk = (vx + cx - 1) // cx
-        if chunk_start is None:
-            chunk_start = 0
-        if chunk_end is None:
-            chunk_end = n_chunk
-
-        if query_subchunk_size is None:
-            query_subchunk_size = max(1024, int(gpu_target_bytes // (n_genes_use * 4)))
-
-        all_loc_x, all_loc_y, all_loc_z, all_gi = [], [], [], []
-        for gidx_use, g in enumerate(use_genes):
-            locs = np.asarray(grouped_map[g], dtype=np.float64)
-            n_t = locs.shape[0]
-            if n_t == 0:
-                continue
-            all_loc_x.append(locs[:, 0])
-            all_loc_y.append(locs[:, 1])
-            if locs.shape[1] >= 3:
-                all_loc_z.append(locs[:, 2])
-            else:
-                all_loc_z.append(np.zeros(n_t, dtype=np.float64))
-            all_gi.append(np.full(n_t, gidx_use, dtype=np.int64))
-        if all_loc_x:
-            loc_x_np = np.concatenate(all_loc_x)
-            loc_y_np = np.concatenate(all_loc_y)
-            loc_z_np = np.concatenate(all_loc_z)
-            gi_np    = np.concatenate(all_gi)
-        else:
-            loc_x_np = np.zeros(0, dtype=np.float64)
-            loc_y_np = np.zeros(0, dtype=np.float64)
-            loc_z_np = np.zeros(0, dtype=np.float64)
-            gi_np    = np.zeros(0, dtype=np.int64)
-        del all_loc_x, all_loc_y, all_loc_z, all_gi
-
-        loc_x_t = torch.as_tensor(loc_x_np, dtype=torch.float64, device=gpu_device)
-        loc_y_t = torch.as_tensor(loc_y_np, dtype=torch.float64, device=gpu_device)
-        loc_z_t = torch.as_tensor(loc_z_np, dtype=torch.float64, device=gpu_device)
-        gi_t    = torch.as_tensor(gi_np,    dtype=torch.int64,   device=gpu_device)
-        centroids_t = torch.as_tensor(centroids_use, dtype=torch.float32, device=gpu_device)
-
-        sd_um = float(sampling_distance)
-        dim = 2 if vz == 1 else 3
-
-        import numcodecs as _nc2
-        _nc2.blosc.set_nthreads(self.ncores)
-
-        for chunk_idx in range(chunk_start, chunk_end):
-            x0 = chunk_idx * cx
-            x1 = min(vx, x0 + cx)
-            local_cx = x1 - x0
-
-            qx_grid = (np.arange(x0, x1) * sd_um).astype(np.float64)
-            qy_grid = (np.arange(vy) * sd_um).astype(np.float64)
-            qz_grid = (np.arange(vz) * sd_um).astype(np.float64)
-            Qx, Qy, Qz = np.meshgrid(qx_grid, qy_grid, qz_grid, indexing='ij')
-            qx_flat = Qx.ravel()
-            qy_flat = Qy.ravel()
-            qz_flat = Qz.ravel()
-            N_total = int(qx_flat.size)
-
-            vf_norm_chunk = np.zeros((local_cx, vy, vz), dtype=np.float32)
-            ctmap_chunk   = np.full((local_cx, vy, vz), -1, dtype=np.int32)
-            corr_chunk    = np.full((local_cx, vy, vz), -1, dtype=np.float32)
-            vf_full_chunk = (np.zeros((n_genes_use, local_cx, vy, vz), dtype=np.float32)
-                             if save_vf else None)
-
-            chunk_q_xmin = float(qx_grid.min()) if N_total > 0 else 0.0
-            chunk_q_xmax = float(qx_grid.max()) if N_total > 0 else 0.0
-            chunk_q_ymin = float(qy_grid.min()) if N_total > 0 else 0.0
-            chunk_q_ymax = float(qy_grid.max()) if N_total > 0 else 0.0
-            chunk_q_zmin = float(qz_grid.min()) if N_total > 0 else 0.0
-            chunk_q_zmax = float(qz_grid.max()) if N_total > 0 else 0.0
-
-            _Rw_pad = float(bandwidth * prune_coefficient + sd_um)
-            x_lo_chunk = chunk_q_xmin - _Rw_pad
-            x_hi_chunk = chunk_q_xmax + _Rw_pad
-            mask_chunk_t = (loc_x_t >= x_lo_chunk) & (loc_x_t <= x_hi_chunk)
-            loc_x_chunk_t = loc_x_t[mask_chunk_t]
-            loc_y_chunk_t = loc_y_t[mask_chunk_t]
-            loc_z_chunk_t = loc_z_t[mask_chunk_t]
-            gi_chunk_t    = gi_t[mask_chunk_t]
-            del mask_chunk_t
-
-            state = _kde_setup_celllist(
-                loc_x_chunk_t, loc_y_chunk_t, loc_z_chunk_t, gi_chunk_t,
-                chunk_q_xmin, chunk_q_ymin, chunk_q_zmin,
-                chunk_q_xmax, chunk_q_ymax, chunk_q_zmax,
-                sd_um, bandwidth, prune_coefficient, dim,
-            )
-
-            n_sub = (N_total + query_subchunk_size - 1) // query_subchunk_size
-            sub_iter = range(n_sub)
-            if self.verbose:
-                sub_iter = tqdm(sub_iter,
-                                desc=f'KDE+corr chunk {chunk_idx + 1}/{n_chunk}',
-                                leave=True, dynamic_ncols=True)
-            for s in sub_iter:
-                s0 = s * query_subchunk_size
-                s1 = min(N_total, s0 + query_subchunk_size)
-                sub_qx = qx_flat[s0:s1]
-                sub_qy = qy_flat[s0:s1]
-                sub_qz = qz_flat[s0:s1]
-
-                kde_t = _kde_run_subchunk(state, sub_qx, sub_qy, sub_qz,
-                                          n_genes_use, gpu_device)
-                vf_norm_t = kde_t.sum(dim=1)
-
-                sub_idx = np.arange(s0, s1)
-                local_x = sub_idx // (vy * vz)
-                rem = sub_idx % (vy * vz)
-                local_y = rem // vz
-                local_z = rem % vz
-
-                vf_norm_chunk[local_x, local_y, local_z] = (
-                    vf_norm_t.detach().cpu().numpy().astype(np.float32, copy=False)
-                )
-
-                if save_vf:
-                    vf_full_t = (kde_t
-                                 / torch.clamp(vf_norm_t, min=1e-12).unsqueeze(1)
-                                 * float(size_after_normalization))
-                    if log_transform:
-                        vf_full_t = torch.log1p(vf_full_t)
-                    vf_full_chunk[:, local_x, local_y, local_z] = (
-                        vf_full_t.T.detach().cpu().numpy().astype(np.float32, copy=False)
-                    )
-                    del vf_full_t
-
-                mask_t = vf_norm_t > norm_threshold
-                n_kept = int(mask_t.sum().item())
-                if n_kept == 0:
-                    del kde_t, vf_norm_t, mask_t
-                    continue
-
-                data_kept_t = kde_t[mask_t]
-                vfn_kept_t  = vf_norm_t[mask_t]
-                data_kept_t = data_kept_t / vfn_kept_t.unsqueeze(1) * float(size_after_normalization)
-                if log_transform:
-                    data_kept_t = torch.log1p(data_kept_t)
-
-                corr_t = _pearson_corr_gpu(centroids_t, data_kept_t)
-                best_corr_t, best_idx_t = corr_t.max(dim=0)
-
-                mask_np = mask_t.detach().cpu().numpy()
-                kept_local_x = local_x[mask_np]
-                kept_local_y = local_y[mask_np]
-                kept_local_z = local_z[mask_np]
-                ctmap_chunk[kept_local_x, kept_local_y, kept_local_z] = (
-                    best_idx_t.detach().cpu().numpy().astype(np.int32, copy=False)
-                )
-                corr_chunk[kept_local_x, kept_local_y, kept_local_z] = (
-                    best_corr_t.detach().cpu().numpy().astype(np.float32, copy=False)
-                )
-
-                del kde_t, vf_norm_t, mask_t, data_kept_t, vfn_kept_t, corr_t
-                del best_corr_t, best_idx_t
-
-            self.dataset.zarr_group['vf_norm'][x0:x1, :, :]          = vf_norm_chunk
-            self.dataset.zarr_group['celltype_maps'][x0:x1, :, :]    = ctmap_chunk
-            self.dataset.zarr_group['max_correlations'][x0:x1, :, :] = corr_chunk
-            if save_vf:
-                self.dataset.zarr_group['vf_normalized'][:, x0:x1, :, :] = vf_full_chunk
-
-            del vf_norm_chunk, ctmap_chunk, corr_chunk, state, vf_full_chunk
-            del Qx, Qy, Qz, qx_flat, qy_flat, qz_flat
-            del loc_x_chunk_t, loc_y_chunk_t, loc_z_chunk_t, gi_chunk_t
-            gc.collect()
-            torch.cuda.empty_cache()
-
-        if attach:
-            import dask.array as _da
-            self.dataset._vf_norm = _da.from_zarr(self.dataset.zarr_group['vf_norm'])
-            self.dataset.celltype_maps = self.dataset.zarr_group['celltype_maps'][:]
-            self.dataset.max_correlations = self.dataset.zarr_group['max_correlations'][:]
-
     def _prepare_transcript_field(self, sdata, *, centroids, element_name,
                                   exclude_gene_indices, bandwidth, sampling_distance,
                                   prune_coefficient, size_after_normalization,
                                   gpu_device):
         """Resolve everything the KDE producer/consumer need (grid, gene set,
-        centroids, transcripts on GPU). Factored verbatim from the setup block of
-        the legacy ``_map_celltypes_gpu_core`` so numerics are preserved."""
+        centroids, transcripts on GPU)."""
         import torch
         for key in ('cluster_labels', 'downsampled_vectors', 'normalized_vectors',
                     'centroids'):
@@ -2934,7 +2618,7 @@ class Analysis(object):
         """PRODUCER. Yield, per output x-slab, a dict with the vf_norm plane, the
         KEPT (vf_norm>threshold) voxels' local positions + normalized·log1p gene
         vectors (GPU tensor), and the full normalized field (only if
-        ``want_full_field``). KDE math is verbatim from the legacy gpu_core loop."""
+        ``want_full_field``)."""
         import torch
         from tqdm.auto import tqdm
         from ._mapping_gpu import _kde_setup_celllist, _kde_run_subchunk

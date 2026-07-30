@@ -269,6 +269,17 @@ notebook — so the h5ad arrives already clustered):**
   must resolve up front); do not guess `leiden` when the h5ad has several candidate columns.
 - **`{species}` / `{organ}`** — the module (e.g. `mouse` / `brain`). From the prompt or obvious from the dataset.
 - **`{disease}`** (optional) — pass `--disease "<name>"` only if the user says the data is disease/cancer (R7 hint).
+- **`{output}`** (optional) — a save path the user names for the annotated h5ad (*"output: /data/kidney_done.h5ad"*,
+  *"save it to …"*). Pass it as `--output {output}` on `init` and it persists to `finalize`; passing it on
+  `finalize` instead also works and wins. Omitted, the h5ad is written to
+  `{out}/{input_basename}_annotated.h5ad` — **inside the `--out` directory, not beside the input.** Relay the
+  user's path verbatim; do not invent one, and do not move or copy the file afterwards to "fix" the location.
+- **`{use_rep}`** (optional) — an `obsm` key the user names for subdividing (*"use rep: X_scVI"*, *"subcluster on
+  the scVI embedding"*). Pass it through as `--use-rep {use_rep}`; **never substitute one of your own.** Omitted,
+  the helper uses `X_pca`, or recomputes normalize + log1p + PCA per group when `obsm` has no `X_pca`. It only
+  takes effect where a marker axis cannot be built (0/1 KG candidates → the PCA fallback below), so it changes
+  nothing on a normal marker-axis descend. An integrated embedding is never selected implicitly, because it
+  changes which splits are reachable — so if the user mentions one, relaying it is the only way it is used.
 
 **Output directory (hard rule):** `{out}` = an `annotation_out/` directory inside the caller's output
 location (`--out {base_out}/annotation_out`; `mkdir -p` it before `init`). All artifacts and the final h5ad
@@ -287,9 +298,12 @@ mkdir -p {out}
 #     from uns['cellman_cluster_params'] if present. Supply them ONLY when they must MATCH an external
 #     clustering that did not record those params.
 #   --adaptive-floor                               sparse platforms (0.5µm KDE vector field): lower R1 thresholds to ambient×F (persists to all rounds).
+#   --use-rep <obsm key>   ONLY when the user named an embedding to subdivide on (e.g. X_scVI). Decided here
+#     and persisted for every later round. Omitted = X_pca, else a per-group normalize+log1p+PCA recompute.
+#     Applies solely to the PCA fallback (0/1 candidate); a marker-axis split ignores it. An unknown key aborts.
 {python} {HELPER} init --h5ad {input_h5ad} --cluster-col {cluster_col} \
    --out {out} --species {species} --organ {organ} [--disease "{disease}"] \
-   [--adaptive-floor]      # (--subcluster-metric/-n-neighbors: only for externally clustered h5ad)
+   [--adaptive-floor] [--use-rep {use_rep}] [--output {output}]   # (--subcluster-metric/-n-neighbors: only for externally clustered h5ad)
 
 # subcluster — MARKER-AXIS split of a NAMED multiplicity (R6). --candidates = the REAL distinct terms to separate.
 {python} {HELPER} subcluster --out {out} --paths '["4.8"]' \
@@ -297,6 +311,7 @@ mkdir -p {out}
    [--resolution 1.0] [--subcluster-n-neighbors 15] [--gpu 0]
 #   per-path candidates: --candidates '{"4.8":["CA2 …","FC …"], "11.2":["D1-MSN","D2-MSN"]}'
 #   0/1 candidate on a path → automatic whole-transcriptome PCA fallback (discovery subclustering).
+#     This is the ONLY route that reads --use-rep (set at init): the named obsm key, else X_pca, else a recompute.
 
 # descend — UNCONDITIONAL KG descent of a class/region FLOOR leaf (R4/R8), region→subtype, kg-descent style.
 {python} {HELPER} descend --out {out} --paths '["cl3"]'   --node "glutamatergic neuron"                 # → its KG children (regions)
@@ -304,8 +319,10 @@ mkdir -p {out}
 
 # check — validate your decisions (helper never edits them; you fix the flagged clusters).
 {python} {HELPER} check --out {out} --decisions {out}/_annotate_decisions.json
-# finalize — write {input}_annotated.h5ad (only when error-free AND the split-review gate is clear, §7.1).
-{python} {HELPER} finalize --out {out} --decisions {out}/_annotate_decisions.json [--accept-large]
+# finalize — write the annotated h5ad (only when error-free AND the split-review gate is clear, §7.1).
+#   Destination: --output here > --output given at init > {out}/{input_basename}_annotated.h5ad.
+#   Pass --output ONLY when the user named a path; never redirect the write on your own.
+{python} {HELPER} finalize --out {out} --decisions {out}/_annotate_decisions.json [--accept-large] [--output {output}]
 
 ```
 

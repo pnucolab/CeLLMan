@@ -8,8 +8,7 @@ and organ mines PubMed into a knowledge graph of cell-type marker genes and infe
 mRNA signals alone — no segmentation, no neighborhood aggregation.
 
 <p align="center">
-  <img src="https://raw.githubusercontent.com/pnucolab/CeLLMan/master/cellman.png"
-       alt="CeLLMan overview" width="900">
+  <img src="cellman.png" alt="CeLLMan overview" width="900">
 </p>
 
 ---
@@ -22,25 +21,28 @@ uv venv .venv --python 3.11
 source .venv/bin/activate
 ```
 
+Then run **one** of the two commands below. 
+
 ```bash
+# CPU only
 uv pip install ./CeLLMan
-
-# The default build enables AVX-512 on any x86_64 host without checking whether the CPU supports it,
-# so a machine that lacks it aborts with an illegal instruction the first time the extension runs.
-# Install with the line below instead if either applies:
-#   - x86_64 Linux with no AVX-512 — `lscpu | grep -o avx512f | head -1` prints nothing
-#                                    (most consumer Ryzen and Core chips)
-#   - an Intel Mac                 — no Mac has ever shipped with AVX-512
-# Apple Silicon and other ARM hosts need nothing extra: SIMD is not enabled there to begin with.
-
-# uv pip install ./CeLLMan --config-settings=setup-args=-Dsimd=disabled
 ```
 
-For GPU acceleration
-
 ```bash
+# same as above, plus GPU acceleration.
 uv pip install './CeLLMan[gpu]'
 ```
+
+Either command builds the C extension, and the default build enables AVX-512 on any x86_64 host
+without checking whether the CPU supports it — a machine that lacks it aborts with an illegal
+instruction the first time the extension runs. Append `--config-settings=setup-args=-Dsimd=disabled`
+to whichever command you chose if either of these applies:
+
+- **x86_64 Linux with no AVX-512** — `lscpu | grep -o avx512f | head -1` prints nothing (most
+  consumer Ryzen and Core chips)
+- **an Intel Mac** — no Mac has ever shipped with AVX-512
+
+Apple Silicon and other ARM hosts need nothing extra: SIMD is not enabled there to begin with.
 
 Then register the skill and the expert agent with your LLM host.
 

@@ -6,7 +6,7 @@ persisting only ``vf_normalized`` + ``vf_norm`` to the zarr store. Voxels are
 then sampled from the tissue image and *looked up* in that field
 (:func:`select_vectors_from_image`) — the count analogue of the transcript path's
 KDE-at-sampled-points. Cluster centroids are mapped over the field by correlation
-(:func:`map_corr`); the TSVM mapper lives in :mod:`cellman.spatial._tsvm`.
+(:func:`map_corr`).
 
 All functions take the ``Analysis`` instance so they can read/write
 ``analysis.dataset.zarr_group`` and honour ``analysis.verbose``.

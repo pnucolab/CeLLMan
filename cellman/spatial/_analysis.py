@@ -1875,34 +1875,40 @@ class Analysis(object):
         Two regimes, auto-detected from the store:
 
         * **count** (blur ``vf_normalized`` present) — the field is read from
-          zarr and mapped by ``method``: ``'corr'`` (centroid Pearson) or
-          ``'tsvm'`` (linear/transductive SVM). No KDE.
+          zarr and mapped by ``method``. No KDE.
         * **transcript** (no precomputed field) — KDE is computed chunk-by-chunk
-          and correlated with centroids, dispatching to
+          and mapped on the fly, dispatching to
           :meth:`map_celltypes_gpu` (CUDA available and not ``force_cpu``) or
-          :meth:`map_celltypes_cpu`. Only ``method='corr'`` is supported here.
+          :meth:`map_celltypes_cpu`.
+
+        Both regimes support ``method='corr'`` (centroid Pearson correlation) and
+        ``method='gnb'`` (per-voxel Gaussian naive Bayes fitted on the labeled
+        ``normalized_vectors``). ``'gnb'`` is generative — every class keeps its own
+        region — so it preserves rare cell types the discriminative correlation
+        argmax can drop.
 
         Parameters
         ----------
-        method : {'corr', 'tsvm'}, default 'corr'
-            Mapping algorithm (count regime only; transcript is always 'corr').
-            ``'corr'`` writes the per-voxel score to ``max_correlations``
-            (filtered by ``min_r``); ``'tsvm'`` writes the softmax probability to
-            ``max_probabilities`` (filtered by ``min_p``). ``'tsvm'`` defaults to
-            **PCA-50 + RBF kernel** (random Fourier features) and, unlike ``'corr'``,
-            can **abstain**: a low-confidence voxel is left Unknown (-1). Override via
-            ``map_kwargs={'fit_kwargs': {...}}`` (e.g. ``{'kernel': 'linear'}``, or
-            ``{'n_components': None, 'kernel': 'linear'}`` for full-gene mode).
+        method : {'corr', 'gnb'}, default 'corr'
+            Mapping algorithm (both regimes). ``'corr'`` correlates each voxel's
+            vector with the centroids and takes the argmax. ``'gnb'`` fits a
+            :class:`~sklearn.naive_bayes.GaussianNB` (cuML on GPU, scikit-learn on
+            CPU) on the labeled ``normalized_vectors`` and predicts each voxel. Both
+            write the label raster to ``celltype_maps`` and the per-voxel score
+            (correlation for ``'corr'``, top-class posterior for ``'gnb'``) to
+            ``max_correlations`` (filtered downstream by ``min_r``). Extra ``'gnb'``
+            options via ``map_kwargs`` (e.g. ``{'row_normalize': False,
+            'var_smoothing': 1e-9}``). On the transcript/imaging regime ``'gnb'`` uses
+            the CPU KDE producer with the (GPU) classifier.
         map_kwargs : dict, optional
             Extra kwargs forwarded to the count mapper
             (:func:`cellman.spatial._count.map_corr` /
-            :func:`cellman.spatial._tsvm.map_tsvm`).
+            :func:`cellman.spatial._gnb.map_gnb`).
         gpu_device : str, default ``'cuda'``
             CUDA device used by the GPU path.
         force_cpu : bool, default False
-            If True, run on CPU regardless of GPU availability — both the transcript
-            KDE path and ``method='tsvm'``. Even without this flag, ``method='tsvm'``
-            falls back to CPU automatically when no CUDA device is present.
+            If True, run on CPU regardless of GPU availability (transcript KDE and
+            the ``'gnb'`` classifier both honor it).
         save_vf : bool, default False
             **Transcript regime only.** By default the imaging-based path
             (Xenium / MERFISH) computes the KDE vector field chunk-by-chunk,
@@ -1998,26 +2004,24 @@ class Analysis(object):
 
         if ('vf_normalized' in zg) and (zg.attrs.get('backend') == 'blur'):
             mk = dict(map_kwargs or {})
-            mk.setdefault('device', gpu_device)
             mk.setdefault('overwrite', overwrite)
             if method == 'corr':
+                mk.setdefault('device', gpu_device)
                 from ._count import map_corr
                 map_corr(self, centroids=centroids, **mk)
-            elif method == 'tsvm':
-                from ._tsvm import map_tsvm
-                tsvm_device = 'cpu' if force_cpu else mk.get('device', gpu_device)
-                map_tsvm(self, device=tsvm_device,
-                         overwrite=mk.get('overwrite', overwrite),
-                         fit_kwargs=mk.get('fit_kwargs'),
-                         apply_kwargs=mk.get('apply_kwargs'))
+            elif method == 'gnb':
+                mk.pop('device', None)
+                from ._gnb import map_gnb
+                map_gnb(self, centroids=centroids, gpu_device=gpu_device,
+                        force_cpu=force_cpu, **mk)
             else:
                 raise ValueError(f"unknown mapping method {method!r} "
-                                 "(count: 'corr'|'tsvm')")
+                                 "(count: 'corr'|'gnb')")
             return self._finish_map(sdata, table_key)
 
-        if method != 'corr':
-            raise ValueError(f"method={method!r} needs a precomputed blur field "
-                             "(count data); transcript mapping is 'corr' only.")
+        if method not in ('corr', 'gnb'):
+            raise ValueError(f"unknown mapping method {method!r} "
+                             "(transcript: 'corr'|'gnb')")
         if sdata is None:
             raise ValueError("transcript map_celltypes requires sdata.")
         shared = dict(
@@ -2026,6 +2030,7 @@ class Analysis(object):
             sampling_distance=sampling_distance, prune_coefficient=prune_coefficient,
             size_after_normalization=size_after_normalization,
             log_transform=log_transform, overwrite=overwrite, save_vf=save_vf,
+            method=method,
         )
         use_gpu = False
         if not force_cpu:
@@ -2043,14 +2048,15 @@ class Analysis(object):
             )
         else:
             self._m('map_celltypes: CPU path')
-            self._map_celltypes_cpu(sdata, **shared)
+            self._map_celltypes_cpu(sdata, gpu_device=gpu_device,
+                                    force_cpu=force_cpu, **shared)
         return self._finish_map(sdata, table_key)
 
     def _map_celltypes_cpu(self, sdata, centroids=None, element_name=None,
                          exclude_gene_indices=None,
                          bandwidth=2.5, sampling_distance=1.0, prune_coefficient=4.3,
                          size_after_normalization=10, log_transform=True, overwrite=True,
-                         save_vf=False):
+                         save_vf=False, method='corr', gpu_device='cuda', force_cpu=False):
         """
         Stream-compute celltype_maps for H&E-sampled data.
 
@@ -2150,6 +2156,20 @@ class Analysis(object):
         else:
             exclude_shared = None
             centroids_use = centroids_shared
+
+        # method='gnb': fit a GaussianNB on the labeled normalized_vectors, restricted to the
+        # SAME gene axis the KDE chunks (data_use) carry, so posteriors align voxel-to-voxel.
+        gnb_clf = gnb_classes = gnb_backend = None
+        if method == 'gnb':
+            from ._gnb import fit_gnb, predict_gnb  # noqa: F401 (predict_gnb used in the loop)
+            if exclude_shared is not None:
+                _keep = np.delete(np.arange(len(shared_gene_indices)), exclude_shared)
+                _gnb_gi = np.asarray(shared_gene_indices)[_keep]
+            else:
+                _gnb_gi = np.asarray(shared_gene_indices)
+            gnb_clf, gnb_classes, gnb_backend = fit_gnb(
+                self.dataset.zarr_group, gpu_device=gpu_device, force_cpu=force_cpu,
+                gene_indices=_gnb_gi, row_normalize=True)
 
         def _safe_remove(name):
             if name in self.dataset.zarr_group:
@@ -2268,29 +2288,33 @@ class Analysis(object):
             if data_chunk.shape[0] > 0:
                 data_use = (np.delete(data_chunk, exclude_shared, axis=1)
                             if exclude_shared is not None else data_chunk)
-                best_corr = np.full(data_use.shape[0], -1, dtype=np.float32)
-                best_idx = np.full(data_use.shape[0], -1, dtype=np.int32)
 
-                if self.verbose:
-                    corr_bar = tqdm(
-                        total=len(centroids_use),
-                        desc=f'Correlations {chunk_idx + 1}/{n_chunk}',
-                        leave=True, dynamic_ncols=True,
-                    )
+                if method == 'gnb':
+                    # per-voxel GaussianNB posterior; best_idx = celltype id (= centroid row),
+                    # best_corr slot holds the top-class probability.
+                    best_idx, best_corr = predict_gnb(
+                        gnb_clf, gnb_classes, data_use, gnb_backend, row_normalize=True)
                 else:
-                    corr_bar = None
-
-                for cidx, centroid in enumerate(centroids_use):
-                    corr_chunk = calc_ctmap(centroid, data_use, self.ncores)
-                    corr_chunk = np.nan_to_num(corr_chunk).astype(np.float32, copy=False)
-                    improved = corr_chunk > best_corr
-                    best_corr[improved] = corr_chunk[improved]
-                    best_idx[improved] = cidx
+                    best_corr = np.full(data_use.shape[0], -1, dtype=np.float32)
+                    best_idx = np.full(data_use.shape[0], -1, dtype=np.int32)
+                    if self.verbose:
+                        corr_bar = tqdm(
+                            total=len(centroids_use),
+                            desc=f'Correlations {chunk_idx + 1}/{n_chunk}',
+                            leave=True, dynamic_ncols=True,
+                        )
+                    else:
+                        corr_bar = None
+                    for cidx, centroid in enumerate(centroids_use):
+                        corr_chunk = calc_ctmap(centroid, data_use, self.ncores)
+                        corr_chunk = np.nan_to_num(corr_chunk).astype(np.float32, copy=False)
+                        improved = corr_chunk > best_corr
+                        best_corr[improved] = corr_chunk[improved]
+                        best_idx[improved] = cidx
+                        if corr_bar is not None:
+                            corr_bar.update(1)
                     if corr_bar is not None:
-                        corr_bar.update(1)
-
-                if corr_bar is not None:
-                    corr_bar.close()
+                        corr_bar.close()
 
                 local_x = x_idx.astype(np.int64) - x0
                 local_y = y_idx.astype(np.int64)
@@ -2467,7 +2491,7 @@ class Analysis(object):
                           prune_coefficient=4.3, size_after_normalization=10,
                           log_transform=True, overwrite=True,
                           gpu_device='cuda', query_subchunk_size=None,
-                          gpu_target_bytes=int(1e9), save_vf=False):
+                          gpu_target_bytes=int(1e9), save_vf=False, method='corr'):
         """GPU equivalent of :meth:`map_celltypes_cpu` (single machine).
 
         Reads zarr state, KDE-computes the vector field chunk-by-chunk on
@@ -2495,7 +2519,19 @@ class Analysis(object):
         normalized field optionally teed to a tensorstore writer (``save_vf``) in
         the same streaming pass. Correlations are computed in matmul batches, so
         they can differ from an unbatched reduction by <1e-5.
+
+        ``method='gnb'`` has no GPU-KDE kernel, so it runs the CPU KDE producer while the
+        GaussianNB classifier itself still predicts on the GPU (cuML); only the KDE step is
+        CPU here.
         """
+        if method == 'gnb':
+            return self._map_celltypes_cpu(
+                sdata, centroids=centroids, element_name=element_name,
+                exclude_gene_indices=exclude_gene_indices, bandwidth=bandwidth,
+                sampling_distance=sampling_distance, prune_coefficient=prune_coefficient,
+                size_after_normalization=size_after_normalization,
+                log_transform=log_transform, overwrite=overwrite, save_vf=save_vf,
+                method='gnb', gpu_device=gpu_device, force_cpu=False)
         return self._transcript_gpu(
             sdata, do_map=True, save_vf=save_vf,
             centroids=centroids, element_name=element_name,

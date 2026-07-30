@@ -12,7 +12,7 @@ celltypes purely by the label string in ``obs[column]``:
                               each source cluster with Unknown vectors becomes its own
                               class ``unknown1``, ``unknown2``, ... So unresolved
                               populations are kept separable and are *mapped* (they are
-                              real classes for both correlation and TSVM), not dropped.
+                              real classes for both correlation and GNB), not dropped.
   * ``Background`` / ``*subclustering`` -> dropped to -1 (non-cell / never-finalized).
 
 ``centroids[k]`` is the mean of the row-L2-normalized member vectors (= Pearson-

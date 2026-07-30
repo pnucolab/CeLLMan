@@ -73,7 +73,7 @@ py.install_sources([
   'cellman/spatial/_griddataset.py',
   'cellman/spatial/_panel.py',
   'cellman/spatial/_count.py',
-  'cellman/spatial/_tsvm.py',
+  'cellman/spatial/_gnb.py',
   'cellman/spatial/_mapping_inputs.py',
 ], subdir: 'cellman/spatial')
 

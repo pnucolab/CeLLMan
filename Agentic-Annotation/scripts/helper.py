@@ -354,7 +354,7 @@ def _context_axis_eval(lineage_label, ca, fon, lf, pin, gidx_U, lean_ratio=1.15,
                     "pmids":ax.get("pmids") or []})
     return out or None
 
-def _state_axis_eval(sa, fon, lf, pin, gidx_U, frac=0.30, lf_on=1.5, pin_min=0.25, min_onpanel=3, coverage=0.75):
+def _state_axis_eval(sa, fon, lf, pin, gidx_U, frac=0.30, lf_on=1.5, pin_min=0.25, min_onpanel=3, coverage=0.80):
     """★ STATE-AXIS eval — base-agnostic cell states (proliferating / interferon-stimulated / hypoxic …).
     Unlike `_context_axis_eval` (pole competition for a subtype), each State is judged INDEPENDENTLY and any
     number can be active: a State is ACTIVE when a COVERAGE fraction of its OWN on-panel program markers are
@@ -364,7 +364,10 @@ def _state_axis_eval(sa, fon, lf, pin, gidx_U, frac=0.30, lf_on=1.5, pin_min=0.2
     ENRICHED and skips states with <min_onpanel measurable markers (a co-regulated pair = 1 signal, not 2). Ranked by summed
     enrichment. States with an IDENTICAL marker signature (EMT ≡ mesenchymal) are de-duplicated (keep one).
     Returns [{name, markers_on[], n_on, n_onpanel, score, pmids}] (highest first); [] if none active.
-    The label is later synthesized as `base, <state1>, <state2>` (finalize)."""
+    ★ EVIDENCE ONLY — standard annotation does NOT append states. This surfaces the state_axis so the
+    INTERACTIVE phase (§8) can subdivide by state on user request ("split the tumor by state"); the finalize
+    label is base-only unless the agent sets dec["states"] there. Coverage=0.80 (≥80% of on-panel program
+    markers ENRICHED) per the redesign; a real co-regulated program lights up (nearly) all its markers."""
     if not sa: return []
     out=[]; seen_sig=set()
     for st in sa:
@@ -1620,20 +1623,13 @@ def _identity_scores(fon, lf, M, pin=None, frac=0.30, lf_high=2.0, lf_on=1.5, pi
     ranked=(sorted(coh, key=lambda c:(c["spec_pass"], c["_root"]==dom_root, c["dec"], c["wspec"]), reverse=True)[:5]
             or sorted(cand, key=lambda c:(c["spec_pass"], c["dec"], c["wspec"], c["n_on"]), reverse=True)[:5])
     if top is not None and top not in ranked: ranked=[top]+ranked[:4]
-    # ★ STATE VISIBILITY (disease=hint-not-filter): state/disease terms are excluded from the
-    #   chimera/`top` core (above) to keep their broad markers from force-fitting normal cells. But if a state
-    #   term has its OWN valid evidence (n_on>=2, no specific-neg leak, spec_pass), it must be VISIBLE so the
-    #   agent can call it when its markers dominate — even with --disease omitted. Surface strong state terms in
-    #   `ranked` (flagged is_state) WITHOUT making them auto-`top` (decision stays with the agent, §7).
-    for c in cand: c["is_state"]=_is_state_term(c["label"], c["tier"])
-    # ★ SPECIFICITY GATE: for a state to appear in ranked as promotable, its own (specific) markers must
-    #   actually be ON (spec_on>=1, spec_n>=1). This blocks a fragment carrying only shared reactive markers
-    #   (Gfap etc.) from surfacing as a disease state (DAA/DAM false positives). The trivial spec_pass of
-    #   spec_n==0 (panel-blind) does not count here either — the evidence must have been measured to promote.
-    state_strong=sorted([c for c in cand if c["is_state"] and c["n_on"]>=2 and c["neg"]==0 and c["spec_pass"]
-                         and c.get("spec_on",0)>=1 and c.get("spec_n",0)>=1
-                         and c not in ranked], key=lambda c:(c["dec"], c["wspec"], c["n_on"]), reverse=True)
-    if state_strong: ranked=ranked+state_strong[:2]
+    # ★ NO STATE FALLBACK. disease/injury/metaplastic/malignant identities are ordinary celltype nodes
+    #   (tier=class/subclass) with their OWN discriminative markers — they compete at the SAME level as normal
+    #   types in `top`/`ranked` above, chosen when their markers WIN, never as a "before-floor" fallback.
+    #   (`_is_state_term` is tier=='state' and there are no tier='state' Terms; the old state-visibility /
+    #   disease_candidates path is retired. Base-agnostic PROGRAMS live in `sa` (state_axis) and are appended
+    #   only in the interactive phase.) is_state is kept False for backward-compatible readers.
+    for c in cand: c["is_state"]=False
     lin_idx=M["lin_idx"]; lin_class=M["lin_class"]; linbest=None
     for lx,idxs in lin_idx.items():
         c=sum(1 for g in idxs if _on(g))
@@ -1967,56 +1963,20 @@ def _profile_leaves(X, genes, leaf_arr, leaves, ont_gene_set, ont_protected,
                 # flag: >=2 poles present (mixed) -> subcluster the parent per §4.3; when a dominant_pole exists, that subtype is the target
                 entry["flags"]["context_axis_mixed"]=any(a.get("mixed") for a in _ca)
                 entry["flags"]["context_axis_pole"]=next((a.get("dominant_pole") for a in _ca if a.get("dominant_pole")), None)
-            # ★ STATE-AXIS (base-agnostic cell states): each State judged independently (ENRICHED program
-            #   markers), any number active → appended to the label as ', <state>' at finalize. Evidence for
-            #   the agent; distinct from disease_candidates (those are per-base disease/injury state Terms).
+            # ★ STATE-AXIS (base-agnostic PROGRAMS: proliferating / IFN / hypoxic …) — each judged
+            #   independently (≥80% of its on-panel program markers ENRICHED). EVIDENCE ONLY: standard
+            #   annotation never appends these; the INTERACTIVE phase (§8) reads state_axis to subdivide a
+            #   base by state on user request. Not an identity, not a split trigger.
             _sax=_state_axis_eval(octx.get("sa") or [], fon, lf, pin, gidx_U)
             if _sax:
                 entry["state_axis"]=_sax
-            if _sa_gi:                                     # per-leaf mean of every state marker → within-base gate (finalize)
+            if _sa_gi:                                     # per-leaf mean of every state marker → within-base gate (interactive finalize)
                 entry["state_marker_means"]={_g: round(float(mi[_i]),4) for _g,_i in _sa_gi.items()}
-            # ★ disease_candidates — disease is a hint, not a filter. _is_state_term keeps states out of the normal
-            #   scoring core (top/coh/chimera) to prevent force-fits from broad markers, so they are exposed
-            #   separately here; and every state term of the module (st_terms) is always surfaced even when --disease
-            #   is not given, so the agent can assign a state when its markers dominate (SKILL §7). Terms matching
-            #   --disease (dz_terms) are flagged hint=True and sorted first. The same ON definition is used.
-            _src = st_terms if st_terms else dz_terms
-            if _src:
-                # ★ SPECIFICITY GATE (disease-state false-positive fix): a disease state is judged by its 'own +
-                #   enriched' markers, not by a raw count of ON markers. Pan-reactive markers such as
-                #   Gfap/Serpina3n/Vim/Cd44 are shared across many states (high share) or switch on as ambient (weak
-                #   expression), so a state with a long marker list won the 'count' and was promoted to a disease state in
-                #   normal tissue (DAA/DAM false positives; 23 cells in a healthy brain became AD astrocytes).
-                #   n_specific_on = the number of ON markers that are low-share (<=3, relatively unique to that state) AND
-                #   rank-enriched (auc>=0.85, not ambient). When it is 0 the evidence is only shared/ambient markers and
-                #   the leaf must fall back to the normal counterpart (reactive/fibrous astrocyte, SKILL §2.5). The term is
-                #   still surfaced (so a genuine state is not missed); only the promotion decision uses n_specific_on.
-                _shmap=(IDM.get("region_share") or IDM.get("share") or {}) if IDM else {}
-                dzc=[]
-                for _tid,_info in _src.items():
-                    ons=[]; spons=[]; tot=0
-                    _rdf={str(g).upper() for g in (_info.get("R",[])+_info.get("DF",[]))}
-                    for _g in (_info.get("R",[])+_info.get("S",[])+_info.get("DF",[])):
-                        _gi=gidx_U.get(str(_g).upper())
-                        if _gi is None: continue
-                        tot+=1
-                        if fon[_gi]>=0.30 or (lf[_gi]>=1.5 and pin[_gi]>=0.25):
-                            ons.append(_g)
-                            # own evidence = REQUIRED/DEFINING markers that are low-share (<=3) AND enriched (auc>=0.85).
-                            #   supporting markers do not count (they are shared and merely corroborative), which stops generic
-                            #   low-share stress markers in the KG (Ctsb/Gsn/Hspb1) from getting through the gate as supporting.
-                            #   DAA's required set is Gfap/Serpina3n (both high share) -> spons=0 -> promotable=False -> falls back to
-                            #   a normal astrocyte.
-                            if str(_g).upper() in _rdf and _shmap.get(_gi,99)<=3 and auc is not None and auc[_gi]>=0.85:
-                                spons.append(_g)
-                    if ons:
-                        dzc.append({"term_id":_tid,"label":_info["L"],"D":_info["D"],
-                                    "on_markers":ons,"n_on":len(ons),"n_markers":tot,
-                                    "specific_markers":spons,"n_specific_on":len(spons),
-                                    "promotable":bool(spons),
-                                    "hint":bool(dz_terms and _tid in dz_terms)})
-                dzc.sort(key=lambda d:(-int(d["hint"]), -d["n_specific_on"], -d["n_on"]))
-                if dzc: entry["disease_candidates"]=dzc[:8]
+            # ★ NO disease_candidates / R7 fallback. disease/injury/metaplastic/malignant cells are ordinary
+            #   celltype nodes (tier=class/subclass) with their OWN discriminative markers, scored at the SAME
+            #   level as normal types in identity_scores (top/ranked) — chosen when their markers win, never as
+            #   a before-floor fallback. (The old st_terms/dz_terms path required tier='state' Terms or a
+            #   disease property, of which the KG now has none; it is retired.)
             # ★ transition_candidates — the anchor tiebreaker (STATE_TRANSITION_DESIGN §engine rules,
             #   evidence-strong). For a lineage-mimicry term (carrying MP + A, regardless of tier): if the origin
             #   identity-anchor (A) markers are still present AND the mimicked program (the non-anchor markers of
@@ -2210,10 +2170,9 @@ def cmd_init(a):
     gmu=np.asarray(X.mean(axis=0)).ravel(); gsd=np.asarray(X.std(axis=0)).ravel()
     np.savez(os.path.join(a.out,"_global_stats.npz"), mean=gmu, std=gsd, genes=np.array(list(adata.var_names),dtype=object))
     print(f"[init] global per-gene stats saved (_global_stats.npz, {len(gmu)} genes) — the absolute-identity reference", flush=True)
-    dz_terms=_disease_terms(idx, a.disease); st_terms=_state_terms(idx); mt_terms=_mimicry_terms(idx)
+    dz_terms=_disease_terms(idx, a.disease); st_terms=_state_terms(idx); mt_terms=_mimicry_terms(idx)   # dz/st_terms retired (no tier='state' Terms / disease property) — kept for signature compat
     if mt_terms: print(f"[init] mimicry/transition terms {len(mt_terms)} (MP+anchor) -> per-leaf transition_candidates (anchor tiebreaker, §state-transition)", flush=True)
-    print(f"[init] state terms {len(st_terms)} -> always surfaced per leaf as disease_candidates (disease is a hint; the agent decides, §7)"
-          + (f"; --disease='{a.disease}' matched {len(dz_terms)} as hints" if a.disease else "; --disease not given (all states considered)"), flush=True)
+    print(f"[init] state-axis programs are EVIDENCE only (interactive §8); disease/injury/malignant are class/subclass celltypes judged at the same level as normal — no before-floor state fallback", flush=True)
     # ★ F-B: the anatomical region-presence gate (computed once over the full data and persisted). Absent
     #   regions (cerebellum, pons, ...) are removed from the anchor / dominant / floor candidates, blocking
     #   force-fits. Only region-groups matching brain anatomy are affected (no effect on non-brain modules).
@@ -3320,9 +3279,14 @@ def cmd_finalize(a):
         if ((dec.get("decision") or "")!="celltype" or base_s in ("","Background","Unknown")
                 or _is_proc):
             return base_s
-        states=dec.get("states")
-        if states is None: states=_state_of.get(path, [])
-        states=_within_base_states(path, states)          # ★ drop pan-lineage states not enriched vs same-base siblings
+        # ★ STANDARD annotation does NOT decide/append state — the base celltype is the whole label.
+        #   State-axis programs (proliferating / IFN / hypoxic …) are base-agnostic OVERLAYS, not identity;
+        #   they are appended ONLY in the INTERACTIVE phase (§8), when the user asks to subdivide by state,
+        #   by the agent explicitly setting dec["states"]. The engine's per-leaf state_axis (coverage 0.80)
+        #   is EVIDENCE for that step, never auto-applied here. (disease/injury/metaplastic identities are
+        #   class/subclass celltypes judged at the same level as normal — NOT states, no fallback.)
+        states=dec.get("states") or []
+        states=_within_base_states(path, states)          # ★ (interactive) drop pan-lineage states not enriched vs same-base siblings
         bl=base_s.lower(); blins=_base_lineages(base_s); seen=set(); keep=[]
         for s in (states or []):
             s=str(s).strip()
@@ -3411,7 +3375,7 @@ def _helper_cli():
     pi.add_argument("--ontology",default=None); pi.add_argument("--output",default=None)
     pi.add_argument("--force",dest="force_input",action="store_true",
                     help="Downgrade the input-matrix checks (X=lognorm / var_names=symbol) to warnings and proceed. Use only when you know the input is non-standard.")
-    pi.add_argument("--disease",default=None,help="Disease context of the input data (e.g. 'brain cancer'). State terms for that disease are surfaced per leaf as disease_candidates (§7).")
+    pi.add_argument("--disease",default=None,help="(retired hint) Disease context of the input data. Disease/injury/malignant cells are now ordinary class/subclass celltypes judged by their own markers at the same level as normal — not a special fallback; flag kept for backward compatibility.")
     pi.add_argument("--use-rep",dest="use_rep",default="auto",
                     help="obsm key the subcluster kNN is built on, used only when a marker axis cannot be built. "
                          "Unset = X_pca, falling back to a per-subset normalize_total + log1p + PCA when obsm has no X_pca. "

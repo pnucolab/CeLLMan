@@ -198,19 +198,16 @@ never tile a homogeneous population. **EXCEPTION:** a declared **context axis** 
 single-lineage population by spatial pole (zonation/layer) even though the poles do not differ by intrinsic
 markers — that is the one split that descend-and-see cannot see, so it is driven by the `context_axis` field.
 
-### R7 — STATE  ·  "before any floor/Unknown, is a state term the real identity?"  [engine: `is_state`, `disease_candidates`]
-State terms (activation / inflammatory / proliferating / transitional / reactive / disease-injury — anything
-the module declares `tier=state`) are **deliberately excluded from the anchor descent and from `top`** (their
-broad reactive markers would force-fit normal cells). The consequence you MUST account for: a `null top` /
-`class_or_unknown` verdict occurs **even when a state IS the answer**. So **before emitting any FLOOR or
-Unknown**, read `identity_scores.ranked` for `is_state=true` and the per-leaf `disease_candidates` block
-(surfaced for EVERY leaf whether or not `--disease` was passed), and apply R3 to the best state term, **plus
-a specificity gate: ≥1 of its OWN markers must be low-share AND rank-enriched (`n_specific_on ≥ 1`)** — so a
-state carried only by pan-reactive markers (`Gfap`/`Vim`/`Apoe`, shared across many states) does NOT qualify
-and falls back to the normal counterpart. If it passes, **the state term IS the label** (a first-class
-terminal, not "less real"). **disease is a HINT, never a filter** — assign a state when its OWN markers win
-even with `--disease` omitted; never dismiss one "because it's a state" / "in-vitro program" / "no disease
-declared."
+### R7 — DISEASE/INJURY/MALIGNANT ARE ORDINARY CELLTYPES (same level, no fallback)  [engine: R3/R4]
+There is **no separate "state-term identity" step and no before-floor fallback.** Disease, injury,
+metaplastic, dedifferentiated and malignant identities are ordinary **celltype nodes** (`tier=class`/`subclass`)
+carrying their OWN discriminative markers, so they are scored **at the SAME level as normal types** in
+`identity_scores` (`top`/`ranked`) and chosen by the SAME test — R3 REAL (own markers ENRICHED + DISCRIMINATIVE)
+then R4 DEEPEST. You **never pick a disease celltype because a normal one is absent** — you pick it when ITS
+OWN markers WIN, exactly like any celltype. A node carried only by pan-reactive markers (`Gfap`/`Vim`/`Apoe`)
+simply **fails R3** (not discriminative) and is not chosen; the honest label is then the normal counterpart or
+the FLOOR (R8), as for any under-supported candidate. (Base-agnostic PROGRAMS — proliferating / IFN / hypoxic
+— are NOT identities: they live in `state_axis` and are used ONLY in the interactive phase, §8.)
 
 ### R8 — FLOOR  ·  "nothing deeper is REAL — what is the honest label?"
 A FLOOR is a **last resort you EARN by descending, never a default you reach for.** Emitting a class /
@@ -247,7 +244,7 @@ multiplying:
 | `verdict`, `dominant_region`, anchor `path`, "stop at region" | **R4** | going deeper than the evidence defends |
 | neuronal-priority, `overlay_lineages`, `lineage_repick`, `lineage_unresolved`, transition mimicry, ambient bleed | **R5** | ambient bleed / a program / a shared-marker lineage mistaken for a real 2nd identity |
 | `descend` (marker-axis recluster of KG children) → count distinct re-judged identities | **R6** | a mixture confirmed as one type — OR a single population over-split. *(The old detection fields `codominant_lineages`/`ambiguous_tie`/`bimodal`/`exclusive_mixture`/`DF_MULTI_SUBTYPE`… are superseded — descend-and-see replaces them; ignore them for splitting.)* |
-| `is_state`, `disease_candidates`, `n_specific_on`, STATE CHECK | **R7** | a real state buried under the bare class |
+| (disease/injury/malignant celltypes score WITH normal in `top`/`ranked`) | **R7** | disease is an ordinary celltype at the same level — no state-fallback field |
 | `class_or_unknown`, `class_floor`, `DIFFERENTIAL_UNSUPPORTED` | **R8** | a confident class downgraded to Unknown, or a magnitude-only over-split |
 
 ---
@@ -346,9 +343,10 @@ only on developmental cells; use it to decide adult-vs-fetal**: in fetal/embryo 
 glia, hepatoblast, fetal cardiomyocyte …) is the correct answer, not its adult counterpart. **ca**=context axes
 (§5 Step 2b), **sa**=state axes (base-agnostic cell states + transition-guard, §5 Step 2c), **cp**=confusion
 pairs, **oq**=open questions, **GM**=grounding PMIDs (cited in the finalize rationale only). **State is a `sa`
-axis now, NOT a `tier=state` term** (that tier is retired): base-agnostic programs (proliferating / IFN-stim /
-EMT / reactive) are appended from `sa`; disease is the `D` **hint** (surfaced as `disease_candidates`, R7) —
-disease-identity terms (malignant …) are normal `class/subclass` anchors gated by R3, never a separate tier.
+axis, NOT a `tier=state` term** (that tier is retired): base-agnostic programs (proliferating / IFN-stim /
+EMT / reactive) live in `sa` as EVIDENCE and are applied ONLY in the interactive phase (§8), never in standard.
+Disease-identity terms (malignant / injury / metaplastic …) are ordinary `class/subclass` anchors gated by R3
+at the same level as normal — never a separate tier, never a fallback.
 
 ---
 
@@ -371,7 +369,7 @@ specificity_peak}}`) for the side-by-side view. Then per leaf, read these — ea
 | `exclusive_mixture` | R6 | reciprocally-exclusive same-lineage DFs each ON in a disjoint subset → `needs_subclustering`. |
 | `transition_candidates` / `transition_note` | R5 | origin-anchor-retained + mimicked-program → label the transition term, do NOT split or call the mimicked lineage. |
 | `context_axis` | R-context | `[{axis, poles[], mixed, dominant_pole, suggested_subtype, pole_confidence, pmids}]` — zonation/layer subtyping (§5 Step 2b); follow the engine's pole. |
-| `state_axis` | R-state | `[{name, markers_on[], n_on, score, pmids}]` — base-agnostic **cell states** (proliferating / interferon-stimulated / hypoxic …) whose OWN program markers are ENRICHED here, ranked by enrichment. Each is INDEPENDENT (multiple can be active); appended to the label as `, <state>` (§5 Step 2c). Not a base identity, not a split trigger. |
+| `state_axis` | R-state | `[{name, markers_on[], n_on, n_onpanel, score, pmids}]` — base-agnostic **PROGRAMS** (proliferating / interferon-stimulated / hypoxic …) with ≥80% of their on-panel markers ENRICHED here. **EVIDENCE ONLY — standard annotation NEVER appends these.** Used solely by the interactive phase (§8) to subdivide a base by state on user request. Not a base identity, not a split trigger. |
 | `subtype_groups` | R6 | parents whose ≥2 finer sibling subtypes co-occur → split-deeper / sibling-mixture signal. |
 | `parent_ctx` | R3·R4 | `{path, up, hp}` parent signature — **for sub-leaves you MUST pool this** (within-parent re-ranking erases the shared class signal). |
 | `sibling_contrast` | R6 | within-parent discriminators — for deciding splits / choosing between close siblings, never for denying identity. |
@@ -392,8 +390,8 @@ S1 CELL?      : density.pct / low_frac / lineage_markers.n / graph_evidence.line
 S2 LINEAGE    : graph_evidence.lineage=__  ; apply R5 (drop overlay/repick/unresolved/ambient 2nd lineages) ; ≥2 lineages EACH REAL(R3)? → R6 split
 S3 REAL?      : per candidate anchor, R3 : OWN markers ENRICHED(R1) ≥half? negatives clean? DF-override?  → which terms are REAL
 S4 DEEPEST    : R4 : deepest REAL node on the best anchor's path ; stop at region if the subtype is not REAL
-S5 STATE      : R7 : before any FLOOR/Unknown — any is_state / disease_candidates term REAL + n_specific_on≥1, beating normal?
-S6 RESOLVE    : clear single REAL → label (R4) ; ELSE DESCEND-AND-SEE (R6): descend the node's KG children → 1 identity=label/merge, ≥2=split+recurse, no separation=FLOOR (R8, after STATE R7)
+S5 (no state step) : disease/injury/malignant are ordinary class/subclass celltypes scored WITH normal in S3/S4 (R7) — no separate state check, no fallback. state_axis PROGRAMS are interactive-only (§8), never in standard.
+S6 RESOLVE    : clear single REAL → label (R4) ; ELSE DESCEND-AND-SEE (R6): descend the node's KG children → 1 identity=label/merge, ≥2=split+recurse, no separation=FLOOR (R8)
 S7 FLAGS      : subclass_resolved ; confidence ; reason_code ; disease ; split mechanism = descend (marker-axis)
 ```
 
@@ -428,9 +426,10 @@ DF-override); among the REAL anchors apply **R4** (deepest defensible node on th
   do NOT pick, pre-classify a tie, or pre-detect a mixture → **DESCEND-AND-SEE (R6)**: descend the node's KG
   children (marker-axis) and let the reclustering show whether it is ≥2 identities (split + recurse) or one
   (label). A region/class floor is usually region-DILUTION, not a true floor — descend and SEE.
-- **`class_or_unknown`** → no REAL anchor → **R7 STATE CHECK first**; then **DESCEND-AND-SEE (R6)** into the
-  lineage/region children. Only if the descent yields **no separation** (children's markers on the axis but
-  cells don't split) is it a genuine floor → **R8** (class FLOOR if lineage clear, else Unknown).
+- **`class_or_unknown`** → no REAL anchor → **DESCEND-AND-SEE (R6)** into the lineage/region children (disease/
+  injury/malignant subtypes are among those children, scored WITH normal — R7, no separate state step). Only if
+  the descent yields **no separation** (children's markers on the axis but cells don't split) is it a genuine
+  floor → **R8** (class FLOOR if lineage clear, else Unknown).
 
 `confidence`: **high** (anchor `excl_on≥3` or `excl_on/excl_n≥0.7`, clean negatives) · **medium**
 (`excl_on` 1–2, or you stopped at a region) · **low** (single OWN marker, panel-limited).
@@ -454,35 +453,26 @@ mechanically** (poles scored graded — weak zonal signal counts; a lean ≥1.15
 - **no pole present** → stop at the lineage class. Context can NEVER change the lineage (a `Glul⁺`
   hepatocyte is a pericentral *hepatocyte*, never "pericentral LSEC").
 
-### Step 2c — STATE-AXIS (base-agnostic cell states appended to the label)  [engine: `state_axis`, slim-index `sa`]
-Some biology is a **cross-cutting cell STATE**, not a cell type — proliferating, interferon-stimulated,
+### Step 2c — STATE-AXIS is NOT decided in standard annotation (interactive only)  [engine: `state_axis`, slim-index `sa`]
+Some biology is a **cross-cutting cell PROGRAM**, not a cell type — proliferating, interferon-stimulated,
 hypoxic, senescent, mesenchymal/EMT, stemness, estrogen-response, angiogenic, M2-polarization. A `CD8 T cell`
 and a `luminal epithelial cell` can BOTH be *proliferating*; encoding that as a separate `proliferating CD8
-T cell` Term would duplicate the same `MKI67` program across dozens of types. Instead the module declares each
-state ONCE as a base-agnostic **State** with its own program signature (`sa` in the slim-index), and the
-engine evaluates them **independently of the base identity**:
-- **After the base celltype is decided** (Steps 1–2), read `state_axis` — each active state has ≥2 of its
-  OWN program markers **ENRICHED** (R1: elevated vs the dataset, NOT mere detection; state markers like
-  `MKI67`=proliferation are program markers, not base markers).
-- **Append EVERY active state** to the label, comma-separated, in a **canonical (alphabetical) order** so the
-  same state-set is always one label: `CD8 T cell, interferon-stimulated, proliferating`. Multiple states
-  co-occur — do not pick one. (Enrichment score is a tie-break only; it does not set the label order.)
-- **LINEAGE GATE (`sa[i].applies_to`).** A state may be **lineage-restricted** — M2-polarization is a
-  *myeloid* program, EMT/mesenchymal an *epithelial* program, estrogen-response a *luminal* program. Such a
-  state carries `applies_to` (a lineage whitelist); it is kept **only when the base celltype OR one of its
-  IS_A ancestors is in `applies_to`** — so ambient `CD163` bleed can never make a T cell "M2-polarization".
-  States with **no** `applies_to` are **global** (proliferating / interferon-stimulated / hypoxic /
-  senescence / stemness / angiogenic) — any lineage. `finalize` applies this gate on the FINAL base label.
-- A state is **NOT a base identity and NOT a split trigger** — it never changes the celltype and never causes
-  a descend. A cluster is not split into "proliferating vs not"; the whole cluster's base gets the state tag.
-- **Drop a state redundant with the base** (a `mesenchymal cell` base is not re-tagged `mesenchymal`); EMT and
-  mesenchymal share one signature (deduplicated). **Enriched-only** — never tag a state on mere detection of
-  one marker (that is ambient); ≥2 program markers must be genuinely elevated.
-- **Mechanics:** the engine surfaces `state_axis` (evidence); `finalize` auto-appends the active states to the
-  base label (or the agent's explicit `dec["states"]` override). Disease/injury states that remain per-base
-  (malignant, and the FUZZY states) are handled by `disease_candidates`/R7, NOT here — this axis is only the
-  base-agnostic program states in `sa`.
-- **STATE IS ALSO A DURING-DETERMINATION GUARD (not only a post-hoc append).** A state whose program *resembles
+T cell` Term would duplicate the same `MKI67` program across dozens of types. The module declares each once as
+a base-agnostic **State** with its own program signature (`sa` in the slim-index).
+- **STANDARD annotation does NOT append states.** The finalized label is the **base celltype ONLY** (`CD8 T
+  cell`, never `CD8 T cell, proliferating`). The engine surfaces `state_axis` — a State is active when **≥80%
+  of its on-panel program markers are ENRICHED** (R1: elevated vs the dataset, not mere detection) — purely as
+  **EVIDENCE**. Do not add it to the label; do not let it change the celltype or trigger a descend.
+- **State determination is an INTERACTIVE step (§8), only on the user's request** ("subdivide the tumor by
+  state", "which of these are proliferating?"). Only THEN do you set `dec["states"]` from the `state_axis`
+  evidence and finalize to `cellman_free_annotation`. The **lineage gate** (`sa[i].applies_to` — M2=myeloid,
+  EMT=epithelial, estrogen-response=luminal; empty = global) and the **within-base gate** (≥2 of its markers
+  enriched vs same-base siblings) are applied there, on the final base label. State order is canonical
+  (alphabetical); EMT≡mesenchymal signatures are deduplicated; drop a state redundant with the base.
+- (Disease/injury/metaplastic/malignant **IDENTITIES** are a different thing — ordinary class/subclass
+  celltypes judged at the same level as normal, R7 — NOT program states, and NOT deferred.)
+
+**STATE IS STILL A DURING-DETERMINATION SPLIT-GUARD (this part STAYS in standard).** A state whose program *resembles
   another lineage* — EMT (epithelial → mesenchymal program `VIM/CDH2/ZEB1`), EndMT, dediff, DAM
   (microglia → macrophage-like `APOE/TREM2`) — makes a single cell carry **two lineages' signals at once**, so
   the naive `mixed`/codominant test (R5/R6) could wrongly SPLIT one EMT⁺ epithelial cell into an
@@ -517,10 +507,12 @@ separation (all sub-groups re-judge to the same parent class) → stop: label th
 detection floor — descend and SEE, then fall to the floor ONLY after a descent actually failed to separate.
 
 ### disease handling
-`--disease` is a HINT (R7), never a filter. Omitted → state candidates still surfaced (`hint=false`), assign
-a state when its OWN markers win, else the best normal type; never assume normal. `== <name>` → matching
-states flagged `hint=true` and sorted first; assign one only when it passes R3 + the specificity gate. Never
-invent a non-ontology label; `open_question_flag=true` if the chosen term is in `oq`.
+Disease/injury/metaplastic/malignant identities are **ordinary class/subclass celltypes** with their own
+discriminative markers — judged by the SAME R3/R4 test at the SAME level as normal types (R7), never as a
+before-floor fallback, and chosen only when THEIR markers WIN. Never assume normal, but also never pick a
+disease celltype because a normal one is merely absent. `--disease` is a retired hint (no longer filters or
+surfaces a separate candidate set). Never invent a non-ontology label; `open_question_flag=true` if the chosen
+term is in `oq`.
 
 ---
 
@@ -725,6 +717,12 @@ that is an evidence/coverage outcome, not a determination). Every refinement her
 - **"Re-annotate only the astrocytes whose positive markers are ON."** → `subcluster` those paths with the
   astrocyte-subtype candidates → the REAL sub-leaves get the finer label, the rest stay `astrocyte`. *(clustering-based)*
 - **"Split D1 vs D2 MSN in the striatal cluster."** → `subcluster --candidates '["D1-MSN","D2-MSN"]'`. *(clustering-based)*
+- **"Subdivide the tumor by state" / "which of these are proliferating / interferon-stimulated?"** → **the ONLY
+  place states are applied.** Read `state_axis` (the engine's ≥80%-coverage program evidence) on the target
+  leaves; for those where a program passes the lineage gate (`applies_to`) and the within-base gate (≥2 markers
+  enriched vs same-base siblings), set `dec["states"]` = the active program names and `finalize --column
+  cellman_free_annotation` → the base label gains `, <state>` (`CD8 T cell, proliferating`). Leaves the user did
+  not ask about, and `cellman_annotation`, stay base-only. *(state = program overlay, never a new identity)*
 - **"Gather the neurons and find the neuropil / fiber tract."** → **NOT SUPPORTED (§1b).** These are
   `tier='process'` terms, not celltypes. Report plainly that this version does not annotate tissue processes.
   Do **NOT** `subcluster` toward them — a process shares its positive markers with the soma that made the
@@ -823,8 +821,8 @@ chosen term's grounding PMIDs from `GM`).
    dominant-lineage cluster merely because no subtype passed (→ FLOOR, R8).
 8. Sub-leaf ⇒ `parent_ctx` pooled; the same `term_id` never carries two labels; split mechanism = marker-axis
    `subcluster`/`descend`.
-9. **R7:** before any `class_floor`/`Unknown`, you inspected `ranked` for `is_state` + `disease_candidates`
-   and confirmed no state passes R3 + `n_specific_on≥1`. A `null top` was NOT read as "→ class".
+9. **R7:** disease/injury/malignant celltypes were scored WITH normal in `top`/`ranked` (same level, R3/R4) —
+   not picked as a before-floor fallback, and not deferred. A `null top` was NOT read as "→ class" (descend).
 10. Before `Unknown`: `alternatives_considered` lists ≥3 candidates each with a concrete rejection.
 
 ## 12. Forbidden (each has caused real misannotations)

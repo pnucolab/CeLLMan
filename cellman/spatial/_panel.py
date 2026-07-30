@@ -9,10 +9,16 @@ is the union of
     (species, organ), fetched via the read-only slim-index REST API.
 
 The KG is reached ONLY through the REST slim-index endpoint (never raw neo4j bolt).
-The server URL is **received as a parameter** — there is no hardcoded IP default:
-resolution is ``server_url`` arg > ``CELLONTO_API`` env > ``None``. When it resolves
-to ``None`` or the module is unreachable, the panel degrades to **HVG-only** (the
-pipeline never dies on a missing KG).
+The server URL resolves as ``server_url`` arg > ``CELLONTO_SERVER_URL`` env >
+``CELLONTO_API`` env (back-compat) > :data:`DEFAULT_ONTOLOGY_SERVER` — the same
+public read-only server, and the same precedence, that
+``Agentic-Annotation/scripts/helper.py`` uses, so the panel and the annotator never
+disagree about whether the KG exists. Setting any of them to an empty string /
+``none`` disables the KG explicitly. When the KG is disabled or unreachable, the
+panel degrades to **HVG-only** (the pipeline never dies on a missing KG) — note that
+KG markers missing from the panel become *off-panel* at annotation time, which is
+exactly what the HVG ∪ KG union exists to prevent, so a degraded panel is worth
+noticing rather than ignoring.
 """
 
 from __future__ import annotations
@@ -27,6 +33,13 @@ from anndata import AnnData
 
 DEFAULT_HVG_N = 5000
 DEFAULT_HVG_SUB = 100_000
+
+#: The single Cell-Ontology server we publish (public, read-only) — identical to
+#: ``DEFAULT_ONTOLOGY_SERVER`` in ``Agentic-Annotation/scripts/helper.py``. Point
+#: ``CELLONTO_SERVER_URL`` at your own deployment to override it.
+DEFAULT_ONTOLOGY_SERVER = "https://cellman.pnucolab.com"
+#: Values that explicitly turn the KG off (panel = HVG-only).
+_SERVER_DISABLED = {"", "none", "off", "null", "false"}
 
 _DENY_MOUSE_PREFIX = ("mt-", "Rps", "Rpl", "Hba", "Hbb")
 _DENY_HUMAN_PREFIX = ("MT-", "RPS", "RPL", "MRPL", "MRPS", "HBA", "HBB")
@@ -54,19 +67,30 @@ def resolve_server(server_url: Optional[str] = None) -> Optional[str]:
     """Resolve the Cell-Ontology REST base URL by priority.
 
     ``server_url`` argument > ``CELLONTO_SERVER_URL`` env > ``CELLONTO_API`` env
-    (back-compat) > ``None``. Returns ``None`` when none is set — callers then
-    skip the KG (HVG-only). ``CELLONTO_SERVER_URL`` is the canonical name (same
-    one ``Agentic-Annotation/scripts/helper.py`` reads); ``CELLONTO_API`` is
-    kept for older setups. No server address is baked into source — pass the URL
-    explicitly or set ``CELLONTO_SERVER_URL`` (e.g. ``https://cellman.pnucolab.com``).
+    (back-compat) > :data:`DEFAULT_ONTOLOGY_SERVER`. Unset therefore means *the
+    public server*, matching ``helper.py``'s ``_resolve_server`` — the annotator
+    connects by default, so the panel must too, otherwise the KG markers it will
+    later look for are silently absent from the vector field.
+    ``CELLONTO_SERVER_URL`` is the canonical name; ``CELLONTO_API`` is kept for
+    older setups. The FIRST source that is set wins (so an env var can be
+    overridden by the argument, and a set-but-empty value is not skipped).
 
-    :param server_url: explicit base URL; takes priority over the environment variables.
+    Returns ``None`` only when the KG is explicitly disabled — the first source
+    that is set holds ``''`` / ``none`` / ``off`` / ``null`` / ``false``; callers
+    then run HVG-only.
+
+    :param server_url: explicit base URL; takes priority over the environment
+        variables. Pass ``'none'`` (or ``''``) to force HVG-only.
     :type server_url: str or None
     """
-    return (server_url
-            or os.environ.get("CELLONTO_SERVER_URL")
-            or os.environ.get("CELLONTO_API")
-            or None)
+    for v in (server_url,
+              os.environ.get("CELLONTO_SERVER_URL"),
+              os.environ.get("CELLONTO_API")):
+        if v is None:
+            continue
+        v = str(v).strip()
+        return None if v.lower() in _SERVER_DISABLED else v.rstrip("/")
+    return DEFAULT_ONTOLOGY_SERVER
 
 
 def _clean(g: str) -> str:
@@ -83,8 +107,9 @@ def fetch_ontology_markers(species: str, organ: str,
 
     Collects genes from the requested term slots (Required / Supporting /
     Negative / Defining by default). Returns an empty set (with a warning) when
-    the server is unresolved / unreachable / the module is missing — the caller
-    then proceeds HVG-only.
+    the KG is disabled / unreachable / the module is missing — the caller then
+    proceeds HVG-only. The default server (:func:`resolve_server`) is the public
+    read-only one, so no configuration is needed for the KG to be used.
 
     :param species: species name for the ontology module.
     :type species: str
@@ -102,7 +127,9 @@ def fetch_ontology_markers(species: str, organ: str,
     url = resolve_server(server_url)
     if url is None:
         if verbose:
-            print("[panel] no ontology server (arg/CELLONTO_API unset) → HVG-only")
+            print("[panel][WARN] ontology server explicitly disabled "
+                  "(server_url / CELLONTO_SERVER_URL set to none) → HVG-only panel: "
+                  "KG markers absent from the panel become off-panel at annotation time")
         return set()
     try:
         import requests
@@ -112,7 +139,8 @@ def fetch_ontology_markers(species: str, organ: str,
         onto = resp.json()
     except Exception as e:  # noqa: BLE001
         if verbose:
-            print(f"[panel][WARN] ontology fetch failed → HVG-only: {e}")
+            print(f"[panel][WARN] ontology fetch failed ({url}, module {species}/{organ}) "
+                  f"→ HVG-only panel; KG markers will be off-panel at annotation time: {e}")
         return set()
 
     markers = set()
@@ -180,8 +208,9 @@ def select_gene_panel(adata: AnnData, species: str, organ: str, *,
     species, organ : str
         Cell-Ontology module to fetch markers for.
     server_url : str, optional
-        KG REST base URL. Priority arg > ``CELLONTO_API`` env > ``None``
-        (HVG-only). Pass explicitly during development.
+        KG REST base URL. Priority arg > ``CELLONTO_SERVER_URL`` env >
+        ``CELLONTO_API`` env > the public default (:func:`resolve_server`), so the
+        KG is used without any configuration. Pass ``'none'`` for HVG-only.
 
     Returns
     -------

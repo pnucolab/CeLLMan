@@ -37,7 +37,7 @@ Datasets:
       tissue : mouse, liver
 
 Common:
-- virtual env    : /bce/groups/pnucolab/analysis/l202255179/UNNAMED/.venv
+- virtual env    : /path/to/your/.venv
 - cluster column : leiden
 - note           : use GPU
 ```
@@ -62,7 +62,7 @@ Datasets:
       tissue : mouse, liver
 
 Common:
-- virtual env    : /bce/groups/pnucolab/analysis/l202255179/UNNAMED/.venv
+- virtual env    : /path/to/your/.venv
 - cluster column : leiden
 - note           : use GPU
 ```

@@ -1,10 +1,11 @@
 """
-GPU equivalent of ssam.utils.kde_at_points using a Triton cell-list kernel.
+GPU equivalent of ``cellman.spatial.utils.kde_at_points`` using a Triton
+cell-list kernel.
 
-This module is fully additive — it does NOT modify any existing ssam code.
-Use it via the ``gpu_kde`` context manager:
+This module is fully additive — it does not modify the C++ implementation;
+it swaps it in only for the duration of a context manager:
 
-    from ssam._kde_gpu import gpu_kde
+    from cellman.spatial._kde_gpu import gpu_kde
     with gpu_kde(device='cuda'):
         ds.downsample_vector(he_path=..., sdata=...)   # uses GPU internally
     # back to C++ outside the with-block
@@ -188,7 +189,7 @@ def kde_at_points_gpu(
     device='cuda',
 ):
     """
-    GPU equivalent of ``ssam.utils.kde_at_points`` (2D and 3D).
+    GPU equivalent of ``cellman.spatial.utils.kde_at_points`` (2D and 3D).
 
     Same positional signature; ``ncores`` is accepted but ignored.
     Returns a ``float32`` numpy.ndarray of shape (N, n_genes).
@@ -308,12 +309,12 @@ def kde_at_points_gpu(
 def gpu_kde(device: str = 'cuda', fallback_3d_to_cpu: bool = False,
             force_2d: bool = False):
     """
-    Inside this with-block, every call to ``ssam.utils.kde_at_points`` is
-    routed to the GPU implementation. All higher-level ssam APIs that
-    internally call ``kde_at_points`` (downsample_vector, downsample_vector_component,
+    Inside this with-block, every call to ``cellman.spatial.utils.kde_at_points``
+    is routed to the GPU implementation. All higher-level APIs that internally
+    call ``kde_at_points`` (downsample_vector, downsample_vector_component,
     _compute_normalized_vectors, etc.) automatically use GPU.
 
-    Existing ssam code is not modified.
+    The C++ implementation is restored on exit; nothing is modified permanently.
 
     Parameters
     ----------
@@ -332,7 +333,7 @@ def gpu_kde(device: str = 'cuda', fallback_3d_to_cpu: bool = False,
 
     Example
     -------
-    >>> from ssam._kde_gpu import gpu_kde
+    >>> from cellman.spatial._kde_gpu import gpu_kde
     >>> with gpu_kde(device='cuda:0'):                # native 3D on GPU
     ...     stats = ds.downsample_vector(he_path=..., sdata=...)
     >>> with gpu_kde(device='cuda:0', force_2d=True): # collapse z for speed/memory
@@ -415,7 +416,7 @@ def auto_kde_context(device: str = 'cuda', **gpu_kwargs):
     """Auto-dispatch context manager.
 
     - If a usable CUDA device is found, behaves like ``gpu_kde(device, **gpu_kwargs)``
-      (i.e. monkey-patches ``ssam.utils.kde_at_points`` with the Triton kernel).
+      (i.e. temporarily swaps ``cellman.spatial.utils.kde_at_points`` for the Triton kernel).
     - Otherwise yields without patching, so the original C++ CPU implementation
       is used.
 

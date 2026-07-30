@@ -29,9 +29,9 @@ except ImportError:
     import numpy as np
     corr = lambda a, b: np.corrcoef(a, b)[0, 1]
 
-class SSAMDataset(object):
+class Dataset(object):
     """
-    A class to store intial values and results of SSAM analysis.
+    A class to store initial values and results of a ``cellman.spatial`` analysis.
 
     :param genes: The genes that will be used for the analysis.
     :type genes: list(str)    
@@ -180,9 +180,8 @@ class SSAMDataset(object):
         """Per-downsampled-vector local KDE density (vf_norm at each sampled
         position), shape (N,), aligned row-for-row with ``downsampled_vectors``
         and ``normalized_vectors``. Computed in ``_select_vectors`` and persisted
-        by ``downsample_vector``; used downstream (e.g. ``cluster_vectors`` writes
-        it into ``ssam_clusters.h5ad`` obs) as a density signal for background /
-        low-density-voxel detection."""
+        by ``downsample_vector``; used downstream as a density signal for
+        background / low-density-voxel detection."""
         if self._downsampled_vf_norm is not None:
             return self._downsampled_vf_norm
         if 'downsampled_vf_norm' in self.zarr_group:
@@ -411,6 +410,13 @@ class SSAMDataset(object):
 
         plot_colors = colors
         ann_df = None
+        # Default palette/legend come from the store (written by map_celltypes),
+        # indexed by celltype id. The legacy path below derives colours from the
+        # RANK of each CSV row against `max(id)+1`, which mismatches whenever
+        # filtering leaves the id space non-contiguous or short of K.
+        store_names, store_colors = self.celltype_names_colors()
+        if colors is None and annotation_csv is None and store_colors is not None:
+            plot_colors = store_colors
         if annotation_csv is not None and colors is None:
             import pandas as pd
             ann_df = pd.read_csv(annotation_csv)
@@ -433,7 +439,14 @@ class SSAMDataset(object):
 
         self._plot_celltypes_map(self.filtered_celltype_maps, background, centroid_indices, plot_colors, cmap, rotate, min_r, set_alpha, z)
 
-        if show_annotation and annotation_csv is not None:
+        if show_annotation and annotation_csv is None and store_names is not None:
+            from matplotlib.patches import Patch
+            present = [i for i in np.unique(self.filtered_celltype_maps) if i >= 0]
+            pal = plot_colors if plot_colors is not None else store_colors
+            plt.legend(handles=[Patch(facecolor=pal[i], label=store_names[i])
+                                for i in present if i < len(store_names)],
+                       bbox_to_anchor=(1.05, 1), loc='upper left', borderaxespad=0.)
+        elif show_annotation and annotation_csv is not None:
             import pandas as pd
             from matplotlib.patches import Patch
             if ann_df is None:
@@ -474,7 +487,7 @@ class SSAMDataset(object):
                 self.filtered_celltype_maps,
                 background,
                 centroid_indices,
-                colors,
+                plot_colors,
                 cmap,
                 rotate,
                 min_r,
@@ -487,25 +500,28 @@ class SSAMDataset(object):
 
     def write_celltype_map(self, sdata=None, *, colors=None, cmap='jet',
                            background="black", z=None, min_r=0.6, set_alpha=False,
-                           annotation_csv=None,
                            labels_key="cellman_celltype_map",
-                           image_key="cellman_celltype_map_rgb",
-                           table_key="cellman_celltype"):
-        """Write the filtered cell-type map into ``sdata`` as three aligned elements.
+                           image_key="cellman_celltype_map_rgb"):
+        """Write the filtered cell-type map into ``sdata`` as two aligned rasters.
 
-        * ``labels[labels_key]`` — integer raster; pixel value = ``cluster index +
-          1`` (0 = background / Unknown). This is the idiomatic categorical
+        Normally reached through :meth:`Analysis.filter_celltypemaps`, which passes
+        the palette fixed at ``map_celltypes`` time.
+
+        * ``labels[labels_key]`` — integer raster; pixel value = ``celltype id +
+          1`` (0 = background / filtered out). This is the idiomatic categorical
           (Labels2DModel) representation of the segmentation-free cell-type map.
-        * ``images[image_key]`` — an RGB rendering (same colours as
-          :meth:`plot_celltypes_map`) for quick visual inspection. (SpatialData
-          keys are globally unique across element types, so the RGB image cannot
-          share the labels' key; it takes the ``…_rgb`` suffix by default.)
-        * ``tables[table_key]`` — annotates the labels: instance id to cell-type
-          name (+ colour), built from ``annotation_csv`` when given.
+        * ``images[image_key]`` — an RGB rendering for quick visual inspection.
+          (SpatialData keys are globally unique across element types, so the RGB
+          image cannot share the labels' key; it takes the ``…_rgb`` suffix.)
 
-        All three carry the SAME ``Scale(sampling_distance) + Translation(origin)``
+        Both carry the SAME ``Scale(sampling_distance) + Translation(origin)``
         affine into the shared ``'global'`` µm coordinate system, so the map
         overlays the input table / points / staining image exactly.
+
+        No annotating table is written: the celltype names live once, in the
+        ``cellman_downsampled`` table that :meth:`Analysis.map_celltypes` attaches,
+        whose categorical is index-aligned with these pixel values (``names[pixel
+        - 1]``). Re-filtering therefore only ever replaces rasters.
 
         ``sdata`` defaults to the SpatialData that was fed to ``compute_vf`` /
         ``downsample_vector`` (remembered as ``_original_input_data``). Returns it.
@@ -513,7 +529,9 @@ class SSAMDataset(object):
         :param sdata: Target SpatialData to write the elements into. Defaults to the
             SpatialData remembered from ``compute_vf`` / ``downsample_vector``.
         :type sdata: spatialdata.SpatialData or None
-        :param colors: Colours for the clusters. Overrides ``cmap`` when given.
+        :param colors: Per-celltype colours, indexed by celltype id. Pass the
+            palette stored at ``map_celltypes`` time so every view agrees;
+            ``None`` samples ``cmap`` over the ids present in the map.
         :type colors: list or None
         :param cmap: Colormap used for the clusters when ``colors`` is not given.
         :type cmap: str or matplotlib.colors.Colormap
@@ -525,15 +543,11 @@ class SSAMDataset(object):
         :type min_r: float
         :param set_alpha: Whether to scale per-pixel opacity by correlation / probability.
         :type set_alpha: bool
-        :param annotation_csv: Path to an annotation CSV used to build the annotating table.
-        :type annotation_csv: str or None
         :param labels_key: Key for the integer labels element written into ``sdata``.
         :type labels_key: str
         :param image_key: Key for the RGB image element written into ``sdata``.
         :type image_key: str
-        :param table_key: Key for the annotating table element written into ``sdata``.
-        :type table_key: str
-        :returns: The SpatialData object with the three elements added.
+        :returns: The SpatialData object with the two elements added.
         :rtype: spatialdata.SpatialData
         """
         if not _SPATIALDATA_AVAILABLE:
@@ -547,13 +561,18 @@ class SSAMDataset(object):
         if z is None:
             z = int(self.shape[2] / 2)
         lab2d = np.asarray(data[..., z].T)
-        K = int(lab2d.max()) + 1 if (lab2d.size and lab2d.max() >= 0) else 0
+        n_present = int(lab2d.max()) + 1 if (lab2d.size and lab2d.max() >= 0) else 0
 
         labels_arr = (lab2d + 1).astype(np.int32)
 
+        # K counts every class the mapping can emit, not just the ones that won a
+        # voxel here: `colors` is indexed BY CELLTYPE ID, so sizing the lookup by
+        # lab2d.max() would silently recolour ids when filtering drops the tail.
         if colors is None:
             cmap_internal = plt.get_cmap(cmap)
-            colors = cmap_internal([float(i) / max(K - 1, 1) for i in range(max(K, 1))])
+            colors = cmap_internal([float(i) / max(n_present - 1, 1)
+                                    for i in range(max(n_present, 1))])
+        K = len(colors)
         lut = ListedColormap([to_rgba(c) for c in colors]) if K else ListedColormap(["black"])
         rgba = lut(np.clip(lab2d, 0, None))
         rgba[lab2d == -1] = (0, 0, 0, 0)
@@ -575,16 +594,15 @@ class SSAMDataset(object):
         mat = np.array([[sd_um * xs, 0.0, ox], [0.0, sd_um * ys, oy], [0.0, 0.0, 1.0]])
         tf = Affine(mat, input_axes=("x", "y"), output_axes=("x", "y"))
 
+        for key, store in ((labels_key, sdata.labels), (image_key, sdata.images)):
+            if key in store:
+                del store[key]
         sdata.labels[labels_key] = Labels2DModel.parse(
             labels_arr, dims=("y", "x"), transformations={"global": tf})
         sdata.images[image_key] = Image2DModel.parse(
             cyx, dims=("c", "y", "x"), transformations={"global": tf})
-        if annotation_csv is not None:
-            self._write_celltype_table(sdata, K, colors, annotation_csv,
-                                       labels_key, table_key)
         print(f"[write_celltype_map] labels['{labels_key}'] {labels_arr.shape} "
-              f"+ images['{image_key}'] + "
-              f"{'tables['+table_key+']' if annotation_csv else 'no table'} "
+              f"+ images['{image_key}'] ({K} celltypes) "
               f"@ {sd_um}µm/px, origin=({ox:.1f},{oy:.1f})")
         return sdata
 
@@ -604,31 +622,18 @@ class SSAMDataset(object):
             return float(off[0]), float(off[1])
         return 0.0, 0.0
 
-    def _write_celltype_table(self, sdata, K, colors, annotation_csv,
-                              labels_key, table_key):
-        """Build the labels-annotating table: instance id (cluster+1) to celltype."""
-        import pandas as pd
-        from anndata import AnnData
-        from matplotlib.colors import to_hex
-        names = {}
-        try:
-            ann = pd.read_csv(annotation_csv)
-            if {"cluster", "celltype"}.issubset(ann.columns):
-                for _, r in ann.sort_values("cluster").iterrows():
-                    names[int(r["cluster"])] = str(r["celltype"])
-        except Exception as e:  # noqa: BLE001
-            print(f"Warning: could not read annotation_csv ({e}); using cluster ids")
-        if K <= 0:
-            return
-        obs = pd.DataFrame({
-            "instance_id": np.arange(1, K + 1, dtype=np.int64),
-            "region": pd.Categorical([labels_key] * K),
-            "celltype": [names.get(i, f"cluster_{i}") for i in range(K)],
-            "color": [to_hex(to_rgba(colors[i])) for i in range(K)],
-        })
-        tab = AnnData(obs=obs)
-        sdata.tables[table_key] = TableModel.parse(
-            tab, region=labels_key, region_key="region", instance_key="instance_id")
+    def celltype_names_colors(self):
+        """``(names, colors)`` of the celltype ids, from the store; ``None`` if absent.
+
+        Written by ``map_celltypes``; the single source for celltype naming and
+        colour, shared by the labels rendering, the annotated table and any legend.
+        """
+        zg = self.zarr_group
+        if 'celltype_names' not in zg:
+            return None, None
+        names = [str(x) for x in zg['celltype_names'][:]]
+        colors = list(zg.attrs.get('cellman_celltype_colors', [])) or None
+        return names, colors
 
     def _save_celltype_map_to_spatialdata(self, data, background="black",
                                           centroid_indices=[], colors=None, cmap='jet',

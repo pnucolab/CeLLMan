@@ -59,10 +59,10 @@ except ImportError:
         return False
     
     def calc_corrmap(*args, **kwargs):
-        raise NotImplementedError("C++ extension not available. Please build SSAM properly.")
+        raise NotImplementedError("C++ extension not available. Please build cellman properly.")
     
     def calc_kde(*args, **kwargs):
-        raise NotImplementedError("C++ extension not available. Please build SSAM properly.")
+        raise NotImplementedError("C++ extension not available. Please build cellman properly.")
 
 try:
     import spatialdata as sd
@@ -112,61 +112,9 @@ else:
         return correlation
 
 
-class MedoidCorrelation:
-    def __init__(self, min_r=0.8):
-        self.min_r = min_r
-
-    def fit_predict(self, X):
-        X = np.array(X, copy=True)
-        labels = np.ones(X.shape[0], dtype=int)
-        prev_midx = -1
-        while True:
-            vindices = np.where(labels > -1)[0]
-            good_X = X[labels > -1]
-            midx = vindices[np.argmin(np.sum(cdist(good_X, good_X, metric='correlation'), axis=0))]
-            if midx == prev_midx:
-                break
-            prev_midx = midx
-            m = X[midx]
-            for vidx, v in zip(vindices, good_X):
-                if corr(v, m) < self.min_r:
-                    labels[vidx] = -1
-        return labels
-
-
-def remove_outliers(X, cluster_labels, outlier_detection_method='medoid-correlation', outlier_detection_kwargs={}, normalize=True):
-    if outlier_detection_method == 'medoid-correlation':
-        clf = MedoidCorrelation(**outlier_detection_kwargs)
-    elif outlier_detection_method == 'robust-covariance':
-        clf = EllipticEnvelope(**outlier_detection_kwargs)
-    elif outlier_detection_method == 'one-class-svm':
-        clf = OneClassSVM(**outlier_detection_kwargs)
-    elif outlier_detection_method == 'isolation-forest':
-        clf = IsolationForest(**outlier_detection_kwargs)
-    elif outlier_detection_method == 'local-outlier-factor':
-        clf = LocalOutlierFactor(**outlier_detection_kwargs)
-    elif outlier_detection_method is None:
-        return np.array(cluster_labels, copy=True)
-    else:
-        raise NotImplementedError("Method %s is not implemented."%outlier_detection_kwargs['method'])
-    new_labels = np.array(cluster_labels, copy=True)
-    if normalize:
-        X = preprocessing.normalize(X)
-    for cidx in np.unique(cluster_labels):
-        if cidx == -1:
-            continue
-        cluster_indices = np.where(new_labels == cidx)[0]
-        X_cl = X[cluster_indices]
-        with warnings.catch_warnings():
-            warnings.simplefilter("ignore")
-            predicted_labels = clf.fit_predict(X_cl)
-        new_labels[cluster_indices[predicted_labels == -1]] = -1
-    return new_labels
-    
-    
-class SSAMAnalysis(object):
+class Analysis(object):
     """
-    A class to run SSAM analysis.
+    A class to run a ``cellman.spatial`` analysis.
     
     Supports both pandas.DataFrame and spatialdata.SpatialData as input data formats.
     
@@ -180,8 +128,8 @@ class SSAMAnalysis(object):
     - Automatically detects coordinate systems and gene annotation fields
     - Supports both 2D and 3D spatial data
 
-    :param dataset: A SSAMDataset object.
-    :type dataset: SSAMDataset
+    :param dataset: A Dataset object.
+    :type dataset: Dataset
     :param ncores: Number of cores for parallel computation. If a negative value is given,
         ((# of all available cores on system) - abs(ncores)) cores will be used.
     :type ncores: int
@@ -256,13 +204,9 @@ class SSAMAnalysis(object):
         if 'cluster_labels' in zk:
             self._m("Loaded existing cluster labels.")
             self.dataset.cluster_labels = self.dataset.zarr_group['cluster_labels'][:]
-        if 'filtered_cluster_labels' in zk:
-            self.dataset.filtered_cluster_labels = self.dataset.zarr_group['filtered_cluster_labels'][:]
         if 'centroids' in zk:
             self.dataset.centroids = self.dataset.zarr_group['centroids'][:]
-        if 'centroids_stdev' in zk:
-            self.dataset.centroids_stdev = self.dataset.zarr_group['centroids_stdev'][:]
-        
+
         if 'tsne' in zk:
             self._m("Loaded an existing t-SNE result.")
             self.dataset.tsne = self.dataset.zarr_group['tsne'][:]
@@ -331,7 +275,7 @@ class SSAMAnalysis(object):
         
     def _spatialdata_to_dataframe(self, sdata, element_name=None, coordinate_system=None):
         """
-        Convert SpatialData object to DataFrame format compatible with SSAM.
+        Convert SpatialData object to the DataFrame format used by this package.
         
         :param sdata: SpatialData object containing points data
         :type sdata: spatialdata.SpatialData
@@ -404,7 +348,7 @@ class SSAMAnalysis(object):
 
     def _validate_input_data(self, data, element_name=None, width=None, height=None, depth=None):
         """
-        Validate and normalize input data for SSAM analysis.
+        Validate and normalize input data for analysis.
         
         :param data: Input data - either DataFrame or SpatialData object
         :param element_name: Name of the points element to extract from SpatialData
@@ -556,252 +500,11 @@ class SSAMAnalysis(object):
         return cx, n_chunk
 
 
-    def _pick_clustering_backend(self, auto_gpu=True):
-        """Return (backend_module, name) for neighbor graph + Leiden/Louvain.
-
-        - If ``auto_gpu`` and ``rapids_singlecell`` imports successfully and
-          a CUDA device is available, use rapids_singlecell (GPU).
-        - Otherwise, fall back to scanpy (CPU).
-
-        Both modules expose the same ``.pp.neighbors`` and
-        ``.tl.leiden`` / ``.tl.louvain`` APIs, so the caller can use the
-        returned module interchangeably.
-        """
-        if auto_gpu:
-            try:
-                import rapids_singlecell as _rsc
-                cuda_ok = False
-                try:
-                    import torch
-                    cuda_ok = bool(torch.cuda.is_available())
-                except ImportError:
-                    try:
-                        import cupy
-                        cuda_ok = cupy.cuda.runtime.getDeviceCount() > 0
-                    except Exception:
-                        cuda_ok = False
-                if cuda_ok:
-                    return _rsc, 'rapids_singlecell (GPU)'
-            except ImportError:
-                pass
-        if not _SCANPY_AVAILABLE:
-            raise ImportError(
-                "Neither rapids_singlecell (GPU) nor scanpy (CPU) is available. "
-                "Install one of them for clustering."
-            )
-        return sc, 'scanpy (CPU)'
-
-    def _resolve_cluster_vectors(self, vectors=None):
-        """Feature matrix for outlier / centroid computation: an explicit
-        ``vectors`` (e.g. a clustering AnnData's ``X``) wins, else the dataset's
-        scaled/normalized vectors."""
-        if vectors is not None:
-            return np.asarray(vectors)
-        if getattr(self.dataset, 'scaled_vectors', None) is not None:
-            return self.dataset.scaled_vectors
-        if getattr(self.dataset, 'normalized_vectors', None) is not None:
-            return self.dataset.normalized_vectors
-        raise ValueError("Neither scaled_vectors nor normalized_vectors are available. "
-                         "Please run downsample_vector() first.")
-
-    def _correct_cluster_labels(self, cluster_labels, outlier_detection_method,
-                                outlier_detection_kwargs, vectors=None):
-        vecs = self._resolve_cluster_vectors(vectors)
-        return remove_outliers(vecs, cluster_labels, outlier_detection_method,
-                               outlier_detection_kwargs)
-
-    def _calc_centroid(self, cluster_labels, normalize=True, norm='l2', vectors=None):
-        vecs = self._resolve_cluster_vectors(vectors)
-        centroids = []
-        centroids_stdev = []
-        for lbl in np.unique(cluster_labels):
-            if lbl == -1:
-                continue
-            cl_vecs = vecs[cluster_labels == lbl, :]
-            if normalize:
-                preprocessing.normalize(cl_vecs, norm=norm, axis=1)
-            centroid = np.mean(cl_vecs, axis=0)
-            centroid_stdev = np.std(cl_vecs, axis=0)
-            centroids.append(centroid)
-            centroids_stdev.append(centroid_stdev)
-        return centroids, centroids_stdev
-
-    def cluster_vectors(self, adata, *, method="leiden", resolution=1.0,
-                        key_added="leiden", min_cluster_size=2, max_correlation=1.0,
-                        outlier_detection_method='medoid-correlation',
-                        outlier_detection_kwargs={}, random_state=0, auto_gpu=True,
-                        neighbors_key=None, **kwargs):
-        """Cluster a downsampled-vector AnnData IN PLACE (scanpy-style).
-
-        Mirrors the ``sc.pp.pca`` -> ``sc.pp.neighbors`` -> cluster idiom: PCA and the
-        kNN graph are the CALLER's job (run scanpy or rapids-singlecell on ``adata``
-        first), and this method does ONLY clustering + centroid computation::
-
-            adata = analysis.downsample_vector(...)      # AnnData of normalized_vectors
-            sc.pp.pca(adata); sc.pp.neighbors(adata)     # or the rapids equivalents
-            analysis.cluster_vectors(adata)              # writes adata.obs['leiden']
-
-        Runs Leiden/Louvain on ``adata``'s existing neighbor graph, refines the labels
-        (outlier removal, small-cluster drop, optional correlation merge), computes
-        per-cluster CENTROIDS from ``adata.X`` (= normalized_vectors, the same space as
-        ``vf_normalized`` for :meth:`map_celltypes`), then
-
-          * writes the final labels to ``adata.obs[key_added]`` (categorical), and
-          * persists ``cluster_labels`` / ``filtered_cluster_labels`` / ``centroids`` /
-            ``centroids_stdev`` to the zarr store so ``map_celltypes`` can read them.
-
-        Returns ``None`` (mutates ``adata``), like ``sc.pp.*`` / ``sc.tl.leiden``.
-
-        Parameters
-        ----------
-        adata : anndata.AnnData
-            Downsampled vectors (from :meth:`downsample_vector`) with a neighbor graph
-            already computed. ``adata.X`` must be the normalized vectors, row-aligned
-            with the store's ``normalized_vectors`` (do not reorder/subset if you will
-            call ``map_celltypes(method='tsvm')`` afterwards).
-        method : {'leiden', 'louvain'}, default 'leiden'
-        resolution : float, default 1.0
-        key_added : str, default 'leiden'
-            ``adata.obs`` column the final labels are written to.
-        neighbors_key : str, optional
-            Select a non-default neighbor graph (forwarded to the backend).
-        min_cluster_size, max_correlation, outlier_detection_method,
-        outlier_detection_kwargs :
-            Label-refinement controls (unchanged from the previous implementation).
-
-        :param random_state: Random seed forwarded to the Leiden/Louvain backend.
-        :type random_state: int
-        :param auto_gpu: If True, use rapids_singlecell on a CUDA device when
-            available, otherwise fall back to scanpy (CPU).
-        :type auto_gpu: bool
-        :param kwargs: Extra keyword arguments accepted for forward compatibility.
-        :type kwargs: dict
-        """
-        import scipy.sparse as _sp
-        if adata is None or not hasattr(adata, "obs"):
-            raise TypeError(
-                "cluster_vectors now takes the downsampled AnnData as its first "
-                "argument: analysis.cluster_vectors(adata). Build it with "
-                "adata = analysis.downsample_vector(...), then run sc.pp.pca(adata) "
-                "and sc.pp.neighbors(adata) before clustering.")
-        has_graph = (neighbors_key is not None) or ('neighbors' in adata.uns) \
-            or ('connectivities' in adata.obsp)
-        if not has_graph:
-            raise ValueError(
-                "cluster_vectors expects a kNN graph on `adata`; run sc.pp.pca(adata) "
-                "+ sc.pp.neighbors(adata) (or the rapids-singlecell equivalents) first, "
-                "as you would before sc.tl.leiden.")
-
-        def remove_small_clusters(lbls, lbls2=None):
-            small_clusters = []
-            cluster_indices = []
-            lbls = np.array(lbls)
-            for lbl in np.unique(lbls):
-                if lbl == -1:
-                    continue
-                cnt = np.sum(lbls == lbl)
-                if cnt < min_cluster_size:
-                    small_clusters.append(lbl)
-                else:
-                    cluster_indices.append(lbl)
-            for lbl in small_clusters:
-                lbls[lbls == lbl] = -1
-            tmp = np.array(lbls, copy=True)
-            for i, idx in enumerate(cluster_indices):
-                lbls[tmp == idx] = i
-            if lbls2 is not None:
-                for lbl in small_clusters:
-                    lbls2[lbls2 == lbl] = -1
-                tmp = np.array(lbls2, copy=True)
-                for i, idx in enumerate(cluster_indices):
-                    lbls2[tmp == idx] = i
-                return lbls, lbls2
-            return lbls
-
-        X = adata.X
-        X = X.toarray() if _sp.issparse(X) else np.asarray(X)
-        X = X.astype(np.float32)
-
-        backend, backend_name = self._pick_clustering_backend(auto_gpu=auto_gpu)
-        self._m(f"cluster_vectors: backend = {backend_name}")
-        nbrs_kw = {'neighbors_key': neighbors_key} if neighbors_key is not None else {}
-        tmp_key = "__cellman_cluster_raw"
-
-        def _run(mod):
-            if method == 'leiden':
-                mod.tl.leiden(adata, resolution=resolution, random_state=random_state,
-                              key_added=tmp_key, **nbrs_kw)
-            elif method == 'louvain':
-                mod.tl.louvain(adata, resolution=resolution, random_state=random_state,
-                               key_added=tmp_key, **nbrs_kw)
-            else:
-                raise NotImplementedError(
-                    f"Method '{method}' is not supported. Only 'leiden' and 'louvain'.")
-        try:
-            _run(backend)
-        except Exception as e:  # noqa: BLE001
-            if backend is not sc and _SCANPY_AVAILABLE:
-                self._m(f"cluster_vectors: {backend_name} clustering failed ({e}); "
-                        f"falling back to scanpy (CPU)")
-                _run(sc)
-            else:
-                raise
-        all_lbls = np.asarray(adata.obs[tmp_key].astype(int).values)
-        del adata.obs[tmp_key]
-
-        if outlier_detection_method is not None:
-            filtered_all_lbls = self._correct_cluster_labels(
-                all_lbls, outlier_detection_method, outlier_detection_kwargs, vectors=X)
-            filtered_all_lbls, all_lbls = remove_small_clusters(filtered_all_lbls, all_lbls)
-        else:
-            filtered_all_lbls = all_lbls = remove_small_clusters(all_lbls)
-
-        centroids, centroids_stdev = self._calc_centroid(filtered_all_lbls, vectors=X)
-
-        if max_correlation < 1.0:
-            Z = scipy.cluster.hierarchy.linkage(centroids, metric='correlation')
-            clbls = scipy.cluster.hierarchy.fcluster(Z, 1 - max_correlation, 'distance')
-            merge_candidates = []
-            for i in set(clbls):
-                leaf_indices = np.where(clbls == i)[0]
-                if len(leaf_indices) > 1:
-                    merge_candidates.append(leaf_indices)
-            removed_indices = []
-            for cand in merge_candidates:
-                for i in cand[1:]:
-                    all_lbls[all_lbls == i] = cand[0]
-                    removed_indices.append(i)
-            for i in sorted(removed_indices, reverse=True):
-                all_lbls[all_lbls > i] -= 1
-            if outlier_detection_method is not None:
-                filtered_all_lbls = self._correct_cluster_labels(
-                    all_lbls, outlier_detection_method, outlier_detection_kwargs, vectors=X)
-                filtered_all_lbls, all_lbls = remove_small_clusters(filtered_all_lbls, all_lbls)
-            else:
-                filtered_all_lbls = all_lbls = remove_small_clusters(all_lbls)
-            centroids, centroids_stdev = self._calc_centroid(filtered_all_lbls, vectors=X)
-
-        self.dataset.cluster_labels = all_lbls
-        self.dataset.filtered_cluster_labels = filtered_all_lbls
-        self.dataset.centroids = np.array(centroids)
-        self.dataset.centroids_stdev = np.array(centroids_stdev)
-        for _k in ('cluster_labels', 'filtered_cluster_labels', 'centroids', 'centroids_stdev'):
-            if _k in self.dataset.zarr_group:
-                del self.dataset.zarr_group[_k]
-        self.dataset.zarr_group['cluster_labels'] = self.dataset.cluster_labels
-        self.dataset.zarr_group['filtered_cluster_labels'] = self.dataset.filtered_cluster_labels
-        self.dataset.zarr_group['centroids'] = self.dataset.centroids
-        self.dataset.zarr_group['centroids_stdev'] = self.dataset.centroids_stdev
-
-        adata.obs[key_added] = pd.Categorical(np.asarray(filtered_all_lbls).astype(str))
-        self._m("Found %d clusters" % len(centroids))
-        return None
-
     def _downsampled_adata(self):
         """Build the AnnData that :meth:`downsample_vector` returns: ``X`` =
         normalized_vectors, ``obsm['spatial']`` = downsampled positions,
         ``obs['vf_norm']`` = per-voxel local density, ``var`` = genes. Feed it to
-        ``sc.pp.pca`` / ``sc.pp.neighbors`` / :meth:`cluster_vectors`."""
+        ``sc.pp.pca`` / ``sc.pp.neighbors`` / ``sc.tl.leiden``."""
         ds = self.dataset
         nv = np.asarray(ds.normalized_vectors, dtype=np.float32)
         genes = getattr(ds, 'genes', None)
@@ -825,6 +528,162 @@ class SSAMAnalysis(object):
         if vfn is not None and len(vfn) == adata.n_obs:
             adata.obs['vf_norm'] = np.asarray(vfn, dtype=np.float32)
         return adata
+
+    def _downsampled_world_xy(self):
+        """World-µm ``(N, 2)`` positions of the downsampled vectors.
+
+        The count backend records them directly (``downsampled_global_xy``); the
+        transcript backend stores grid indices, so they are converted with the
+        vector field's own ``coordinate_offset`` + ``sampling_distance``. Either
+        way the result lives in the SAME global µm frame as the staining image
+        and the celltype-map labels, which is what makes the table overlay them.
+        """
+        zg = self.dataset.zarr_group
+        if 'downsampled_global_xy' in zg:
+            return np.asarray(zg['downsampled_global_xy'][:]).T.astype(np.float64)
+        dv = np.asarray(zg['downsampled_vectors'][:])
+        sd_um = float(zg.attrs.get(
+            'sampling_distance',
+            zg['vf_params'][0] if 'vf_params' in zg else 1.0))
+        off = (np.asarray(zg['coordinate_offset'][:]) if 'coordinate_offset' in zg
+               else np.zeros(3))
+        return np.stack([off[0] + dv[0] * sd_um, off[1] + dv[1] * sd_um],
+                        axis=1).astype(np.float64)
+
+    def _celltype_names_colors(self, cmap=None):
+        """``(names, colors)`` for the celltype ids 0..K-1, both length K.
+
+        Written by :func:`~cellman.spatial._mapping_inputs.build_centroids_from_h5ad`.
+        K is ``centroids.shape[0]`` — every class the mapping can emit, including
+        the ones that never win a voxel — so the palette never depends on which
+        classes happen to survive filtering. Stores built before these keys
+        existed fall back to the celltype-index CSV, then to positional names.
+        """
+        from ._mapping_inputs import celltype_colors
+        zg = self.dataset.zarr_group
+        K = int(zg['centroids'].shape[0]) if 'centroids' in zg else 0
+        if 'celltype_names' in zg:
+            names = [str(x) for x in zg['celltype_names'][:]]
+        else:
+            names = None
+            csv = self.dataset._zarr_store_path(self.dataset.zarr_store)
+            csv = os.path.join(csv, 'celltype_index.csv') if csv else None
+            if csv and os.path.isfile(csv):
+                idx = pd.read_csv(csv).sort_values('cluster')
+                if len(idx) == K:
+                    names = idx['celltype'].astype(str).tolist()
+            if names is None:
+                names = [f'celltype_{i}' for i in range(K)]
+        colors = list(zg.attrs.get('cellman_celltype_colors', []))
+        if len(colors) != len(names):
+            colors = celltype_colors(len(names), cmap=cmap)
+        return names, colors
+
+    def set_celltype_palette(self, cmap=None, sdata=None, *, colors=None,
+                             table_key='cellman_downsampled',
+                             labels_key='cellman_celltype_map',
+                             image_key='cellman_celltype_map_rgb', z=None):
+        """Re-fix the per-celltype palette WITHOUT re-running the mapping.
+
+        Colour is a presentation choice, but it is stored once so every view
+        agrees — so changing it means updating that one place and re-rendering
+        what was derived from it. This rewrites
+        ``attrs['cellman_celltype_colors']``, the annotated table's
+        ``uns['cellman_annotation_colors']``, and (if a filtered map exists) the
+        RGB image. The labels raster and the celltype ids are untouched.
+
+        :param cmap: ``None`` (default) = qualitative palette sized to the class
+            count; a colormap name samples it continuously instead.
+        :type cmap: str or matplotlib.colors.Colormap or None
+        :param sdata: SpatialData to update; defaults to the remembered one.
+        :type sdata: spatialdata.SpatialData or None
+        :param colors: explicit per-id colours, overriding ``cmap``.
+        :type colors: list or None
+        :param table_key: key of the annotated downsampled table to update.
+        :type table_key: str
+        :param labels_key: key of the labels element (re-parsed unchanged).
+        :type labels_key: str
+        :param image_key: key of the RGB image element to re-render.
+        :type image_key: str
+        :param z: Z index used when re-rendering a 3D map.
+        :type z: int or None
+        :returns: The updated SpatialData, or ``None`` if none was available.
+        :rtype: spatialdata.SpatialData or None
+        """
+        from matplotlib.colors import to_hex, to_rgba
+        from ._mapping_inputs import celltype_colors
+        zg = self.dataset.zarr_group
+        names, _ = self._celltype_names_colors()
+        if colors is None:
+            colors = celltype_colors(len(names), cmap=cmap)
+        colors = [to_hex(to_rgba(c)) for c in colors]
+        if len(colors) != len(names):
+            raise ValueError(f'{len(colors)} colours for {len(names)} celltypes')
+        zg.attrs['cellman_celltype_colors'] = colors
+        self._m(f'set_celltype_palette: {len(colors)} colours '
+                f"(cmap={cmap!r})" if cmap else
+                f'set_celltype_palette: {len(colors)} qualitative colours')
+
+        sdata = sdata if sdata is not None else getattr(
+            self.dataset, '_original_input_data', None)
+        if sdata is None:
+            return None
+        if table_key in getattr(sdata, 'tables', {}):
+            sdata.tables[table_key].uns['cellman_annotation_colors'] = colors
+        if getattr(self.dataset, 'filtered_celltype_maps', None) is not None:
+            self.dataset.write_celltype_map(
+                sdata, colors=colors, z=z,
+                labels_key=labels_key, image_key=image_key)
+        return sdata
+
+    def _finish_map(self, sdata, table_key):
+        """Attach the annotated downsampled table to ``sdata`` and return it."""
+        if sdata is None:
+            self._m('map_celltypes: no SpatialData given and none remembered; '
+                    'store written, table skipped')
+            return None
+        return self._write_downsampled_table(sdata, table_key=table_key)
+
+    def _write_downsampled_table(self, sdata, *, table_key='cellman_downsampled'):
+        """Write the annotated downsampled vectors into ``sdata.tables[table_key]``.
+
+        ``obs['cellman_annotation']`` is REBUILT from ``cluster_labels`` — not
+        copied from the annotated h5ad. The two differ: the h5ad's ``Unknown`` is
+        split per source cluster into ``unknown1..N``, so the h5ad may carry (say)
+        27 distinct labels where the mapping uses 36 classes. Rebuilding keeps the
+        categorical's categories index-aligned with the celltype ids, the rows of
+        ``centroids``, the values of ``celltype_maps``, and
+        ``uns['cellman_annotation_colors']`` — one shared axis, nothing to drift.
+
+        Vectors dropped from the mapping (``cluster_labels == -1``: Background /
+        never-finalized labels) are EXCLUDED; they are background, not a class.
+        """
+        import pandas as pd
+        from spatialdata.models import TableModel
+
+        zg = self.dataset.zarr_group
+        names, colors = self._celltype_names_colors()
+        labels = np.asarray(zg['cluster_labels'][:])
+        keep = labels >= 0
+
+        adata = self._downsampled_adata()
+        xy = self._downsampled_world_xy()
+        if not keep.all():
+            adata = adata[keep].copy()
+        adata.obsm['spatial'] = xy[keep]
+        adata.obs['cellman_annotation'] = pd.Categorical.from_codes(
+            labels[keep], categories=names)
+        adata.uns['cellman_annotation_colors'] = colors
+        adata.uns['cellman_celltype_names'] = names
+
+        if table_key in sdata.tables:
+            del sdata.tables[table_key]
+        sdata.tables[table_key] = TableModel.parse(adata)
+        n_drop = int((~keep).sum())
+        print(f"[map_celltypes] tables['{table_key}'] {adata.shape} "
+              f"{len(names)} celltypes"
+              + (f" (excluded {n_drop} background vectors)" if n_drop else ""))
+        return sdata
 
     def _prepare_grid(self, sdata, element_name=None, bandwidth=2.5, sampling_distance=1.0,
                       prune_coefficient=4.3, size_after_normalization=10):
@@ -1515,7 +1374,7 @@ class SSAMAnalysis(object):
         prune_coefficient : float, default 4.3
             Gaussian kernel truncation radius in σ units: ``radius = ceil(
             prune_coefficient * sigma_bin)`` bins (= ``prune_coefficient *
-            bandwidth`` µm). Matches SSAM's default 4.3 (radius ≈ cell diameter);
+            bandwidth`` µm). Default 4.3 (radius ≈ cell diameter);
             lower (e.g. 3.0 ≈ 99.7% mass) truncates tighter and runs faster.
         panel : list[str], optional
             Gene panel to restrict to before rasterization.
@@ -1602,12 +1461,11 @@ class SSAMAnalysis(object):
 
         Returns an :class:`anndata.AnnData` of the sampled voxels (``X`` =
         normalized_vectors, ``obsm['spatial']``, ``obs['vf_norm']``, ``var`` =
-        genes) — feed it to ``sc.pp.pca`` / ``sc.pp.neighbors`` and then
-        :meth:`cluster_vectors`::
+        genes) — feed it to ``sc.pp.pca`` / ``sc.pp.neighbors`` / ``sc.tl.leiden``::
 
             adata = analysis.downsample_vector(sdata, ...)
             sc.pp.pca(adata); sc.pp.neighbors(adata)
-            analysis.cluster_vectors(adata)   # writes adata.obs['leiden'] in place
+            sc.tl.leiden(adata)               # writes adata.obs['leiden'] in place
 
 
         Two modes, auto-detected:
@@ -1623,7 +1481,7 @@ class SSAMAnalysis(object):
 
         If ``auto_gpu`` is True (default) and a usable CUDA device is
         detected (``torch + triton + cuda.is_available()``), the underlying
-        ``ssam.utils.kde_at_points`` is transparently routed to the Triton
+        ``cellman.spatial.utils.kde_at_points`` is transparently routed to the Triton
         GPU kernel for the duration of this call. Otherwise the original
         C++/OpenMP CPU implementation is used. The user therefore does
         not need to wrap the call in ``with gpu_kde(...): ...``.
@@ -2009,7 +1867,9 @@ class SSAMAnalysis(object):
                       size_after_normalization=10, log_transform=True, overwrite=True,
                       gpu_device='cuda', force_cpu=False,
                       query_subchunk_size=None, gpu_target_bytes=int(1e9),
-                      map_kwargs=None, save_vf=False):
+                      map_kwargs=None, save_vf=False,
+                      h5ad=None, column='cellman_annotation', leiden_column='leiden',
+                      cmap=None, table_key='cellman_downsampled'):
         """Single entry point for celltype mapping.
 
         Two regimes, auto-detected from the store:
@@ -2040,7 +1900,9 @@ class SSAMAnalysis(object):
         gpu_device : str, default ``'cuda'``
             CUDA device used by the GPU path.
         force_cpu : bool, default False
-            If True, always use the CPU path regardless of GPU availability.
+            If True, run on CPU regardless of GPU availability — both the transcript
+            KDE path and ``method='tsvm'``. Even without this flag, ``method='tsvm'``
+            falls back to CPU automatically when no CUDA device is present.
         save_vf : bool, default False
             **Transcript regime only.** By default the imaging-based path
             (Xenium / MERFISH) computes the KDE vector field chunk-by-chunk,
@@ -2062,9 +1924,30 @@ class SSAMAnalysis(object):
         :param sdata: Transcript SpatialData to map; required in the transcript
             regime, unused in the count regime.
         :type sdata: spatialdata.SpatialData or None
-        :param centroids: Per-cluster centroid matrix; falls back to
-            ``self.dataset.centroids`` when None.
+        :param centroids: Per-cluster centroid matrix; falls back to the store's
+            ``centroids`` (or the h5ad-built ones) when None.
         :type centroids: numpy.ndarray or None
+        :param h5ad: Annotated h5ad (row-aligned with ``normalized_vectors``). When
+            given, ``cluster_labels`` + ``centroids`` are (re)built from it before
+            mapping: vectors are grouped by the label string in ``obs[column]`` (one
+            class per label; ``Unknown`` split by ``obs[leiden_column]`` into
+            ``unknown1..N``; Background dropped). Required the first time — when the
+            store has no centroids/cluster_labels and no ``centroids`` array is passed.
+        :type h5ad: str or None
+        :param column: obs column with the final celltype label (h5ad build).
+        :type column: str
+        :param leiden_column: obs column with the original cluster id, used to split
+            ``Unknown`` when building from an h5ad.
+        :type leiden_column: str
+        :param cmap: palette fixing the per-celltype colours at build time; the
+            same palette is reused by the labels rendering and any legend.
+            ``None`` (default) = qualitative palette sized to the class count
+            (tab20 / scanpy 28 / scanpy 102), which stays legible for tens of
+            celltypes; a colormap name samples it continuously instead.
+        :type cmap: str or matplotlib.colors.Colormap or None
+        :param table_key: key of the annotated downsampled table written into
+            ``sdata.tables``.
+        :type table_key: str
         :param element_name: Name of the points element to parse from ``sdata``.
         :type element_name: str or None
         :param exclude_gene_indices: Gene indices to drop before correlation.
@@ -2084,12 +1967,35 @@ class SSAMAnalysis(object):
 
         Returns
         -------
-        None
-            The map is written into the store (``celltype_maps`` +
-            ``max_correlations`` in zarr, and ``ds.celltype_maps`` /
-            ``ds.max_correlations`` in memory); nothing is returned.
+        spatialdata.SpatialData
+            The map itself is written into the store (``celltype_maps`` +
+            ``max_correlations`` / ``max_probabilities`` in zarr, and mirrored on
+            ``ds``). The returned SpatialData additionally carries
+            ``tables[table_key]`` — the downsampled vectors annotated with the
+            REBUILT celltype labels + the fixed colour palette. Feed it to
+            :meth:`filter_celltypemaps`, which adds the raster elements.
         """
         zg = self.dataset.zarr_group
+        sdata = sdata if sdata is not None else getattr(
+            self.dataset, '_original_input_data', None)
+
+        # The inputs (cluster_labels + centroids) are built here from the annotated
+        # h5ad. Rebuild when an h5ad is passed; otherwise build only if the store is
+        # missing them and no centroids array was given (else fall back to the store).
+        need_build = ('centroids' not in zg) or ('cluster_labels' not in zg)
+        if h5ad is not None or (need_build and centroids is None):
+            if h5ad is None:
+                raise ValueError(
+                    "store has no centroids/cluster_labels. Pass h5ad=<annotated .h5ad> "
+                    "so map_celltypes can group vectors by obs[column] and build them, "
+                    "or pass centroids= directly.")
+            from ._mapping_inputs import build_centroids_from_h5ad
+            build_centroids_from_h5ad(
+                zg, h5ad, column=column, leiden_column=leiden_column, cmap=cmap,
+                store_dir=self.dataset._zarr_store_path(self.dataset.zarr_store))
+            self.dataset.cluster_labels = zg['cluster_labels'][:]
+            self.dataset.centroids = zg['centroids'][:]
+
         if ('vf_normalized' in zg) and (zg.attrs.get('backend') == 'blur'):
             mk = dict(map_kwargs or {})
             mk.setdefault('device', gpu_device)
@@ -2099,14 +2005,15 @@ class SSAMAnalysis(object):
                 map_corr(self, centroids=centroids, **mk)
             elif method == 'tsvm':
                 from ._tsvm import map_tsvm
-                map_tsvm(self, device=mk.get('device', gpu_device),
+                tsvm_device = 'cpu' if force_cpu else mk.get('device', gpu_device)
+                map_tsvm(self, device=tsvm_device,
                          overwrite=mk.get('overwrite', overwrite),
                          fit_kwargs=mk.get('fit_kwargs'),
                          apply_kwargs=mk.get('apply_kwargs'))
             else:
                 raise ValueError(f"unknown mapping method {method!r} "
                                  "(count: 'corr'|'tsvm')")
-            return None
+            return self._finish_map(sdata, table_key)
 
         if method != 'corr':
             raise ValueError(f"method={method!r} needs a precomputed blur field "
@@ -2137,7 +2044,7 @@ class SSAMAnalysis(object):
         else:
             self._m('map_celltypes: CPU path')
             self._map_celltypes_cpu(sdata, **shared)
-        return None
+        return self._finish_map(sdata, table_key)
 
     def _map_celltypes_cpu(self, sdata, centroids=None, element_name=None,
                          exclude_gene_indices=None,
@@ -2168,13 +2075,11 @@ class SSAMAnalysis(object):
         self.dataset.cluster_labels          = self.dataset.zarr_group['cluster_labels'][:]
         self.dataset.downsampled_vectors              = self.dataset.zarr_group['downsampled_vectors'][:]
         self.dataset.normalized_vectors      = self.dataset.zarr_group['normalized_vectors'][:]
-        self.dataset.filtered_cluster_labels = self.dataset.zarr_group['filtered_cluster_labels'][:]
         self.dataset.centroids               = self.dataset.zarr_group['centroids'][:]
-        self.dataset.centroids_stdev         = self.dataset.zarr_group['centroids_stdev'][:]
 
         if centroids is None:
             if getattr(self.dataset, 'centroids', None) is None:
-                raise ValueError('centroids not found. Run cluster_vectors() first.')
+                raise ValueError('centroids not found. Pass h5ad=<annotated .h5ad> to map_celltypes to build them.')
             centroids = np.asarray(self.dataset.centroids, dtype=np.float32)
         else:
             centroids = np.asarray(centroids, dtype=np.float32)
@@ -2407,10 +2312,39 @@ class SSAMAnalysis(object):
         self.dataset.celltype_maps = self.dataset.zarr_group['celltype_maps'][:]
         self.dataset.max_correlations = self.dataset.zarr_group['max_correlations'][:]
 
-    def filter_celltypemaps(self, min_p=0.6, min_r=0.6, min_norm=0.1, fill_blobs=True, min_blob_area=0, filter_params={}, output_mask=None):
+    def filter_celltypemaps(self, sdata=None, min_p=0.6, min_r=0.6, min_norm=0.1,
+                            fill_blobs=True, min_blob_area=0, filter_params={},
+                            output_mask=None, z=None,
+                            labels_key="cellman_celltype_map",
+                            image_key="cellman_celltype_map_rgb"):
         """
         Post-filter cell type maps created by `map_celltypes`.
 
+        When ``sdata`` is given (or one was remembered from ``compute_vf`` /
+        ``map_celltypes``) the filtered map is also written into it as two aligned
+        raster elements and the SpatialData is returned:
+
+        * ``labels[labels_key]`` — the categorical raster; pixel value =
+          ``celltype id + 1`` (0 = background / filtered out). Labels, not an
+          image: that is what makes the raster addressable as categories
+          (``aggregate``, label picking, region queries).
+        * ``images[image_key]`` — an RGB rendering in the palette fixed at
+          ``map_celltypes`` time, for quick visual inspection.
+
+        No table is written here — the celltype NAMES live once, in
+        ``tables['cellman_downsampled']`` from :meth:`map_celltypes`, whose
+        categorical is index-aligned with these pixel values::
+
+            names = sdata['cellman_downsampled'].obs['cellman_annotation'].cat.categories
+            name_of_pixel = names[pixel - 1]        # pixel 0 = background
+
+        so re-filtering can mint fresh rasters as often as you like without ever
+        duplicating (or desynchronizing) the naming.
+
+        :param sdata: SpatialData to write the raster elements into. Defaults to
+            the one remembered from ``compute_vf`` / ``map_celltypes``; pass
+            ``None`` with nothing remembered to only update the zarr store.
+        :type sdata: spatialdata.SpatialData or None
         :param min_p: minimum threshold of the softmax probability, used when a
             probability volume (``max_probabilities``) is present instead of
             correlations.
@@ -2430,6 +2364,16 @@ class SSAMAnalysis(object):
         :type filter_params: dict
         :param output_mask: If given, the cell type maps will be filtered using the output mask.
         :type output_mask: np.ndarray(bool)
+        :param z: Z index to slice a 3D map when writing the rasters; defaults to
+            the middle slice.
+        :type z: int or None
+        :param labels_key: Key of the integer labels element written into ``sdata``.
+        :type labels_key: str
+        :param image_key: Key of the RGB image element written into ``sdata``.
+        :type image_key: str
+        :returns: The SpatialData with the two raster elements added, or ``None``
+            when no SpatialData was given or remembered.
+        :rtype: spatialdata.SpatialData or None
         """
 
         if self.dataset.max_probabilities is not None:
@@ -2501,7 +2445,20 @@ class SSAMAnalysis(object):
         if output_mask is not None:
             filtered_ctmaps[~output_mask.astype(bool)] = -1
         self.dataset.filtered_celltype_maps = filtered_ctmaps
+        if 'filtered_celltype_maps' in self.dataset.zarr_group:
+            del self.dataset.zarr_group['filtered_celltype_maps']
         self.dataset.zarr_group['filtered_celltype_maps'] = self.dataset.filtered_celltype_maps
+
+        sdata = sdata if sdata is not None else getattr(
+            self.dataset, '_original_input_data', None)
+        if sdata is None:
+            self._m('filter_celltypemaps: no SpatialData given and none '
+                    'remembered; store updated, rasters skipped')
+            return None
+        _, colors = self._celltype_names_colors()
+        return self.dataset.write_celltype_map(
+            sdata, colors=colors, z=z, min_r=min_r,
+            labels_key=labels_key, image_key=image_key)
 
 
     def _map_celltypes_gpu(self, sdata, centroids=None, element_name=None,
@@ -2587,14 +2544,14 @@ class SSAMAnalysis(object):
             raise RuntimeError("map_celltypes_gpu requires a CUDA device")
 
         for key in ('cluster_labels', 'downsampled_vectors', 'normalized_vectors',
-                    'filtered_cluster_labels', 'centroids', 'centroids_stdev'):
+                    'centroids'):
             if key in self.dataset.zarr_group:
                 setattr(self.dataset, key,
                         self.dataset.zarr_group[key][:])
 
         if centroids is None:
             if getattr(self.dataset, 'centroids', None) is None:
-                raise ValueError('centroids not found. Run cluster_vectors() first.')
+                raise ValueError('centroids not found. Pass h5ad=<annotated .h5ad> to map_celltypes to build them.')
             centroids = np.asarray(self.dataset.centroids, dtype=np.float32)
         else:
             centroids = np.asarray(centroids, dtype=np.float32)
@@ -2877,7 +2834,7 @@ class SSAMAnalysis(object):
         the legacy ``_map_celltypes_gpu_core`` so numerics are preserved."""
         import torch
         for key in ('cluster_labels', 'downsampled_vectors', 'normalized_vectors',
-                    'filtered_cluster_labels', 'centroids', 'centroids_stdev'):
+                    'centroids'):
             if key in self.dataset.zarr_group:
                 setattr(self.dataset, key, self.dataset.zarr_group[key][:])
         produce_only = centroids is None and getattr(self.dataset, 'centroids', None) is None
@@ -3199,13 +3156,11 @@ class SSAMAnalysis(object):
         self.dataset.cluster_labels          = self.dataset.zarr_group['cluster_labels'][:]
         self.dataset.downsampled_vectors              = self.dataset.zarr_group['downsampled_vectors'][:]
         self.dataset.normalized_vectors      = self.dataset.zarr_group['normalized_vectors'][:]
-        self.dataset.filtered_cluster_labels = self.dataset.zarr_group['filtered_cluster_labels'][:]
         self.dataset.centroids               = self.dataset.zarr_group['centroids'][:]
-        self.dataset.centroids_stdev         = self.dataset.zarr_group['centroids_stdev'][:]
 
         if centroids is None:
             if getattr(self.dataset, 'centroids', None) is None:
-                raise ValueError('centroids not found. Run cluster_vectors() first.')
+                raise ValueError('centroids not found. Pass h5ad=<annotated .h5ad> to map_celltypes to build them.')
             centroids = np.asarray(self.dataset.centroids, dtype=np.float32)
         else:
             centroids = np.asarray(centroids, dtype=np.float32)
@@ -3358,13 +3313,11 @@ class SSAMAnalysis(object):
         self.dataset.cluster_labels          = self.dataset.zarr_group['cluster_labels'][:]
         self.dataset.downsampled_vectors              = self.dataset.zarr_group['downsampled_vectors'][:]
         self.dataset.normalized_vectors      = self.dataset.zarr_group['normalized_vectors'][:]
-        self.dataset.filtered_cluster_labels = self.dataset.zarr_group['filtered_cluster_labels'][:]
         self.dataset.centroids               = self.dataset.zarr_group['centroids'][:]
-        self.dataset.centroids_stdev         = self.dataset.zarr_group['centroids_stdev'][:]
 
         if centroids is None:
             if getattr(self.dataset, 'centroids', None) is None:
-                raise ValueError('centroids not found. Run cluster_vectors() first.')
+                raise ValueError('centroids not found. Pass h5ad=<annotated .h5ad> to map_celltypes to build them.')
             centroids = np.asarray(self.dataset.centroids, dtype=np.float32)
         else:
             centroids = np.asarray(centroids, dtype=np.float32)

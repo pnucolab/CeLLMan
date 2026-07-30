@@ -23,27 +23,26 @@ principle in full detail.
 
 ---
 
-## 1b. Two annotation modes — clustering-based (default) vs scoring-based (on-demand)
+## 1b. One mode — clustering-based annotation. Tissue **processes** are out of scope.
 
-Everything in §1 and §5–§13 is **clustering-based annotation** — the default. Alongside it there is a second
-mode, **scoring-based annotation**, used only when the user explicitly asks for it. Know which one a request
-is, because they answer different questions and CANNOT substitute for each other.
+This skill has **exactly one method**: marker-axis Leiden → judge each cluster by R1–R8 (REAL/DEEPEST/FLOOR).
+Everything in §1 and §5–§13 is that method. The engine is `init` / `subcluster` / `descend` / `check` /
+`finalize` and the unit of decision is **a cluster**, which gets **one** celltype.
 
-| | **clustering-based** (default) | **scoring-based** (on-demand) |
-|---|---|---|
-| **method** | marker-axis Leiden → judge each cluster by R1–R8 (REAL/DEEPEST/FLOOR) | per-vector: positive-marker composite top N% = candidate → remove those whose negative-marker composite is top M% → keep |
-| **unit** | a cluster gets **one** celltype | a **vector** is/ isn't the target (no cluster) |
-| **engine** | `init` / `subcluster` / `descend` / `check` / `finalize` | `score-profile` / `score-apply` / `score-finalize` |
-| **use for** | standard annotation; "subdivide the T cells", "split D1 vs D2" — any request to resolve a celltype | finding a **process** (neuropil / fiber tract / …); any "find `<X>` **by score**" |
-| **why it must exist** | identities separate into clusters | a **process shares its positive markers with the soma that made the transcripts** (neuropil's synaptic markers = the neuron's) → it does NOT separate on a positive marker axis; only a **negative axis** (`MALAT1` nuclear-retained; `SOX10`/`OLIG2` oligo-soma) tells the process from its cell. Clustering has no negative axis, so it CANNOT find a process — gathering the neurons and re-clustering splits them into neuron subtypes, never into neuropil-vs-not. |
+**Tissue processes are NOT annotated by this skill.** The module may serve `tier='process'` terms (neuropil,
+fiber tract, …), but they are **not celltypes** and there is no path to label them here:
+- The engine **excludes** `tier='process'` terms from lineage/anchor derivation, so they never appear in
+  `graph_evidence` / `identity_scores` / `verdict`. That is deliberate — without it a process term is picked up
+  as a lineage root and a real oligodendrocyte gets called `fiber tract`.
+- `check` raises `PROCESS_IN_CLUSTERING` (warn) if a process `term_id` ever ends up in your decisions.
+- **A process shares its positive markers with the soma that made the transcripts** (neuropil's synaptic markers
+  *are* the neuron's), so a positive marker axis cannot separate it — gathering the neurons and re-clustering
+  splits them into neuron subtypes, never into neuropil-vs-not. Do not attempt it.
 
-**Standard (autonomous) annotation is clustering-based ONLY.** There is no pre-Leiden process partition and no
-cluster-level process detection — the input h5ad already carries the user's cluster/annotation column and you
-annotate it directly (§8). **Scoring-based annotation is invoked ONLY in the interactive phase**, when the user
-says something like *"gather the neurons and find the neuropil / fiber tract"* or *"find `<X>` by score"* (§8,
-§5 Step S). It is fully generalized: the default targets are the module's `tier='process'` classes, but `--targets`
-scores **any** KG class (pos = its `R∪DF`, neg = its `N` ∪ all ancestors' `N`). The scoring engine, its
-constraints, and how you judge REAL are all in **§5 Step S**.
+If the user asks for a process, say plainly that this version does not support it. **Never force-fit a process
+term onto a cluster**, and never invent a process label. (A per-vector scoring engine for processes is under
+development and **not part of this release** — `helper.py score-*` is rejected. Its known defects are
+fixed-quota candidates, no agent-judgeable material, and unjudged auto-subtyping.)
 
 ---
 
@@ -81,7 +80,7 @@ The absolute-identity backbone; it survives fragmentation (a 150-cell fragment s
   looser `auc ≥ 0.65` — so a quiet layer marker (`Rorb` auc ~0.68 in sparse Stereo-seq) still anchors its
   layer instead of collapsing to the generic region. **Negatives stay STRICT (0.85)** — a weak negative
   never vetoes. Targeted panels (Xenium, auc > 0.85) are unaffected.
-- **`adaptive-floor` (sparse platforms):** on 0.5 µm SSAM the (a)/(b) thresholds are lowered to the data's
+- **`adaptive-floor` (sparse platforms):** on a 0.5 µm KDE vector field the (a)/(b) thresholds are lowered to the data's
   own `ambient × F` (reference-free) to recover low-copy DF (`Rspo1`→L4). Set at `init`, persists to all rounds.
 
 The engine's boolean for "gene ON" in `identity_scores` / anchors is exactly this rule. **"detected `>0`"
@@ -277,10 +276,9 @@ land there. Pass the same `--out` to every round.
 
 ```bash
 mkdir -p {out}
-# CLUSTERING-BASED annotation (the DEFAULT — §1b). The input h5ad ALREADY carries a cluster/annotation
-#   column (leiden or any obs column the user names — clustering is the user's job, done in their notebook).
-#   You annotate that column directly: init → judge → descend/subcluster → check → finalize. No process/
-#   pre-Leiden partition step exists anymore.
+# The input h5ad ALREADY carries a cluster/annotation column (leiden or any obs column the user names —
+#   clustering is the user's job, done in their notebook). You annotate that column directly:
+#   init → judge → descend/subcluster → check → finalize. There is no process/pre-Leiden partition step.
 
 # init — compute the reference (global stats) + fetch ontology + profile the input's clusters.
 #   --cluster-col {cluster_col}   the obs column the USER named in the prompt (leiden / any annotation column).
@@ -288,7 +286,7 @@ mkdir -p {out}
 #   --subcluster-metric / --subcluster-n-neighbors  init inherits the input clustering's metric/n_neighbors
 #     from uns['cellman_cluster_params'] if present. Supply them ONLY when they must MATCH an external
 #     clustering that did not record those params.
-#   --adaptive-floor                               sparse platforms (0.5µm SSAM): lower R1 thresholds to ambient×F (persists to all rounds).
+#   --adaptive-floor                               sparse platforms (0.5µm KDE vector field): lower R1 thresholds to ambient×F (persists to all rounds).
 {python} {HELPER} init --h5ad {input_h5ad} --cluster-col {cluster_col} \
    --out {out} --species {species} --organ {organ} [--disease "{disease}"] \
    [--adaptive-floor]      # (--subcluster-metric/-n-neighbors: only for externally clustered h5ad)
@@ -309,25 +307,6 @@ mkdir -p {out}
 # finalize — write {input}_annotated.h5ad (only when error-free AND the split-review gate is clear, §7.1).
 {python} {HELPER} finalize --out {out} --decisions {out}/_annotate_decisions.json [--accept-large]
 
-# ── SCORING-BASED annotation (§1b) — ON-DEMAND, interactive-phase only. Use ONLY when the user asks to
-#    find a process (neuropil / fiber tract / …) or explicitly says "find <X> by score". NOT part of
-#    standard (clustering-based) annotation. Runs on an h5ad that already has annotation (e.g. the finalized
-#    one, or a subset the caller gathered — "gather the neurons"). Same positive-candidate / negative-exclude
-#    engine that clustering CANNOT replicate (a process shares its positive markers with the soma that made
-#    the transcripts; only the negative axis — MALAT1 nuclear-retained / SOX10·OLIG2 oligo-soma — separates it).
-# score-profile — material only (NEVER labels; you judge REAL). --targets = a JSON list of KG class labels to
-#    score (default = the module's tier='process' classes). --restrict = a JSON list of current-annotation labels
-#    to confine scoring to (e.g. score neuropil only WITHIN the neurons). Writes {out}/_score_profile.json.
-{python} {HELPER} score-profile  --h5ad {h5ad} --out {out} --species {sp} --organ {og} \
-    [--targets '["neuropil","fiber tract"]'] [--restrict '["glutamatergic neuron","GABAergic neuron"]'] \
-    [--cand-pct 10] [--neg-pct 10] [--column cellman_annotation]
-# score-apply — record your REAL verdicts → obs['cellman_process'] (which class per kept vector; '' otherwise).
-{python} {HELPER} score-apply    --h5ad {h5ad} --out {out} --species {sp} --organ {og} \
-    --decisions '{"neuropil": true, "fiber tract": false}'   [--targets …] [--restrict …]
-# score-finalize — subtype each REAL class into its KG typed children (glutamatergic/… neuropil, else bare
-#    class) and write the final labels into obs[--column] (default cellman_annotation) for the process vectors
-#    only, leaving every other vector's label intact.
-{python} {HELPER} score-finalize --h5ad {h5ad} --out {out} --species {sp} --organ {og} [--column cellman_annotation]
 ```
 
 If the server 404s for this module → **stop and tell the caller** (no guessing). Read the ontology from
@@ -516,53 +495,6 @@ a state when its OWN markers win, else the best normal type; never assume normal
 states flagged `hint=true` and sorted first; assign one only when it passes R3 + the specificity gate. Never
 invent a non-ontology label; `open_question_flag=true` if the chosen term is in `oq`.
 
-### Step S — SCORING-BASED annotation (§1b; INTERACTIVE-PHASE ONLY) — apply the positive-candidate / negative-exclude test
-**This is NOT part of standard annotation.** Run it ONLY when, in the interactive phase (§8), the user asks to
-find a **process** (neuropil / fiber tract / … — a KG `tier='process'` term) or explicitly says *"find `<X>`
-**by score**"*. Everything above (Steps 0–5) is clustering-based; a process cannot be found that way (§1b): its
-positive markers are shared with the soma that made the transcripts, so re-clustering the neurons only splits
-them into neuron subtypes. Scoring-based annotation is the answer, and it works on a **vector level with a
-negative axis** the clustering engine does not have.
-
-**The mechanism (engine computes it; you JUDGE REAL).** For each target class the engine derives, from the KG,
-**pos = its `R∪DF`** and **neg = its `N` ∪ all ancestors' `N`** (the generic nucleus axis `MALAT1` sits on the
-process root and every class inherits it; `SOX10`/`OLIG2` = oligo soma for fiber tract). Then per vector:
-- **positive composite** (per-gene z → mean → **re-standardize**) → **candidate = top `cand_pct`% (default 10)**.
-- **negative composite** likewise → **remove candidates whose negative score is top `neg_pct`% (default 10)**.
-- **keep = candidate AND NOT negative.** `--restrict '[…annotation labels…]'` confines scoring to a subset
-  (e.g. score neuropil only WITHIN the neuron labels — percentiles are taken inside that subset).
-
-**How you judge each class REAL (per `{out}/_score_profile.json`):**
-- **`removal.ratio`** (observed removal ÷ chance `neg_pct`): the negative filter removes `neg_pct`% of ANY set
-  by construction, so **chance = 1.0**. **>1** = the candidates really contained somata and the negative axis
-  is doing the separating (fiber tract vs oligodendrocyte typically ≫1 — load-bearing). **≈1** = the filter is
-  uninformative. **<1** = candidates were already soma-depleted, so the positive axis alone sufficed and the
-  negative is merely confirmatory (neuropil typically <1, because its positive top-slice is already the
-  nucleus-poor mesh — this is EXPECTED, not a failure; say so in the rationale).
-- **Anatomy is the real check.** A REAL process is spatially coherent and lands where the tissue actually is
-  (neuropil → cortical mantle / molecular layers; fiber tract → corpus callosum / fimbria). Speckled-everywhere
-  is not real, whatever the ratio.
-- **`pos_missing`/`neg_missing`** = panel gaps, NOT evidence of absence — report, don't conclude.
-- **No force-fit.** A class you don't judge REAL → `false`; those vectors keep their existing celltype.
-
-**Hard-won constraints (violating any silently produces nonsense):**
-- **NEVER k-of-n / AND / OR over markers** — yield is driven by the *gene count* (`0.25^7` vs `0.25^2`), not
-  biology. The engine uses the size-invariant standardized composite; you never threshold marker-by-marker.
-- **NEVER use detection (`>0`).** KDE blur puts every marker in ~100% of vectors — "expressed" separates
-  nothing; only **level** (the composite) does.
-- **Don't expect a generic soma marker to exist.** `MALAT1` works by a *mechanism* (nuclear retention), not a
-  gradient; a class is separable from its cell only when that cell has soma markers of its own (fiber tract has
-  `PLP1`/`SOX10`/`OLIG2`; neuropil has none, so its filter is *expected* to read `ratio<1`).
-
-**Flow (interactive phase, on the finalized h5ad or a gathered subset):** `score-profile` (material) → you judge
-each class REAL/not → `score-apply --decisions '{"neuropil":true,…}'` (writes `obs['cellman_process']`) →
-`score-finalize` (subtypes each REAL class into its KG typed children — `glutamatergic neuropil` … — else the
-bare class, and writes the final labels into `obs[--column]`, default `cellman_annotation`, for the process
-vectors only, leaving every other vector's label intact). Generalized: `--targets` scores **any** KG class the
-user names, not only processes (pos/neg derived the same way) — but scoring a normal celltype forfeits the
-R1–R8 / no-force-fit discipline of clustering-based judgment, so use it only when a process/shared-positive
-target makes clustering unable to separate the identity.
-
 ---
 
 ## 6. The split — MARKER-AXIS recluster (`helper.py subcluster` / `descend`)
@@ -621,7 +553,7 @@ Then: subset X to the axis genes → **centering-free per-gene scaling** (divide
 percentile of its non-zero values — 0-preserving, so rare markers don't sweep no-signal cells) → kNN →
 **Leiden on that axis** → sub-clusters.
 
-> **Precondition:** the input X must be **normalized** (per-cell library-size normalized — SSAM vectors
+> **Precondition:** the input X must be **normalized** (per-cell library-size normalized — KDE vectors
 > already are; per-cell total ≈ constant). The axis does per-gene scaling only, so raw-count input would let
 > sequencing depth drive the clustering.
 
@@ -757,24 +689,22 @@ The caller presents the finalized outcome (English; table + explanation) and off
 user-directed exploration**. This is free-form — the user asks in their own words; you translate it into
 targeted work and answer **honestly** (BIAS GUARD: the data decides, never manufacture a positive
 to satisfy the user; never editorialize the *sample* as normal/diseased from the absence of a state label —
-that is an evidence/coverage outcome, not a determination). **First read the intent to pick the MODE (§1b):** a
-request to **resolve/subdivide a celltype** is clustering-based (`subcluster`/`descend`); a request to **find a
-process, or "find `<X>` by score"** is scoring-based (§5 Step S). Examples:
+that is an evidence/coverage outcome, not a determination). Every refinement here is the **same** method —
+`subcluster` / `descend` + re-judgment by R1–R8. Examples:
 - **"Is there really no <type X>?"** → find the leaf carrying its signal → `subcluster --candidates
   '["<X>","<sibling>"]'` on that leaf → if a sub-leaf is REAL (R3) → label & report; if X's markers are not
   above background anywhere → say so plainly. *(clustering-based)*
 - **"Re-annotate only the astrocytes whose positive markers are ON."** → `subcluster` those paths with the
   astrocyte-subtype candidates → the REAL sub-leaves get the finer label, the rest stay `astrocyte`. *(clustering-based)*
 - **"Split D1 vs D2 MSN in the striatal cluster."** → `subcluster --candidates '["D1-MSN","D2-MSN"]'`. *(clustering-based)*
-- **"Gather the neurons and find the neuropil / fiber tract."** or **"find neuropil by score"** → **scoring-based
-  (§5 Step S):** on the finalized h5ad, `score-profile [--restrict '["…neuron labels…"]']` → judge each class
-  REAL by `removal.ratio` + anatomy → `score-apply --decisions '{"neuropil":true,…}'` → `score-finalize
-  --column cellman_free_annotation`. Do NOT `subcluster` for this — a process will not separate on a marker axis.
+- **"Gather the neurons and find the neuropil / fiber tract."** → **NOT SUPPORTED (§1b).** These are
+  `tier='process'` terms, not celltypes. Report plainly that this version does not annotate tissue processes.
+  Do **NOT** `subcluster` toward them — a process shares its positive markers with the soma that made the
+  transcripts, so a marker axis cannot separate it, and any label you produce would be a force-fit.
 
-Each refinement = a targeted `subcluster`/`descend` (clustering-based) OR `score-profile`→`score-apply`→
-`score-finalize` (scoring-based) + re-judgment (§5) + `finalize`. A finalize/score-finalize AFTER interaction
-writes to `cellman_free_annotation` (`--column cellman_free_annotation`), keeping `cellman_annotation` intact.
-If a requested type is genuinely absent, report that honestly.
+Each refinement = a targeted `subcluster`/`descend` + re-judgment (§5) + `finalize`. A finalize AFTER
+interaction writes to `cellman_free_annotation` (`--column cellman_free_annotation`), keeping
+`cellman_annotation` intact. If a requested type is genuinely absent, report that honestly.
 
 ---
 
@@ -836,8 +766,8 @@ vascular/immune anchor but you labeled parenchymal — re-weigh, glia may be KDE
 }}
 ```
 **Label hygiene (hard):** clean literature name only — no `(n=…)`, `"?"`, `"possible"`, reason text, or `+`.
-Unknown→"Unknown", Background→"Background". Reasoning goes in `rationale`. (Process labels — neuropil /
-fiber tract / … — are written by scoring-based annotation, §5 Step S, NOT through these celltype decisions.)
+Unknown→"Unknown", Background→"Background". Reasoning goes in `rationale`. (**Never emit a `tier='process'`
+term — neuropil / fiber tract / … — as a celltype decision; this version does not annotate processes, §1b.**)
 
 ### 10.2 `{out}/expert_judgment_round{k}.csv`
 `cluster_path,n_cells,decision,label,term_id,subclass_resolved,confidence,reason_code,key_markers,rationale`.

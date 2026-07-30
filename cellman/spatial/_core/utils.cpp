@@ -859,7 +859,7 @@ static PyObject *accumulate_gene(PyObject *self, PyObject *args, PyObject *kwarg
 
     const long long n_spot = PyArray_DIM(arr_indptr, 0) - 1;
     
-    // 정규화 상수: (2*pi*h^2)^(d/2)
+    // normalization constant: (2*pi*h^2)^(d/2)
     const double norm = pow(2.0 * M_PI * (bandwidth * bandwidth), 0.5 * static_cast<double>(dim));
 
     // C-order strides
@@ -869,10 +869,10 @@ static PyObject *accumulate_gene(PyObject *self, PyObject *args, PyObject *kwarg
     const long long sZ = (long long)G;
     const long long sG = 1;
 
-    // 병렬 루프
+    // parallel loop
     #pragma omp parallel for schedule(static) num_threads(ncores)
     for (long long i = 0; i < n_spot; ++i) {
-        // spot i → z 인덱스
+        // spot i -> z index
         int zi = static_cast<int>(floor(p_locz[i] / sampling_distance));
         if (zi < 0 || zi >= Z) continue;
 
@@ -883,19 +883,19 @@ static PyObject *accumulate_gene(PyObject *self, PyObject *args, PyObject *kwarg
             const long long idx = p_indices[p];  // grid index (row in X_)
             const double d = p_dists[p];
 
-            // grid 좌표 → voxel 인덱스
+            // grid coordinate -> voxel index
             int xi = static_cast<int>(floor(px[idx] / sampling_distance));
             int yi = static_cast<int>(floor(py[idx] / sampling_distance));
             if (xi < 0 || xi >= X || yi < 0 || yi >= Y) continue;
 
-            // 가우시안 값
+            // Gaussian value
             const double w = exp(-0.5 * (d / sigma) * (d / sigma)) / norm;
             const float wf = static_cast<float>(w);
 
-            // 선형 오프셋
+            // linear offset
             const long long off = (long long)xi * sX + (long long)yi * sY + (long long)zi * sZ + (long long)gidx * sG;
 
-            // 원자적 누적
+            // atomic accumulation
             #if defined(_OPENMP)
               #pragma omp atomic
             #endif
@@ -930,7 +930,7 @@ static PyObject *accumulate_gene(PyObject *self, PyObject *args, PyObject *kwarg
 //         "gidx", "dim", "ncores", NULL
 //     };
 
-//     // 포맷 문자열 수정: OOOO ddd i i | i  → 공백 없이 "OOOOdddii|i"
+//     // fix the format string: OOOO ddd i i | i  ->  "OOOOdddii|i" without spaces
 //     if (!PyArg_ParseTupleAndKeywords(
 //             args, kwargs, "OOOOdddii|i",
 //             (char**)kwlist,
@@ -941,7 +941,7 @@ static PyObject *accumulate_gene(PyObject *self, PyObject *args, PyObject *kwarg
 //         return NULL;
 //     }
 
-//     // NumPy 배열 래핑
+//     // wrap NumPy arrays
 //     PyArrayObject *arr_vf = (PyArrayObject*)PyArray_FROM_OTF(arg_vf, NPY_FLOAT,  NPY_ARRAY_INOUT_ARRAY);
 //     PyArrayObject *arr_lx = (PyArrayObject*)PyArray_FROM_OTF(arg_lx, NPY_DOUBLE, NPY_ARRAY_IN_ARRAY);
 //     PyArrayObject *arr_ly = (PyArrayObject*)PyArray_FROM_OTF(arg_ly, NPY_DOUBLE, NPY_ARRAY_IN_ARRAY);
@@ -951,7 +951,7 @@ static PyObject *accumulate_gene(PyObject *self, PyObject *args, PyObject *kwarg
 //         return NULL;
 //     }
 
-//     // vf_temp 모양 검사
+//     // check the shape of vf_temp
 //     if (PyArray_NDIM(arr_vf) != 4) {
 //         PyErr_SetString(PyExc_ValueError, "vf_temp must be 4D (X,Y,Z,G)");
 //         Py_DECREF(arr_lx); Py_DECREF(arr_ly); Py_DECREF(arr_lz);
@@ -973,7 +973,7 @@ static PyObject *accumulate_gene(PyObject *self, PyObject *args, PyObject *kwarg
 //         return NULL;
 //     }
 
-//     // 좌표 길이 동일성 체크
+//     // check that the coordinate arrays have equal length
 //     const npy_intp n_locs = PyArray_SIZE(arr_lx);
 //     if (PyArray_SIZE(arr_ly) != n_locs || PyArray_SIZE(arr_lz) != n_locs) {
 //         PyErr_SetString(PyExc_ValueError, "loc_x, loc_y, loc_z must have the same length");
@@ -983,7 +983,7 @@ static PyObject *accumulate_gene(PyObject *self, PyObject *args, PyObject *kwarg
 //         return NULL;
 //     }
 
-//     // dim 검사
+//     // check dim
 //     if (dim != 2 && dim != 3) {
 //         PyErr_SetString(PyExc_ValueError, "dim must be 2 or 3");
 //         Py_DECREF(arr_lx); Py_DECREF(arr_ly); Py_DECREF(arr_lz);
@@ -996,61 +996,61 @@ static PyObject *accumulate_gene(PyObject *self, PyObject *args, PyObject *kwarg
 //     const double *ly = (const double*)PyArray_DATA(arr_ly);
 //     const double *lz = (const double*)PyArray_DATA(arr_lz);
 
-//     // 정규화 계수: (2*pi*h^2)^(d/2)
+//     // normalization factor: (2*pi*h^2)^(d/2)
 //     const double dimd     = (double)dim;
 //     const double norm     = pow(2.0 * M_PI * bandwidth * bandwidth, 0.5 * dimd);  // h in world units
 //     const double inv_norm = 1.0 / norm;
 
-//     // 반경: effective_radius = int(bandwidth * prune_coefficient) [world] → pixel
+//     // radius: effective_radius = int(bandwidth * prune_coefficient) [world] -> pixel
 //     const double Rw = bandwidth * prune_coefficient;                       // world
 //     const npy_intp Rp = (npy_intp)floor(Rw / sampling_distance + 1e-12);   // pixel half-width
 
-//     // 가우시안: exp(-r^2/(2*h^2))
+//     // Gaussian: exp(-r^2/(2*h^2))
 //     const double two_h2 = 2.0 * bandwidth * bandwidth;
 
 //     float *base = (float*)PyArray_DATA(arr_vf);
 
-//     // 선형 오프셋 (C-order: ((x*Y)+y)*Z+z)*G + g)
+//     // linear offset (C-order: ((x*Y)+y)*Z+z)*G + g)
 //     const long long sX = (long long)Y * (long long)Z * (long long)G;
 //     const long long sY = (long long)Z * (long long)G;
 //     const long long sZ = (long long)G;
 //     const long long sG = 1;
 
-//     // 스레드 수 설정(선택)
+//     // set the thread count (optional)
 // #ifdef _OPENMP
 //     if (ncores < 1) ncores = 1;
 //     if (ncores > omp_get_max_threads()) ncores = omp_get_max_threads();
 // #endif
 
-//     // 좌표 병렬 루프
+//     // parallel loop over coordinates
 //     #pragma omp parallel for schedule(dynamic, 16) num_threads(ncores)
 //     for (npy_intp t = 0; t < n_locs; ++t) {
 //         const double xw = lx[t];   // world x
 //         const double yw = ly[t];   // world y
-//         const double zw = (dim == 3 && Z > 1) ? lz[t] : 0.0; // depth==1이면 0으로 고정
+//         const double zw = (dim == 3 && Z > 1) ? lz[t] : 0.0; // pinned to 0 when depth == 1
 
-//         // 중심 픽셀 인덱스(월드→픽셀)
+//         // centre pixel index (world -> pixel)
 //         const npy_intp xc = (npy_intp)floor(xw / sampling_distance);
 //         const npy_intp yc = (npy_intp)floor(yw / sampling_distance);
 //         const npy_intp zc = (npy_intp)floor(zw / sampling_distance);
 
-//         // 윈도우 (클램프)
+//         // window (clamped)
 //         npy_intp x0 = xc - Rp, x1 = xc + Rp + 1;
 //         npy_intp y0 = yc - Rp, y1 = yc + Rp + 1;
 //         if (x0 < 0) x0 = 0; if (y0 < 0) y0 = 0;
 //         if (x1 > X) x1 = X; if (y1 > Y) y1 = Y;
 
 //         if (Z == 1) {
-//             // ===== 2D 누적 =====
+//             // ===== 2D accumulation =====
 //             for (npy_intp xi = x0; xi < x1; ++xi) {
-//                 const double xpw = (double)xi * sampling_distance; // 픽셀센터 world 좌표
+//                 const double xpw = (double)xi * sampling_distance; // world coordinate of the pixel centre
 //                 const double dxw = (xpw - xw);
 //                 const double dxw2 = dxw * dxw;
 //                 for (npy_intp yi = y0; yi < y1; ++yi) {
 //                     const double ypw = (double)yi * sampling_distance;
 //                     const double dyw  = (ypw - yw);
 //                     const double r2   = dxw2 + dyw * dyw;
-//                     if (r2 > Rw*Rw) continue; // 원형 마스크(선택): 사각창 내부에서 원 반경 제한
+//                     if (r2 > Rw*Rw) continue; // optional circular mask: restrict to the circle radius inside the square window
 
 //                     const double w  = exp(-r2 / two_h2) * inv_norm;
 //                     const float  wf = (float)w;
@@ -1065,7 +1065,7 @@ static PyObject *accumulate_gene(PyObject *self, PyObject *args, PyObject *kwarg
 //                 }
 //             }
 //         } else {
-//             // ===== 3D 누적 =====
+//             // ===== 3D accumulation =====
 //             npy_intp z0 = zc - Rp, z1 = zc + Rp + 1;
 //             if (z0 < 0) z0 = 0; if (z1 > Z) z1 = Z;
 
@@ -1100,7 +1100,7 @@ static PyObject *accumulate_gene(PyObject *self, PyObject *args, PyObject *kwarg
 //         }
 //     }
 
-//     // INOUT 배열 writeback
+//     // write back the INOUT array
 //     PyArray_ResolveWritebackIfCopy(arr_vf);
 //     Py_DECREF(arr_vf);
 //     Py_DECREF(arr_lx);
@@ -1120,7 +1120,7 @@ static PyObject *accumulate_gene_vector(PyObject *self, PyObject *args, PyObject
     double sampling_distance, bandwidth, prune_coefficient;
     int gidx, dim;
     int ncores = omp_get_max_threads();
-    /* chunk의 전역 시작 인덱스 (pixel 단위). 기본값 0 → 전체 vf와 동일 */
+    /* global start index of the chunk (in pixels). Default 0 -> same as the full vf */
     int x0_chunk = 0, y0_chunk = 0, z0_chunk = 0;
 
     static const char *kwlist[] = {
@@ -1129,7 +1129,7 @@ static PyObject *accumulate_gene_vector(PyObject *self, PyObject *args, PyObject
         "gidx", "dim", "ncores", "x0", "y0", "z0", NULL
     };
 
-    /* 포맷: 필수 9개 + 옵션 4개 (ncores, x0, y0, z0) */
+    /* format: 9 required + 4 optional (ncores, x0, y0, z0) */
     if (!PyArg_ParseTupleAndKeywords(
             args, kwargs, "OOOOdddii|iiii",
             (char**)kwlist,
@@ -1141,7 +1141,7 @@ static PyObject *accumulate_gene_vector(PyObject *self, PyObject *args, PyObject
         return NULL;
     }
 
-    /* NumPy 배열 래핑 */
+    /* wrap NumPy arrays */
     PyArrayObject *arr_vf = (PyArrayObject*)PyArray_FROM_OTF(arg_vf, NPY_FLOAT,  NPY_ARRAY_INOUT_ARRAY);
     PyArrayObject *arr_lx = (PyArrayObject*)PyArray_FROM_OTF(arg_lx, NPY_DOUBLE, NPY_ARRAY_IN_ARRAY);
     PyArrayObject *arr_ly = (PyArrayObject*)PyArray_FROM_OTF(arg_ly, NPY_DOUBLE, NPY_ARRAY_IN_ARRAY);
@@ -1159,7 +1159,7 @@ static PyObject *accumulate_gene_vector(PyObject *self, PyObject *args, PyObject
         return NULL;
     }
 
-    const npy_intp X = PyArray_DIM(arr_vf, 0);  /* chunk 크기 */
+    const npy_intp X = PyArray_DIM(arr_vf, 0);  /* chunk size */
     const npy_intp Y = PyArray_DIM(arr_vf, 1);
     const npy_intp Z = PyArray_DIM(arr_vf, 2);
     const npy_intp G = PyArray_DIM(arr_vf, 3);
@@ -1203,7 +1203,7 @@ static PyObject *accumulate_gene_vector(PyObject *self, PyObject *args, PyObject
 
     float *base = (float*)PyArray_DATA(arr_vf);
 
-    /* chunk의 전역 범위 (pixel index) */
+    /* global extent of the chunk (pixel index) */
     const npy_intp gx0 = (npy_intp)x0_chunk;
     const npy_intp gy0 = (npy_intp)y0_chunk;
     const npy_intp gz0 = (npy_intp)z0_chunk;
@@ -1227,26 +1227,26 @@ static PyObject *accumulate_gene_vector(PyObject *self, PyObject *args, PyObject
         const double yw = ly[t];
         const double zw = (dim == 3 && Z > 1) ? lz[t] : 0.0;
 
-        /* 전역 픽셀 인덱스 (전체 그리드 기준) */
+        /* global pixel index (relative to the full grid) */
         const npy_intp xc_g = (npy_intp)floor(xw / sampling_distance);
         const npy_intp yc_g = (npy_intp)floor(yw / sampling_distance);
         const npy_intp zc_g = (npy_intp)floor(zw / sampling_distance);
 
-        /* 전역 윈도우 */
+        /* global window */
         npy_intp x0g = xc_g - Rp, x1g = xc_g + Rp + 1;
         npy_intp y0g = yc_g - Rp, y1g = yc_g + Rp + 1;
 
-        /* 이 chunk가 커버하는 전역 범위와의 교집합만 사용 */
+        /* use only the intersection with the global range this chunk covers */
         if (x0g < gx0) x0g = gx0;
         if (y0g < gy0) y0g = gy0;
         if (x1g > gx1) x1g = gx1;
         if (y1g > gy1) y1g = gy1;
         if (x0g >= x1g || y0g >= y1g) {
-            continue;  /* 이 좌표에서 나오는 KDE가 이 chunk에는 기여 없음 */
+            continue;  /* the KDE from this coordinate contributes nothing to this chunk */
         }
 
         if (Z == 1) {
-            /* ===== 2D 누적 (z=0만 존재) ===== */
+            /* ===== 2D accumulation (z=0 only) ===== */
             for (npy_intp xg = x0g; xg < x1g; ++xg) {
                 const double xpw = (double)xg * sampling_distance;
                 const double dxw = (xpw - xw);
@@ -1277,7 +1277,7 @@ static PyObject *accumulate_gene_vector(PyObject *self, PyObject *args, PyObject
                 }
             }
         } else {
-            /* ===== 3D 누적 ===== */
+            /* ===== 3D accumulation ===== */
             npy_intp z0g = zc_g - Rp, z1g = zc_g + Rp + 1;
             if (z0g < gz0) z0g = gz0;
             if (z1g > gz1) z1g = gz1;
@@ -1564,7 +1564,7 @@ fail:
 //         return NULL;
 //     }
 
-//     /* NumPy array로 변환 (float32, C-contiguous 보장) */
+//     /* convert to NumPy arrays (float32, C-contiguous guaranteed) */
 //     PyArrayObject *vf_chunk_arr = (PyArrayObject*)PyArray_FROMANY(
 //         vf_chunk_obj, NPY_FLOAT32, 4, 4, NPY_ARRAY_C_CONTIGUOUS);
 //     PyArrayObject *vf_norm_arr = (PyArrayObject*)PyArray_FROMANY(
@@ -1587,7 +1587,7 @@ fail:
 //     int vz = (int)shape_chunk[2];
 //     int ng = (int)shape_chunk[3];
 
-//     /* 간단한 shape 일치 체크 */
+//     /* simple shape-consistency check */
 //     if (shape_norm[0] != cx || shape_norm[1] != vy || shape_norm[2] != vz) {
 //         Py_DECREF(vf_chunk_arr);
 //         Py_DECREF(vf_norm_arr);
@@ -1597,7 +1597,7 @@ fail:
 
 //     long nvox = (long)cx * (long)vy * (long)vz;
 
-//     /* 1차 패스: nnz 개수 세기 (vf_norm > 0 && vf_chunk != 0) */
+//     /* first pass: count nnz (vf_norm > 0 && vf_chunk != 0) */
 //     long nnz = 0;
 
 //     #pragma omp parallel for reduction(+:nnz) num_threads(ncores)
@@ -1615,7 +1615,7 @@ fail:
 //         }
 //     }
 
-//     /* nnz가 0이면 빈 배열 반환 */
+//     /* return empty arrays when nnz == 0 */
 //     npy_intp shp1[1] = { nnz };
 //     PyArrayObject *x_arr    = reinterpret_cast<PyArrayObject*>(PyArray_SimpleNew(1, shp1, NPY_INT32));
 //     PyArrayObject *y_arr    = reinterpret_cast<PyArrayObject*>(PyArray_SimpleNew(1, shp1, NPY_INT32));
@@ -1631,7 +1631,7 @@ fail:
 
 //     long pos = 0;
 
-//     /* 2차 패스: 실제 값 채우기 */
+//     /* second pass: fill in the values */
 //     #pragma omp parallel for num_threads(ncores) schedule(static)
 //     for (long vidx = 0; vidx < nvox; ++vidx) {
 //         float norm = vf_norm[vidx];
@@ -1669,39 +1669,9 @@ fail:
 //     Py_DECREF(vf_chunk_arr);
 //     Py_DECREF(vf_norm_arr);
 
-//     /* (x, y, z, g, data) 튜플로 반환 */
+//     /* return an (x, y, z, g, data) tuple */
 //     return Py_BuildValue("OOOOO", x_arr, y_arr, z_arr, g_arr, data_arr);
 // }
-
-// /* 모듈 메서드 테이블 */
-// static PyMethodDef ssam_norm_methods[] = {
-//     {
-//         "normalize_vf_sparse",
-//         (PyCFunction)normalize_vf_sparse,
-//         METH_VARARGS | METH_KEYWORDS,
-//         "Normalize vf_chunk by vf_norm and return sparse (x,y,z,g,data)."
-//     },
-//     {NULL, NULL, 0, NULL}
-// };
-
-// /* 모듈 정의 */
-// static struct PyModuleDef ssam_norm_module = {
-//     PyModuleDef_HEAD_INIT,
-//     "ssam_norm",
-//     "Sparse normalization for SSAM",
-//     -1,
-//     ssam_norm_methods
-// };
-
-// /* 모듈 초기화 */
-// PyMODINIT_FUNC
-// PyInit_ssam_norm(void)
-// {
-//     import_array();
-//     return PyModule_Create(&ssam_norm_module);
-// }
-
-
 
 // static PyObject* normalize_vf(
 //     PyObject *self, PyObject *args, PyObject *kwargs)
@@ -2101,7 +2071,7 @@ static struct PyMethodDef module_methods[] = {
 #if PY_MAJOR_VERSION >= 3
 static struct PyModuleDef moduledef_utils = {
         PyModuleDef_HEAD_INIT,
-        "analysis_utils",
+        "cellman.spatial.utils",
         NULL,
         -1,
         module_methods

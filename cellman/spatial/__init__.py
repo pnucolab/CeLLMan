@@ -1,5 +1,5 @@
-from ._analysis import SSAMAnalysis, remove_outliers
-from ._dataset import SSAMDataset
+from ._analysis import Analysis
+from ._dataset import Dataset
 
 from ._griddataset import GridDataset
 from ._panel import select_gene_panel, resolve_server, fetch_ontology_markers

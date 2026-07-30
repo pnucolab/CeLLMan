@@ -48,7 +48,7 @@ Pipeline
    training and apply reuse the projected field.
 4. Train by label switching; init from projected centroids (near the correlation
    solution).
-5. Inductive apply: classify every voxel with ``vf_norm > 0`` (SSAM-faithful);
+5. Inductive apply: classify every voxel with ``vf_norm > 0``;
    the top-class softmax probability goes to ``max_probabilities``. Output zarr
    layout mirrors the correlation path (``celltype_maps`` + a per-voxel score
    volume) so ``filter_celltypemaps`` / ``plot_celltypes_map`` keep working -- the
@@ -62,6 +62,26 @@ import numpy as np
 import torch
 import dask.array as da
 from tqdm.auto import tqdm
+
+
+def _resolve_device(device):
+    """Resolve a requested torch device, falling back to CPU when CUDA is unavailable.
+
+    A ``'cuda'`` request on a machine without CUDA is downgraded to ``'cpu'``; an
+    explicit ``'cpu'`` is honored.
+    """
+    dev = str(device)
+    if dev.startswith("cuda") and not torch.cuda.is_available():
+        print("[tsvm] CUDA unavailable; running on device='cpu' (much slower — "
+              "consider map_celltypes(method='corr', force_cpu=True) for CPU).")
+        return "cpu"
+    return dev
+
+
+def _empty_cache(device):
+    """``torch.cuda.empty_cache()`` only on a CUDA device (a no-op on CPU)."""
+    if str(device).startswith("cuda"):
+        torch.cuda.empty_cache()
 
 
 def _row_normalize(Xt):
@@ -99,7 +119,7 @@ def fit_pca(X, n_components=50, device="cuda", seed=0):
     sign = torch.sign(comps[torch.arange(comps.shape[0]), comps.abs().argmax(dim=1)])
     comps = comps * sign.unsqueeze(1)
     del Xt, Xc
-    torch.cuda.empty_cache()
+    _empty_cache(device)
     return mean, comps
 
 
@@ -191,7 +211,7 @@ def sample_unlabeled_field(ds, mean, comps, *, vf_norm_threshold,
         Z_chunks.append(Z)
         n_have += Z.shape[0]
         del block, gb, sm
-        torch.cuda.empty_cache()
+        _empty_cache(device)
         pbar.set_postfix(have=n_have)
         if n_have >= n_target:
             break
@@ -356,7 +376,10 @@ def _train_labelswitch(Zl_r, yl, k, Zu_pca, omega, beta, *, W_init=None, lam=1e-
         (_hinge(Zl_r, yl) + 0.5 * lam * (W * W).sum()).backward()
         opt.step()
 
-    S = torch.empty(n_u, k, device=device, dtype=torch.float16)
+    # fp16 halves the (n_u, k) score buffer on GPU; CPU fp16 is unsupported for many
+    # ops and yields no memory win, so the CPU path uses fp32.
+    score_dtype = torch.float16 if str(device).startswith("cuda") else torch.float32
+    S = torch.empty(n_u, k, device=device, dtype=score_dtype)
     _field_scores_into(Zu_pca, omega, beta, W.detach(), b.detach(), S)
     ytil, _ = _balanced_assign(S.float(), prior, iters=assign_iters)
 
@@ -385,7 +408,7 @@ def _train_labelswitch(Zl_r, yl, k, Zu_pca, omega, beta, *, W_init=None, lam=1e-
             if switched < switch_tol:
                 break
     del S
-    torch.cuda.empty_cache()
+    _empty_cache(device)
     return W.detach(), b.detach()
 
 
@@ -410,7 +433,7 @@ def fit_celltype_tsvm(ds, *, n_components=50, n_unlabeled=200_000,
                       abstain_q=0.0, chunk_h=128,
                       kernel="rbf", rff_dim=1024, gamma=None, rff_seed=0,
                       algo="labelswitch", Cu=1.0, switch_rounds=4, ls_inner=40,
-                      train_floor="principled"):
+                      train_floor="principled", max_fit_cells=200_000):
     """Fit PCA + multiclass TSVM from the store's labeled vectors and field pool.
 
     Returns a model dict and caches it on ``ds._tsvm_model``.
@@ -435,7 +458,7 @@ def fit_celltype_tsvm(ds, *, n_components=50, n_unlabeled=200_000,
 
     :param ds: Dataset/store exposing ``zarr_group`` with labeled vectors, cluster
         labels, centroids and the field; the fitted model is cached on ``ds._tsvm_model``.
-    :type ds: SSAMDataset
+    :type ds: Dataset
     :param n_components: PCA latent dim (default 50). ``None`` selects full-gene mode:
         no PCA, a linear classifier on the row-normalized full-gene vectors
         (``kernel='rbf'`` is not supported there). PCA-50 + linear caps training fidelity
@@ -508,7 +531,15 @@ def fit_celltype_tsvm(ds, *, n_components=50, n_unlabeled=200_000,
     :param train_floor: vf_norm floor for the TRAINING unlabeled set: ``'principled'``,
         ``'store'`` or a float (see above).
     :type train_floor: str or float
+    :param max_fit_cells: Cap on labeled vectors used for FITTING (PCA basis + margin
+        training); a per-class stratified, seeded subsample is taken above this. The whole
+        labeled matrix is put on the GPU and row-normalized (several transient copies), so a
+        large store (e.g. 650k x 5k genes) OOMs here before the field is touched. centroids /
+        cluster_labels are unaffected (computed from all vectors), so the map is unchanged in
+        expectation. ``None`` uses every labeled vector.
+    :type max_fit_cells: int or None
     """
+    device = _resolve_device(device)
     kernel = str(kernel).lower()
     if kernel not in ("linear", "rbf"):
         raise ValueError("kernel must be 'rbf' or 'linear'")
@@ -525,6 +556,26 @@ def fit_celltype_tsvm(ds, *, n_components=50, n_unlabeled=200_000,
     if not keep.all():
         X, y = X[keep], np.asarray(y)[keep]
         print(f"[fit] dropped {int((~keep).sum())} unlabeled (-1) vectors")
+
+    # Cap the labeled set used for FITTING (PCA basis + margin training). The whole
+    # labeled matrix is put on the GPU and row-normalized (3 transient copies in
+    # fit_pca / project); for large stores (e.g. 650k x 5k = ~13 GB each) that alone
+    # OOMs before the field is ever touched. The classifier does not need every
+    # vector — a per-class stratified subsample gives the same basis/margin. centroids
+    # / cluster_labels stay computed from ALL vectors (in the store), so the map is
+    # unaffected. Deterministic (seeded).
+    if max_fit_cells is not None and len(y) > max_fit_cells:
+        rng = np.random.default_rng(seed)
+        take = []
+        for c in np.unique(y):
+            ci = np.flatnonzero(y == c)
+            n_c = max(1, int(round(len(ci) * max_fit_cells / len(y))))
+            take.append(rng.choice(ci, min(n_c, len(ci)), replace=False))
+        sub = np.sort(np.concatenate(take))
+        print(f"[fit] subsampled labeled {len(y)} -> {len(sub)} for fitting "
+              f"(max_fit_cells={max_fit_cells}; stratified, seeded)")
+        X, y = X[sub], y[sub]
+
     k = int(zg["centroids"].shape[0])
     if vf_norm_threshold is None:
         vf_norm_threshold = float(zg.attrs.get("select_vf_norm_threshold",
@@ -590,7 +641,7 @@ def fit_celltype_tsvm(ds, *, n_components=50, n_unlabeled=200_000,
     Zu = None
     if use_unlabeled:
         build_field_pca_cache(ds, dict(mean=mean, comps=comps), chunk_h=chunk_h, device=device)
-        torch.cuda.empty_cache()
+        _empty_cache(device)
         if algo == "labelswitch":
             Zu = load_unlabeled_from_cache(ds, vf_norm_threshold=floor, device=device)
             print(f"[fit] transductive pool = FULL field {tuple(Zu.shape)} "
@@ -707,7 +758,7 @@ def build_field_pca_cache(ds, model=None, *, key="tsvm_field_pca",
         Zc = Z.T.reshape(d, h, n_C).contiguous().cpu().numpy()
         cache[:, r0:r1, :] = Zc
         del block, gb, Z, Zc
-        torch.cuda.empty_cache()
+        _empty_cache(device)
     zg.attrs[f"{key}_fp"] = fp
     print(f"[cache] wrote {key} {(d, n_R, n_C)} fp={fp}")
     return fp
@@ -760,7 +811,7 @@ def map_celltypes_tsvm(ds, model=None, *, tau_conf=None, chunk_h=128, device="cu
 
     :param ds: Dataset/store whose ``zarr_group`` holds the field; results are written
         back into it (and onto ``ds`` when ``set_ds_attrs``).
-    :type ds: SSAMDataset
+    :type ds: Dataset
     :param model: Fitted model dict from :func:`fit_celltype_tsvm`; ``None`` uses the one
         cached on ``ds._tsvm_model``.
     :type model: dict or None
@@ -787,6 +838,7 @@ def map_celltypes_tsvm(ds, model=None, *, tau_conf=None, chunk_h=128, device="cu
     :param tau: Deprecated alias, ignored.
     :type tau: float or None
     """
+    device = _resolve_device(device)
     if model is None:
         model = getattr(ds, "_tsvm_model", None)
         if model is None:
@@ -877,7 +929,7 @@ def map_celltypes_tsvm(ds, model=None, *, tau_conf=None, chunk_h=128, device="cu
                 m_sub = M[r0:r1, c0:c1]; m_sub[sub] = bn[sub]; M[r0:r1, c0:c1] = m_sub
                 g_sub = Mg[r0:r1, c0:c1]; g_sub[sub] = cn[sub]; Mg[r0:r1, c0:c1] = g_sub
                 del block, gb, S, p, conf, best
-            torch.cuda.empty_cache()
+            _empty_cache(device)
         if tau_conf is not None:
             tc = float(tau_conf)
         else:
@@ -902,7 +954,7 @@ def map_celltypes_tsvm(ds, model=None, *, tau_conf=None, chunk_h=128, device="cu
             M[off:off + Z.shape[0]] = bi.to(torch.int32).cpu().numpy()
             Mg[off:off + Z.shape[0]] = c.cpu().numpy().astype(np.float32)
             del Zc, Z, p, c, bi
-            torch.cuda.empty_cache()
+            _empty_cache(device)
         M = M.reshape(n_R, n_C); Mg = Mg.reshape(n_R, n_C)
         sig = norm > thr
         M[~sig] = -1; Mg[~sig] = -1.0
@@ -942,7 +994,7 @@ def map_celltypes_tsvm(ds, model=None, *, tau_conf=None, chunk_h=128, device="cu
             g_flat[pos] = conf.cpu().numpy().astype(np.float32)
             M[r0:r1] = m_flat.reshape(h, n_C); Mg[r0:r1] = g_flat.reshape(h, n_C)
             del block, gb, sm, Z, p, conf, best
-            torch.cuda.empty_cache()
+            _empty_cache(device)
 
     n_assigned = int((M >= 0).sum())
     print(f"[map] assigned {n_assigned} voxels (tau_conf={tc:.3f})")
@@ -991,7 +1043,7 @@ def map_tsvm(analysis, *, n_components=50, device="cuda", overwrite=True,
     ``fit_kwargs={'kernel': 'linear'}`` with it.
 
     :param analysis: Analysis object exposing ``dataset`` (the store fit and mapped here).
-    :type analysis: SSAMAnalysis
+    :type analysis: Analysis
     :param n_components: PCA latent dim passed to :func:`fit_celltype_tsvm`; ``None``
         selects full-gene (linear) mode. May also be supplied inside ``fit_kwargs``.
     :type n_components: int or None
@@ -1005,6 +1057,7 @@ def map_tsvm(analysis, *, n_components=50, device="cuda", overwrite=True,
     :type apply_kwargs: dict or None
     """
     ds = analysis.dataset
+    device = _resolve_device(device)
     if "vf_normalized" in ds.zarr_group and ds.zarr_group["vf_normalized"].ndim != 3:
         raise NotImplementedError(
             "map_tsvm supports the 3D count vector field only; the stored field is "

@@ -1,6 +1,6 @@
 project('cellman', 'cpp',
   version: '0.1.0',
-  license: 'AGPL-3.0-or-later',
+  license: 'BSD-3-Clause',
   meson_version: '>= 0.64.0',
   default_options: [
     'buildtype=release',
@@ -45,7 +45,7 @@ if get_option('debug-symbols')
   cpp_args += ['-g']
 endif
 
-# C++ extension module (compiled from c/utils.cpp; installed as unnamed.utils)
+# C++ extension module (compiled from cellman/spatial/_core/utils.cpp; installed as cellman.spatial.utils)
 utils_ext = py.extension_module('utils',
   sources: ['cellman/spatial/_core/utils.cpp'],
   include_directories: [
@@ -74,6 +74,7 @@ py.install_sources([
   'cellman/spatial/_panel.py',
   'cellman/spatial/_count.py',
   'cellman/spatial/_tsvm.py',
+  'cellman/spatial/_mapping_inputs.py',
 ], subdir: 'cellman/spatial')
 
 # count-based loaders subpackage

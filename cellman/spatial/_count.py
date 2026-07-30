@@ -2,13 +2,13 @@
 
 For count platforms the KDE-equivalent vector field is built by **rasterizing bin
 counts onto a grid and GPU Gaussian-blurring** it (:func:`compute_vf_blur`),
-persisting only ``vf_normalized`` + ``vf_norm`` to the SSAM zarr store. Voxels are
+persisting only ``vf_normalized`` + ``vf_norm`` to the zarr store. Voxels are
 then sampled from the tissue image and *looked up* in that field
 (:func:`select_vectors_from_image`) — the count analogue of the transcript path's
 KDE-at-sampled-points. Cluster centroids are mapped over the field by correlation
 (:func:`map_corr`); the TSVM mapper lives in :mod:`cellman.spatial._tsvm`.
 
-All functions take the ``SSAMAnalysis`` instance so they can read/write
+All functions take the ``Analysis`` instance so they can read/write
 ``analysis.dataset.zarr_group`` and honour ``analysis.verbose``.
 """
 
@@ -165,8 +165,8 @@ def compute_vf_blur(analysis, bin_adata, *, sigma_bin: float = 1.0,
     alignment (no read-modify-write on interior writes) ``chunk_h`` and ``chunk_w``
     should be integer multiples of the store tile (the defaults 64/512 vs 32 are).
 
-    :param analysis: the ``SSAMAnalysis`` instance (provides ``dataset`` and ``verbose``).
-    :type analysis: SSAMAnalysis
+    :param analysis: the ``Analysis`` instance (provides ``dataset`` and ``verbose``).
+    :type analysis: Analysis
     :param bin_adata: bin-count AnnData with ``obs['array_row']`` / ``obs['array_col']``.
     :type bin_adata: AnnData
     :param sigma_bin: Gaussian sigma in raster bins.
@@ -347,8 +347,8 @@ def select_vectors_from_image(analysis, grid, *, bin_size_um: float,
     Pixels are mapped to world µm via ``grid.affine_px_to_um`` (folds each
     platform's transpose/flip), then to grid bins via ``grid.origin`` + ``bin_size_um``.
 
-    :param analysis: the ``SSAMAnalysis`` instance (provides ``dataset`` and ``verbose``).
-    :type analysis: SSAMAnalysis
+    :param analysis: the ``Analysis`` instance (provides ``dataset`` and ``verbose``).
+    :type analysis: Analysis
     :param grid: raster/image grid with ``image``, ``origin``, ``um_per_px``, ``affine_px_to_um``, ``he_revert``.
     :type grid: object
     :param bin_size_um: grid bin spacing in microns.
@@ -528,8 +528,8 @@ def map_corr(analysis, centroids=None, *, vf_norm_threshold=None, chunk_h=128,
     voxel and each centroid, assigns the max-correlation cluster. Output layout
     matches the transcript KDE path so downstream filter/plot work unchanged.
 
-    :param analysis: the ``SSAMAnalysis`` instance (provides ``dataset`` and ``verbose``).
-    :type analysis: SSAMAnalysis
+    :param analysis: the ``Analysis`` instance (provides ``dataset`` and ``verbose``).
+    :type analysis: Analysis
     :param centroids: cluster centroids ``(k, n_G)``; read from the zarr group when ``None``.
     :type centroids: numpy.ndarray or None
     :param vf_norm_threshold: minimum ``vf_norm`` for a voxel to be mapped; auto-derived when ``None``.
@@ -551,7 +551,7 @@ def map_corr(analysis, centroids=None, *, vf_norm_threshold=None, chunk_h=128,
 
     if centroids is None:
         if "centroids" not in zg:
-            raise ValueError("centroids missing — run cluster_vectors first.")
+            raise ValueError("centroids missing — pass h5ad=<annotated .h5ad> to map_celltypes to build them.")
         centroids = zg["centroids"][:]
     centroids = np.asarray(centroids, dtype=np.float32)
     if centroids.shape[1] != n_G:

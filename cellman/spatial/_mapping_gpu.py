@@ -1,7 +1,7 @@
-"""GPU helpers for ``SSAMAnalysis.map_celltypes_gpu``.
+"""GPU helpers for ``Analysis.map_celltypes_gpu``.
 
 Reuses the Triton KDE kernel + cell-list builders from
-``ssam._kde_gpu`` and adds:
+``cellman.spatial._kde_gpu`` and adds:
 
 * ``_kde_setup_celllist``  — build the cell-list once per outer chunk.
 * ``_kde_run_subchunk``    — run KDE for one sub-chunk of query points

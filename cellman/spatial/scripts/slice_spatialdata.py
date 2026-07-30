@@ -51,7 +51,7 @@ def parse_args():
         help='Staining / morphology image key to keep (e.g. H&E or polyT). '
              'If set, all other image elements are dropped from each tile. '
              'Useful when only the staining image is needed downstream '
-             '(e.g. ssam.downsample_vector).',
+             '(e.g. Analysis.downsample_vector).',
     )
     p.add_argument(
         '--keep-points', nargs='*', default=None,
@@ -188,7 +188,7 @@ def slim_cropped(cropped, image_key=None, keep_points=None,
 
     Used to reduce per-tile zarr footprint when the downstream consumer
     only needs a subset of elements (e.g. images[image_key] + points for
-    ssam.downsample_vector).
+    Analysis.downsample_vector).
     """
     if drop_labels:
         for k in list(cropped.labels.keys()):

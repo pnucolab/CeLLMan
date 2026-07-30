@@ -5,7 +5,7 @@ Subpackages
 -----------
 spatial
     Segmentation-free, multi-platform spatial cell-type mapping workflow
-    (``import cellman.spatial as cms``). SSAM-derived KDE vector field.
+    (``import cellman.spatial as cms``). KDE vector field.
 
 The agentic annotation step (LLM + ontology server) ships as a skill bundle
 under ``Agentic-Annotation/`` and is driven by your own LLM host, not imported

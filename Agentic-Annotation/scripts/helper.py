@@ -2,16 +2,17 @@
 # NOTE: helper.py is a STANDALONE build — the helper.py engine is INLINED below,
 #       plus the annotate-mode marker-axis split (subcluster/descend). Do NOT edit
 #       helper.py expecting changes here; regenerate via scratchpad/build_helper.py.
-"""UNNAMED annotate helper — in-memory recursive subclustering + ontology-aware profiling.
+"""CeLLMan annotate helper — in-memory recursive subclustering + ontology-aware profiling.
 
-cellularspace `_annotate_helper.py`를 계승하되 UNNAMED 변경 반영:
-  - cluster 컬럼 인자화 (--cluster-col; leiden 하드코딩 제거)
-  - ontology = **서버 slim-index fetch** (init에서 1회) + `--ontology` 로컬 폴백
-  - subcluster 백엔드 **자동 분기**: GPU+rapids_singlecell → rapids, 아니면 scanpy
-  - profile `bg` → **identity_evidence**(vf_norm 밀도 + 정체 신호) ; up/dn 무제한, hp=50
-  - 출력 = **{input}_annotated.h5ad** (입력 전체 복사 + obs['cellman_annotation'](표준) / obs['cellman_free_annotation'](사용자 상호작용)만 추가)
+Design notes:
+  - the cluster column is a parameter (--cluster-col; no hardcoded `leiden`)
+  - ontology = **slim-index fetched from the server** (once, at init) + `--ontology` local fallback
+  - subcluster backend is chosen **automatically**: GPU + rapids_singlecell -> rapids, else scanpy
+  - profile `bg` -> **identity_evidence** (vf_norm density + identity signal); up/dn unbounded, hp=50
+  - output = **{input}_annotated.h5ad** (full copy of the input plus only obs['cellman_annotation']
+    (standard) / obs['cellman_free_annotation'] (user interaction))
 
-서브커맨드:
+Subcommands:
   init       --h5ad --cluster-col --out [--ontology-url | --ontology] [--use-rep X_scVI|auto|recompute]
   subcluster --out --paths '["4","11"]' --resolution 0.2 [--gpu 0] [--ontology ...]
   finalize   --out --decisions <json> [--output <path>]
@@ -23,29 +24,31 @@ from scipy.stats import rankdata
 from scipy.sparse import csr_matrix
 
 # ===================================================================== ontology
-# 우리가 배포하는 단일 Cell-Ontology 서버(공개, 읽기 전용). 사용자는 보통 아무것도 안 줘도 여기로 자동 연결된다.
-# 우선순위: --server-url 플래그 > 환경변수 CELLONTO_SERVER_URL > 이 기본값.
-# 내부(랩) 개발자는 CELLONTO_SERVER_URL로 사설 주소(예: http://192.168.101.31:8088)를 덮어쓴다.
+# The single Cell-Ontology server we publish (public, read-only). Users normally need to pass nothing
+# and are connected here automatically.
+# Precedence: --server-url flag > CELLONTO_SERVER_URL env var > this default.
+# If you run your own server, point CELLONTO_SERVER_URL at it.
 DEFAULT_ONTOLOGY_SERVER = "https://cellman.pnucolab.com"
 def _resolve_server(server_url=None):
     return (server_url or os.environ.get("CELLONTO_SERVER_URL") or DEFAULT_ONTOLOGY_SERVER).rstrip("/")
 
 def _dedup_parents(idx):
-    """KG 빌드 결함 방어 (2026-06-17): term의 P(부모 리스트)에 같은 부모가 중복 등장하는 경우가 있다
-    (관측: mouse_whole_brain 28/373 term이 P=['X','X']). children-index/subtype_groups가 `for p in P`를
-    dedup 없이 돌아 같은 자식을 두 번 세어 → 자식이 1종뿐인데 허위 '≥2 형제' subtype_group이 성립하고
-    children_resolvable에도 중복이 생긴다(허위 분할 신호). 인덱스를 얻는 모든 지점에서 순서 보존 dedup으로
-    모든 소비처(subtype_groups·_candidate_subtypes·_graph_evidence·_build_ident_maps)를 한 번에 정상화."""
+    """Guard against a KG build defect (2026-06-17): a term's P (parent list) can contain the same
+    parent twice (observed: 28/373 terms in mouse_whole_brain had P=['X','X']). The children index and
+    subtype_groups iterate `for p in P` without dedup, so the same child is counted twice -> a term with a
+    single child yields a bogus '>=2 siblings' subtype_group, and children_resolvable picks up duplicates
+    too (a false split signal). Order-preserving dedup at every point where the index is built fixes all
+    consumers at once (subtype_groups, _candidate_subtypes, _graph_evidence, _build_ident_maps)."""
     if idx and isinstance(idx.get("terms"), dict):
         for t in idx["terms"].values():
             P = t.get("P")
             if P and len(P) != len(dict.fromkeys(P)):
-                t["P"] = list(dict.fromkeys(P))      # 순서 보존 dedup
+                t["P"] = list(dict.fromkeys(P))
     return idx
 
 def _fetch_slim_index(out, ontology_url=None, ontology_file=None):
-    """slim-index를 확보해 {out}/_ontology_index.json 으로 저장.
-    우선순위: 서버 fetch(ontology_url) > 로컬 파일(ontology_file) > 이미 있는 파일."""
+    """Obtain the slim-index and store it at {out}/_ontology_index.json.
+    Precedence: server fetch (ontology_url) > local file (ontology_file) > a file that already exists."""
     dst = os.path.join(out, "_ontology_index.json")
     if ontology_url:
         import urllib.request, urllib.error
@@ -54,27 +57,26 @@ def _fetch_slim_index(out, ontology_url=None, ontology_file=None):
                 idx = json.loads(r.read().decode())
         except urllib.error.HTTPError as e:
             if e.code == 404:
-                sys.exit(f"[init][ERROR:MODULE_NOT_FOUND] 서버에 해당 module이 없습니다 ({ontology_url}, HTTP 404). "
-                         f"(species, organ)을 확인하거나 그 module의 빌드를 요청하세요. → caller는 사용자에게 "
-                         f"'요청한 조직(species/organ)의 온톨로지가 서버에 없어 annotation을 진행할 수 없습니다'라고 알릴 것.")
-            sys.exit(f"[init][ERROR:SERVER_HTTP_{e.code}] 온톨로지 서버가 오류 {e.code}를 반환했습니다 ({ontology_url}).")
+                sys.exit(f"[init][ERROR:MODULE_NOT_FOUND] the server has no such module ({ontology_url}, HTTP 404). "
+                         f"Check (species, organ) or request a build of that module. -> the caller should tell the user "
+                         f"'the ontology for the requested tissue (species/organ) is not on the server, so annotation cannot proceed'.")
+            sys.exit(f"[init][ERROR:SERVER_HTTP_{e.code}] the ontology server returned error {e.code} ({ontology_url}).")
         except urllib.error.URLError as e:
-            sys.exit(f"[init][ERROR:SERVER_UNREACHABLE] 온톨로지 서버에 연결할 수 없습니다 ({ontology_url}; {e.reason}). "
-                     f"서버 기동 여부와 CELLONTO_SERVER_URL을 확인하세요. → caller는 사용자에게 "
-                     f"'온톨로지 서버에 연결할 수 없습니다(서버 다운 또는 주소 오류)'라고 알릴 것.")
+            sys.exit(f"[init][ERROR:SERVER_UNREACHABLE] cannot reach the ontology server ({ontology_url}; {e.reason}). "
+                     f"Check that the server is running and verify CELLONTO_SERVER_URL. -> the caller should tell the user "
+                     f"'the ontology server is unreachable (server down or wrong address)'.")
         if not idx or not idx.get("terms"):
-            sys.exit(f"[init][ERROR:MODULE_EMPTY] module은 응답했으나 term이 비어 있습니다 ({ontology_url}). "
-                     f"그 module의 빌드가 필요합니다. → caller는 사용자에게 '해당 조직의 온톨로지가 비어 있어 진행 불가'라고 알릴 것.")
-        idx = _dedup_parents(idx)                       # P 중복 부모 정리(허위 형제 그룹 방지)
+            sys.exit(f"[init][ERROR:MODULE_EMPTY] the module responded but contains no terms ({ontology_url}). "
+                     f"That module needs to be built. -> the caller should tell the user 'the ontology for this tissue is empty, so we cannot proceed'.")
+        idx = _dedup_parents(idx)                       # dedup duplicate parents in P (prevents bogus sibling groups)
         with open(dst, "w") as f: json.dump(idx, f, separators=(",", ":"))
         print(f"[ontology] fetched slim-index from server -> {dst} ({len(idx.get('terms',{}))} terms)", flush=True)
         return idx
     if ontology_file and os.path.exists(ontology_file):
-        # celltypes.json(원형) 또는 slim-index 둘 다 허용
         raw = json.load(open(ontology_file))
         if "terms" in raw and isinstance(raw["terms"], dict):
-            idx = raw                                   # 이미 slim-index
-        else:                                            # celltypes.json → slim 변환
+            idx = raw
+        else:
             idx = {"terms": {}, "cp": [], "oq": []}
             for t in raw.get("terms", []):
                 m = t.get("markers", {})
@@ -82,9 +84,9 @@ def _fetch_slim_index(out, ontology_url=None, ontology_file=None):
                     "P": t.get("is_a", []), "R": list(m.get("required", [])),
                     "S": list(m.get("supporting", []))[:6], "N": list(m.get("negative", []))[:4],
                     "D": t.get("disease_context","normal"),
-                    "A": list(t.get("anchor", []) or []),          # identity-anchor (origin 잔존) 마커
-                    "MP": list(t.get("mimics", []) or [])}         # mimics[{lineage,program}] (흉내 대상)
-        idx = _dedup_parents(idx)                       # P 중복 부모 정리(허위 형제 그룹 방지)
+                    "A": list(t.get("anchor", []) or []),
+                    "MP": list(t.get("mimics", []) or [])}
+        idx = _dedup_parents(idx)                       # dedup duplicate parents in P (prevents bogus sibling groups)
         with open(dst, "w") as f: json.dump(idx, f, separators=(",", ":"))
         print(f"[ontology] loaded slim-index from {ontology_file} -> {dst}", flush=True)
         return idx
@@ -105,7 +107,7 @@ def _ontology_gene_set(idx):
 def _ontology_protected(idx):
     s = set()
     for t in (idx or {}).get("terms", {}).values():
-        for k in ("R","S","DF"): s.update(t.get(k, []) or [])  # negative는 보호 안 함
+        for k in ("R","S","DF"): s.update(t.get(k, []) or [])
     return s
 
 def _ontology_hits(genes, idx):
@@ -122,20 +124,21 @@ def _ontology_hits(genes, idx):
     return out
 
 # ---------- gene-panel denylist + KG inclusion (mirror cellman.spatial._panel.select_gene_panel) ----------
-# HVG feeding PCA는 (1) technical gene을 빼고 (2) KG에 있고 데이터에도 있는데 HVG가 놓친 마커를 도로 넣는다.
+# The HVG set feeding PCA (1) drops technical genes and (2) puts back markers that are in the KG and in
+# the data but that HVG selection missed.
 _PANEL_DENY_MOUSE=("mt-","Rps","Rpl","Hba","Hbb")
 _PANEL_DENY_HUMAN=("MT-","RPS","RPL","MRPL","MRPS","HBA","HBB")
 _PANEL_DENY_HUMAN_RE=re.compile(r"^(ENSG|LINC|MIR|SNOR)|(-AS\d*$)|(-DT$)|(-IT\d*$)|(-OT\d*$)"
                                 r"|(^RP\d+-)|(^A[CLP]\d{6})|(^Z\d{5})|(\.\d+$)")
 def _panel_denier(species):
-    """technical/low-info gene predicate (g->bool). species 미지정이면 mouse 기본."""
+    """technical/low-info gene predicate (g->bool). Defaults to mouse when species is unset."""
     sp=(species or "").lower()
     if sp.startswith("human") or sp in ("hs","homo_sapiens"):
         return lambda g: g.startswith(_PANEL_DENY_HUMAN) or g=="MALAT1" or bool(_PANEL_DENY_HUMAN_RE.search(g))
     return lambda g: g.startswith(_PANEL_DENY_MOUSE) or bool(re.match(r"Gm\d",g)) or g.endswith("Rik")
 
 def _panel_clean(g):
-    """marker 심볼을 var_names에 맞게 정규화(-/_ suffix 제거) — _panel._clean과 동일."""
+    """Normalize a marker symbol to match var_names (strip -/_ suffixes) — same as _panel._clean."""
     return str(g).split("-")[0].split("_")[0]
 
 
@@ -155,13 +158,12 @@ def _data_driven_hk(cmeans, max_auc, genes, mean_pct=75, max_cv=0.2, max_auc_t=0
     return set(genes[i] for i in np.where(mask)[0])
 
 # ===================================================================== ontology-derived domain context
-# 과거의 뇌-하드코딩(_LINEAGE/_LAYER/_SPECIFIC/_PAN)을 폐기하고, lineage/specific/pan/sibling을
-# 그 module의 온톨로지(slim-index)에서 유도한다. 유도 불가(계층/마커 빈약) 시에만 아래 cross-organ
-# fallback을 쓴다. → 어떤 organ에도 일반화.
+# lineage / specific / pan / sibling are derived from that module's ontology (slim-index), never from
+# hardcoded per-organ tables. The cross-organ fallback below is used only when derivation is impossible
+# (a hierarchy or marker set too sparse). This generalizes to any organ.
 _BG_MAX_N=500; MIN_N_OUT=20
 def _U(s): return str(s).upper()
 
-# cross-organ fallback(온톨로지 유도가 비었을 때만): 흔한 broad lineage 마커.
 _LINEAGE_FALLBACK={
     "oligodendrocyte":{"MBP","PLP1","MOG","MOBP","MAL","MAG","CNP","CLDN11"},
     "astrocyte":{"SLC1A2","AQP4","GFAP","SLC1A3","MLC1"},
@@ -177,12 +179,14 @@ _SPECIFIC_FALLBACK={"PMCH","HCRT","AVP","OXT","TTR","TH","TPH2","CHAT","PVALB","
 _PAN_FALLBACK={"SLC17A7","SLC17A6","SLC17A8","GAD1","GAD2","SLC32A1","SNAP25","SYT1"}
 
 def _derive_lineages(idx):
-    """lineage = 계층의 root(부모 없음) 노드. lineage 마커 = 그 root 노드 **자신의** required 만
-    (canonical pan-LINEAGE transmitter: glut→Slc17a7/6/8, GABA→Gad1/2·Slc32a1, DA→Th/Ddc/Slc6a3 …).
-    ★ root∪후손을 쓸어담지 않는다(2026-06-13): 쓸어담으면 후손에 붙은 pan-NEURONAL(Camk2a)·subtype
-    마커까지 lineage 집합에 섞여 'which lineage'가 아닌 'neuron'을 가리키게 됨 — cluster 38이 Slc17a7=0
-    인데도 Camk2a로 glut 오판된 원인. root-own-R 로 좁히면 transmitter만 남아 lineage 판정이 깨끗해진다.
-    계층이 없으면 {} 반환(→ fallback). {lineage_label: {MARKER_UPPER}}."""
+    """lineage = a root node of the hierarchy (no parent). lineage markers = only that root node's **own**
+    required set (canonical pan-LINEAGE transmitters: glut->Slc17a7/6/8, GABA->Gad1/2 & Slc32a1,
+    DA->Th/Ddc/Slc6a3 ...).
+    ★ Do NOT sweep up root + descendants (2026-06-13): sweeping mixes pan-NEURONAL (Camk2a) and subtype
+    markers attached to descendants into the lineage set, so it points at 'neuron' rather than at 'which
+    lineage' — that is why cluster 38 was called glut via Camk2a despite Slc17a7=0. Narrowing to the
+    root's own R leaves only transmitters and keeps the lineage call clean.
+    Returns {} when there is no hierarchy (-> fallback). {lineage_label: {MARKER_UPPER}}."""
     terms=(idx or {}).get("terms",{})
     if not terms or not any(t.get("P") for t in terms.values()): return {}
     def roots_of(tid):
@@ -203,7 +207,8 @@ def _derive_lineages(idx):
     return lin if len(lin)>=2 else {}
 
 def _derive_specific(idx):
-    """≤2개 term에만 required인 마커(=고특이 식별자) ∪ DF(defining). 빈약하면 {}."""
+    """Markers that are required by <=2 terms (= highly specific identifiers) union DF (defining).
+    Returns {} when too sparse."""
     terms=(idx or {}).get("terms",{}); cnt={}; spec=set()
     for t in terms.values():
         for m in (t.get("R") or []): cnt[m.upper()]=cnt.get(m.upper(),0)+1
@@ -212,7 +217,8 @@ def _derive_specific(idx):
     return spec
 
 def _derive_pan(idx, min_terms=4):
-    """많은 term이 공유하는 R/S 마커(=비변별 pan/class 마커). neg-leak 예외·lineage_present 제외에 사용."""
+    """R/S markers shared by many terms (= non-discriminative pan/class markers). Used for neg-leak
+    exemptions and for excluding them from lineage_present."""
     terms=(idx or {}).get("terms",{}); cnt={}
     for t in terms.values():
         for k in ("R","S"):
@@ -220,158 +226,40 @@ def _derive_pan(idx, min_terms=4):
     return {m for m,c in cnt.items() if c>=min_terms}
 
 def _sibling_groups(idx):
-    """부모를 공유하는 ≥2 자식(=sibling subclass 그룹). {parent_id:[child_id...]} + child별 required."""
+    """Groups of >=2 children that share a parent (= sibling subclass groups). {parent_id:[child_id...]}
+    plus each child's required set."""
     terms=(idx or {}).get("terms",{}); bp={}
     for tid,t in terms.items():
         for p in (t.get("P") or []):
             if p in terms: bp.setdefault(p,[]).append(tid)
     return {p:ch for p,ch in bp.items() if len(ch)>=2}
 
-# ★ PROCESS tier (2026-07-15, 'compartment'→'process' 개명 2026-07-17): 세포체가 아니라 **세포에서 뻗어나온
-#   부분**(process)으로 채워진 조직 영역. 정의 = "mRNA는 있는데 핵/세포체가 아닌 영역". neuropil(수상돌기·축삭·
-#   교세포 돌기의 mesh)과 fiber tract(수초화 축삭 다발)이 그 신경계 사례고, 망막 plexiform layer·신장 podocyte
-#   발돌기·폐 I형 폐포세포 확장부처럼 **비신경 조직으로도 확장**된다.
-#   ★ 2026-07-21 리팩터: process를 **pre-Leiden 자동 파티션**으로 찾던 로직(Step P + cluster-level Step 0.5)은
-#   제거됐다. process는 양성 마커를 그 전사체를 만든 소마와 **공유**하므로 마커축 클러스터링(clustering-based
-#   annotation)으로는 소마에서 안 갈린다 — 오직 **음성축(MALAT1 등 핵-보유)** 으로만 갈린다. 그래서 process
-#   탐지는 이제 사용자가 명시적으로 요청하는 **scoring-based annotation**(score-profile/apply/finalize) 전용이다.
-#   _PROC_TIERS는 (1) scoring 기본 대상(target 미지정 시 tier='process' class) + (2) _onto_ctx에서 process term을
-#   celltype 엔진(lineage/anchor)에서 배제(회귀 방지: neuropil이 lineage root로 잡혀 oligodendrocyte 오판)에 쓰인다.
-#   'compartment'는 legacy tier로 계속 받는다.
+# ★ PROCESS tier — a tissue region filled not with cell bodies but with **the parts that extend out of
+#   cells** (processes). Definition: "a region that has mRNA but is not a nucleus/soma". In the nervous
+#   system these are neuropil (the mesh of dendrites, axons and glial processes) and fiber tract (bundles
+#   of myelinated axons); the concept **extends to non-neural tissue** as well — the retinal plexiform
+#   layer, kidney podocyte foot processes, the thin extensions of lung type I pneumocytes.
+#   Processes are NOT labelled by the clustering-based path: a process **shares** its positive markers
+#   with the soma that made the transcripts, so a marker axis cannot separate it from that soma — only a
+#   **negative axis** (nucleus-retained transcripts such as MALAT1) can. Process detection is therefore
+#   not part of this release.
+#   _PROC_TIERS is still needed: tier='process' terms exist in the KG, so _onto_ctx must exclude them from
+#   the celltype engine (lineage/anchor). Without that exclusion neuropil is picked up as a lineage root
+#   and a real oligodendrocyte is called 'fiber tract'.
+#   'compartment' is still accepted as a legacy tier.
 _PROC_TIERS={"process","compartment"}
-
-# ================================================================ SCORING-based annotation
-# ★ 2026-07-21. process P 로직을 **일반화**한 per-vector scoring 엔진. clustering-based annotation(마커축
-#   Leiden→클러스터당 판정)과 대비되는 두 번째 모드다. 대상 class의 positive 마커 합성점수 상위 N%를 후보로,
-#   negative 마커 합성점수 상위 M%를 배제해 keep을 정한다(클러스터 아님, 벡터 단위). neuropil/fiber tract처럼
-#   양성 마커를 소마와 공유해 클러스터로 안 갈리는 대상에 필수. 기본 대상=tier='process' class지만 --targets로
-#   임의 KG class도 스코어링할 수 있다(pos=자신 R∪DF, neg=자신 N∪조상 N).
-_PROC_CAND_PCT = 10.0     # 후보 = pos_score 상위 N%   (default; 스킬과 같은 값)
-_PROC_NEG_PCT  = 10.0     # 제거 = neg_score 상위 M%   (default; 우연 제거율 = M% 이 되어 배수 해석이 자명)
-
-def _score_targets_ctx(idx, target_labels=None):
-    """scoring-based annotation의 대상 class를 KG 구조에서 유도. 하드코딩 이름 없음.
-      target_labels=None  → module의 tier='process' class(process 루트의 **직속 자식**: neuropil / fiber tract / …)
-                            를 기본 대상으로 (process 탐지의 기본 동작).
-      target_labels=[...] → 임의 KG class 라벨(대소문자 무시)을 대상으로. "score 기반으로 <X> 찾아" 처럼
-                            사용자가 명시한 임의 class를 스코어링.
-    각 class:
-      pos       = 그 class의 R∪DF
-      neg       = N(자신) ∪ N(조상 전부)  ← 범용 핵 축(MALAT1)은 루트에만 있고 전원이 상속한다(process),
-                  임의 class면 그 계보의 curated N을 상속.
-      children  = 직속 자식(typed subtype)들의 델타(R∪DF).
-    {} 반환 = 대상 없음(기본 모드에서 process term 없는 module, 또는 --targets가 어떤 term에도 매칭 안 됨)."""
-    terms=(idx or {}).get("terms",{}) or {}
-    if not terms: return {}
-    def _U(gs): return {str(g).upper() for g in (gs or [])}
-    def _rdf(t): return _U(t.get("R"))|_U(t.get("DF"))
-    def _par(tid): return [p for p in dict.fromkeys(terms[tid].get("P") or []) if p in terms and p!=tid]  # slim이 P를 중복해 실음
-    def _kid(tid): return [c for c in terms if tid in _par(c)]
-    def _neg(tid, seen=None):
-        if seen is None: seen=set()
-        if tid in seen or tid not in terms: return set()
-        seen.add(tid)
-        out=_U(terms[tid].get("N"))
-        for q in _par(tid): out |= _neg(q, seen)
-        return out
-    # 대상 term id 결정
-    if target_labels:
-        want={str(l).strip().lower() for l in target_labels}
-        target_ids=[tid for tid,t in terms.items() if str(t.get("L","")).strip().lower() in want]
-    else:
-        P={tid for tid,t in terms.items() if (t.get("T") or "") in _PROC_TIERS}
-        if not P: return {}
-        def _parP(tid): return [p for p in _par(tid) if p in P]
-        roots=[tid for tid in P if not _parP(tid)]
-        target_ids=[c for r in roots for c in P if r in _parP(c)]      # process 루트의 직속 자식
-    classes=[]
-    for c in target_ids:
-        classes.append({"id":c, "label":terms[c].get("L",c),
-                        "pos":sorted(_rdf(terms[c])), "neg":sorted(_neg(c)),
-                        "children":[{"id":k,"label":terms[k].get("L",k),"delta":sorted(_rdf(terms[k]))}
-                                    for k in _kid(c)]})
-    return {"classes":classes}
-
-
-def _zc(X, cols):
-    """표준화 composite. ★ AND/OR 조합(k-of-n)을 쓰지 않는 이유: 수율이 유전자 **개수**에 지수적으로
-    끌려간다 — 같은 데이터에서 neuropil(7개 AND)은 0%, fiber tract(2개 AND)는 6.4%가 나와 마커
-    품질 차이처럼 보였지만 전부 0.25^7 vs 0.25^2 이라는 산수였다. 유전자별 z → 평균 → **그 평균을
-    다시 표준화**하면 2개든 20개든 축의 분포가 같아져 임계값과 수율이 비교 가능해진다."""
-    import numpy as _np
-    Z=_np.column_stack([(X[:,i]-X[:,i].mean())/(X[:,i].std()+1e-9) for i in cols])
-    c=Z.mean(1)
-    return (c-c.mean())/(c.std()+1e-9)
-
-
-def _proc_scores(adata, ctx, cand_pct=_PROC_CAND_PCT, neg_pct=_PROC_NEG_PCT, restrict=None):
-    """class별 pos/neg score와 판단 재료를 계산. 라벨을 붙이지 않는다 — 판정은 에이전트 몫.
-    restrict = 전체 길이 bool 마스크(None=전 벡터). 지정 시 후보 percentile을 그 subset **안에서만** 잡는다
-    ('이 neuron들 안에서 상위 N%')·keep/pct도 subset 기준. z-score는 전 벡터 대비(=whole-dataset enrichment).
-    반환 마스크(_mask/_cand)는 전체 길이(restrict 밖은 False)라 하류 인덱스 매핑이 필요 없다."""
-    import numpy as _np
-    X=adata.X; X=_np.asarray(X.todense()) if hasattr(X,"todense") else _np.asarray(X)
-    um={str(g).upper():i for i,g in enumerate(adata.var_names)}
-    vf=adata.obs["vf_norm"].to_numpy() if "vf_norm" in adata.obs else None
-    rm=_np.ones(adata.n_obs,bool) if restrict is None else _np.asarray(restrict,bool)
-    nrm=max(int(rm.sum()),1)
-    out=[]
-    for cl in ctx["classes"]:
-        pc=[um[g] for g in cl["pos"] if g in um]; pmiss=[g for g in cl["pos"] if g not in um]
-        nc=[um[g] for g in cl["neg"] if g in um]; nmiss=[g for g in cl["neg"] if g not in um]
-        if not pc:
-            out.append({"label":cl["label"],"term_id":cl["id"],"usable":False,
-                        "reason":"positive 마커가 패널에 하나도 없음",
-                        "pos_missing":pmiss,"neg_missing":nmiss}); continue
-        ps=_zc(X,pc)
-        cand=(ps>_np.quantile(ps[rm],1-cand_pct/100.0)) & rm            # 후보는 restrict 안에서만
-        rec={"label":cl["label"],"term_id":cl["id"],"usable":True,
-             "pos_used":[adata.var_names[i] for i in pc],"pos_missing":pmiss,
-             "neg_used":[adata.var_names[i] for i in nc],"neg_missing":nmiss,
-             "n_candidate":int(cand.sum()),"pct_candidate":round(100*float(cand.sum())/nrm,2)}
-        if nc:
-            ns=_zc(X,nc)
-            negon=(ns>_np.quantile(ns[rm],1-neg_pct/100.0)) & rm
-            removed=float((cand&negon).sum())/max(int(cand.sum()),1)
-            keep=cand&~negon
-            rec.update({
-                "corr_pos_neg":round(float(_np.corrcoef(ps[rm],ns[rm])[0,1]),3),
-                # ★ 배수 해석: neg_score 상위 M%는 정의상 restrict의 M%를 지운다. neg가 후보와 무관하면
-                #   후보에서도 M%가 지워진다 => 우연=M%. 배수>1 = 후보에 소마가 실제로 몰려 있고
-                #   필터가 그걸 걷어냄. 배수≈1 = 필터가 무정보. 배수<1 = 후보가 이미 소마-결핍.
-                "removal":{"observed_pct":round(100*removed,2),"chance_pct":neg_pct,
-                           "ratio":round(removed/(neg_pct/100.0),2)},
-                "n_final":int(keep.sum()),"pct_final":round(100*float(keep.sum())/nrm,2)})
-        else:
-            keep=cand
-            rec.update({"removal":None,"n_final":int(keep.sum()),
-                        "pct_final":round(100*float(keep.sum())/nrm,2)})
-        if vf is not None:
-            rec["density"]={"median_vf_final":round(float(_np.median(vf[keep])),4) if keep.sum() else None,
-                            "median_vf_all":round(float(_np.median(vf[rm])),4)}
-        subs=[]
-        for k in cl["children"]:
-            dc=[um[g] for g in k["delta"] if g in um]
-            subs.append({"label":k["label"],"term_id":k["id"],
-                         "delta_used":[adata.var_names[i] for i in dc],
-                         "delta_missing":[g for g in k["delta"] if g not in um]})
-        rec["subtypes"]=subs
-        rec["_mask"]=keep
-        rec["_cand"]=cand
-        rec["_pos"]=ps
-        out.append(rec)
-    return out
 
 
 def _onto_ctx(idx):
-    """profiling/validate가 쓰는 도메인 컨텍스트(온톨로지 유도, fallback 포함)."""
+    """Domain context used by profiling/validate (derived from the ontology, with fallbacks)."""
     terms_all=(idx or {}).get("terms",{})
-    # ★ PROCESS 분리 (2026-07-15, 게이트 일반화 2026-07-21): tier='process' term(neuropil/fiber tract 등)은
-    #   celltype이 아니므로 lineage/specific/pan/sibling 유도 및 IDM(anchor/top)에서 제외한다 — state term을
-    #   top에서 빼는 것과 같은 취지. 제외 안 하면 neuropil/fiber-tract가 root=lineage로 잡혀 진짜
-    #   oligodendrocyte(MBP+)를 'fiber tract' lineage로 오판한다(process module은 KG에 남아 있으므로 필수).
-    #   process 마커는 _ontology_gene_set(full idx)엔 남아 scoring-based annotation이 측정한다. process term이
-    #   없는 module이면 idx 그대로 통과 → 완전 무영향.
+    # ★ PROCESS isolation: tier='process' terms (neuropil, fiber tract, ...) are not celltypes, so they are
+    #   excluded from lineage/specific/pan/sibling derivation and from IDM (anchor/top) — the same intent as
+    #   keeping state terms out of top. Without the exclusion neuropil / fiber tract is taken as root=lineage
+    #   and a genuine oligodendrocyte (MBP+) is called the 'fiber tract' lineage. This is required because the
+    #   process module remains in the KG.
+    #   Process markers stay in _ontology_gene_set (the full idx) so they remain measurable. A module with no
+    #   process term passes through unchanged -> no effect at all.
     _has_proc=any((t.get("T") or "") in _PROC_TIERS for t in terms_all.values())
     idx_ct=({**(idx or {}), "terms":{tid:t for tid,t in terms_all.items() if (t.get("T") or "") not in _PROC_TIERS}}
             if _has_proc else idx)
@@ -379,11 +267,13 @@ def _onto_ctx(idx):
     return {"lineages": _derive_lineages(idx_ct) or {k:set(v) for k,v in _LINEAGE_FALLBACK.items()},
             "specific": _derive_specific(idx_ct) or set(_SPECIFIC_FALLBACK),
             "pan": _derive_pan(idx_ct) or set(_PAN_FALLBACK),
-            # ★ pan_disc (2026-06-17): candidate_subtypes/children_resolvable의 변별마커 판정용 pan 집합.
-            #   octx["pan"](≥4 term)은 Cux2(4)/Rorb(5)/Fezf2(5) 같은 *층 변별 마커*까지 pan으로 죽여 피질 층이
-            #   children_resolvable·n_nonpan_present에서 사라진다(SHOULD_SPLIT_DEEPER 과소발화). _build_ident_maps가
-            #   graph_evidence용으로 쓰는 것과 **동일한 ≥12 임계**로 맞춰 통일 — 진짜 pan(Slc17a7=52 등)만 거르고
-            #   층 마커는 변별마커로 살린다. octx["pan"](≥4)은 _validate/lineage_present 등 기존 용처가 있어 불변.
+            # ★ pan_disc: the pan set used to judge discriminative markers for candidate_subtypes /
+            #   children_resolvable. octx["pan"] (>=4 terms) also kills *layer-discriminating* markers such as
+            #   Cux2 (4) / Rorb (5) / Fezf2 (5), so cortical layers disappear from children_resolvable and
+            #   n_nonpan_present (SHOULD_SPLIT_DEEPER under-fires). This uses the **same >=12 threshold** that
+            #   _build_ident_maps uses for graph_evidence — only true pan markers (Slc17a7=52 etc.) are filtered and
+            #   layer markers survive as discriminators. octx["pan"] (>=4) is left alone because _validate /
+            #   lineage_present depend on it.
             "pan_disc": _derive_pan(idx_ct, 12) or set(_PAN_FALLBACK),
             "siblings": _sibling_groups(idx_ct),
             "terms": terms,
@@ -393,37 +283,43 @@ def _onto_ctx(idx):
             "term_req": {tid:{m.upper() for m in (t.get("R") or [])} for tid,t in terms.items()}}
 
 def _context_axis_eval(lineage_label, ca, fon, lf, pin, gidx_U, lean_ratio=1.15, sig_floor=0.03, extra_labels=None):
-    """★ Context-axis subtyping (§4.3) — DETERMINISTIC engine support. lineage의 subtype이 세포-내재 마커가
-    아니라 *공간 위치*(zonation/layer)로 갈리는 경우, module이 선언한 ca 축의 pole별 context_markers(=이웃 우세
-    세포형 마커, 분할데이터선 ambient)를 점수화해 dominant pole→subtype을 제안한다. lineage는 graph_evidence가
-    내재마커로 이미 확정(여기선 절대 안 바꿈) — pole은 subtype 축에만 적용. off-panel context 마커는 스킵.
-    ★ WEAK-LEAN (2026-06-21): zonation은 연속체라 신호가 약하다 — 강한 우세를 요구하면 대부분 bare class로
-    빠진다. 그래서 (a) 점수는 graded(하드 ON 임계 없이 fon 합 — 약한 ambient도 반영), (b) 한 극이 *약하더라도*
-    분명히(>=lean_ratio×) 앞서면 그 극으로 판정(pole_confidence=low; >=1.5×면 medium). 둘 다 실재하나 동률
-    (near-tie)이면 mixed(부모면 분할). bounded same-lineage 축이라 최악도 인접 zone(치명적 오판 아님)."""
+    """★ Context-axis subtyping (§4.3) — DETERMINISTIC engine support. When a lineage's subtypes are not
+    separated by cell-intrinsic markers but by *spatial position* (zonation/layer), score the per-pole
+    context_markers of the ca axis the module declares (= markers of the dominant neighbouring cell type;
+    ambient in segmented data) and propose dominant pole -> subtype. The lineage is already fixed by
+    graph_evidence from intrinsic markers (never changed here) — poles apply only to the subtype axis.
+    Off-panel context markers are skipped.
+    ★ WEAK-LEAN (2026-06-21): zonation is a continuum, so the signal is weak — demanding a strong lead
+    would drop most leaves to the bare class. Therefore (a) the score is graded (a sum of fon with no hard
+    ON threshold, so faint ambient still counts), and (b) if one pole leads clearly (>=lean_ratio x) even
+    while *weak*, that pole is assigned (pole_confidence=low; >=1.5x -> medium). If both are genuinely
+    present and near-tied, the result is mixed (split when this is a parent). Because the axis is a bounded
+    same-lineage axis, the worst case is an adjacent zone (not a fatal misassignment)."""
     if not ca: return None
-    # ★ region/anchor-aware 매칭 (2026-06-22): liver는 lineage=celltype("Hepatocyte")라 lineage_label로 충분하나,
-    #   brain은 lineage=transmitter class("glutamatergic neuron")로 너무 broad → applies_to를 dominant_region/anchor
-    #   라벨(extra_labels)에도 매칭해 축을 올바른 region/celltype에만 적용(thalamic core/matrix, CA1 deep/superficial).
+    # ★ region/anchor-aware matching: in liver, lineage = celltype ("Hepatocyte") so the lineage label is
+    #   enough; in brain, lineage = a transmitter class ("glutamatergic neuron") and is far too broad. So
+    #   applies_to is also matched against the dominant_region / anchor labels (extra_labels), applying the
+    #   axis only to the right region/celltype (thalamic core/matrix, CA1 deep/superficial).
     cand={str(lineage_label).strip().lower()} if lineage_label else set()
     for x in (extra_labels or []):
         if x: cand.add(str(x).strip().lower())
     if not cand: return None
     def lvl(g):
         i=gidx_U.get(str(g).upper())
-        if i is None: return None                       # off-panel — 무시(증거로 안 씀)
-        return float(max(fon[i],0.0))                   # graded presence (약한 신호도 반영)
+        if i is None: return None
+        return float(max(fon[i],0.0))
     out=[]
     for ax in ca:
-        # ★ lineage 게이트 (2026-06-22): 축이 lineage를 선언하면 cluster의 transmitter lineage가 일치할 때만 적용.
-        #   CA1 radial 같은 glut-pyramidal 축이 GABAergic interneuron 클러스터(parent가 CA1라 anchor/path로 매칭)에
-        #   잘못 발화해 "CA1 deep pyramidal"로 오라벨하던 문제 차단. lineage 미선언 축은 게이트 없음(liver 호환).
+        # ★ lineage gate: when an axis declares a lineage, it applies only if the cluster's transmitter lineage
+        #   matches. This blocks a glut-pyramidal axis such as CA1 radial from firing on a GABAergic interneuron
+        #   cluster (matched via anchor/path because its parent is CA1) and mislabelling it "CA1 deep pyramidal".
+        #   An axis with no declared lineage has no gate (liver compatible).
         ax_lin=ax.get("lineage")
         if ax_lin and lineage_label and str(ax_lin).strip().lower()!=str(lineage_label).strip().lower(): continue
         appl=[str(x).strip().lower() for x in (ax.get("applies_to") or [])]
         matched=[a for a in appl if a in cand]
         if not matched: continue
-        mkey=matched[0]                                  # 매칭된 applies_to(소문자) → subtype lookup 키
+        mkey=matched[0]
         poles=[]
         for p in (ax.get("poles") or []):
             on_g=[]; score=0.0; n_onpanel=0
@@ -441,11 +337,13 @@ def _context_axis_eval(lineage_label, ca, fon, lf, pin, gidx_U, lean_ratio=1.15,
         top=present[0]["score"] if present else 0.0
         second=present[1]["score"] if len(present)>1 else 0.0
         dom=None; conf=None
-        if top>0 and top>=lean_ratio*max(second,1e-9):  # 약하더라도 한 극이 분명히 우세 → 그 극으로 lean
+        if top>0 and top>=lean_ratio*max(second,1e-9):
             dom=present[0]; conf=("medium" if top>=1.5*max(second,1e-9) else "low")
-        # ★ mixed = 둘째 극이 *실질적*(>=0.4×)으로 공존 → 큰 부모면 양극 분리 위해 subcluster(소수 극 매몰 방지).
-        #   dominant_pole이 있어도 mixed일 수 있다(부모가 한쪽으로 기울지만 반대 극도 상당). lean은 분할 후
-        #   sub-leaf 라벨용, mixed는 분할 트리거(§4.3). 둘째 극이 미미하면(pure-ish) mixed=False → 바로 lean-label.
+        # ★ mixed = the second pole is *substantially* present (>=0.4x) -> for a large parent, subcluster to
+        #   separate both poles so the minority pole is not buried. A leaf can have a dominant_pole and still be
+        #   mixed (the parent leans one way but the opposite pole is considerable). The lean labels sub-leaves
+        #   after a split; mixed is the split trigger (§4.3). When the second pole is negligible (pure-ish),
+        #   mixed=False -> label by the lean directly.
         both_substantial=(len(present)>=2 and second>=0.4*max(top,1e-9))
         out.append({"axis":ax.get("name"),"poles":poles,
                     "poles_present":[p["pole"] for p in present],
@@ -456,13 +354,14 @@ def _context_axis_eval(lineage_label, ca, fon, lf, pin, gidx_U, lean_ratio=1.15,
                     "pmids":ax.get("pmids") or []})
     return out or None
 
-def _state_axis_eval(sa, fon, lf, pin, gidx_U, frac=0.30, lf_on=1.5, pin_min=0.25, min_on=2):
+def _state_axis_eval(sa, fon, lf, pin, gidx_U, frac=0.30, lf_on=1.5, pin_min=0.25, min_onpanel=3, coverage=0.75):
     """★ STATE-AXIS eval — base-agnostic cell states (proliferating / interferon-stimulated / hypoxic …).
     Unlike `_context_axis_eval` (pole competition for a subtype), each State is judged INDEPENDENTLY and any
-    number can be active: a State is ACTIVE when ≥`min_on` of its OWN program markers are **ENRICHED** —
-    elevated vs the whole dataset (fon≥frac OR fold≥lf_on & detected≥pin_min), NOT mere detection. State
-    markers are program markers (MKI67=proliferation …), curated base-agnostically in the KG, so the
-    discriminative side is baked in; the engine only checks enrichment + coherence (≥2). Ranked by summed
+    number can be active: a State is ACTIVE when a COVERAGE fraction of its OWN on-panel program markers are
+    **ENRICHED** — elevated vs the whole dataset (fon≥frac OR fold≥lf_on & detected≥pin_min), NOT mere
+    detection. State markers are co-regulated program markers (MKI67=proliferation …), curated base-agnostically
+    in the KG; a real program lights up (nearly) ALL of them, so the engine requires ≥ceil(coverage*n_onpanel)
+    ENRICHED and skips states with <min_onpanel measurable markers (a co-regulated pair = 1 signal, not 2). Ranked by summed
     enrichment. States with an IDENTICAL marker signature (EMT ≡ mesenchymal) are de-duplicated (keep one).
     Returns [{name, markers_on[], n_on, n_onpanel, score, pmids}] (highest first); [] if none active.
     The label is later synthesized as `base, <state1>, <state2>` (finalize)."""
@@ -479,7 +378,14 @@ def _state_axis_eval(sa, fon, lf, pin, gidx_U, frac=0.30, lf_on=1.5, pin_min=0.2
             n_onpanel+=1
             enr=(fon[i]>=frac) or (lf[i]>=lf_on and pin[i]>=pin_min)   # ENRICHED (R1), not mere detection
             if enr: on.append(str(g)); score+=float(max(lf[i],0.0))
-        if len(on)>=min_on:                                        # coherence: ≥2 program markers enriched
+        # ★ COVERAGE gate (2026-07-29): a coherent program lights up (nearly) ALL its on-panel markers.
+        #   Co-regulated markers (FOS/JUN/JUNB…) rise together, so the old "any ≥2" = 1 signal and let
+        #   artifacts through; instead require ≥ceil(coverage*n_onpanel) of the MEASURABLE markers ENRICHED,
+        #   and skip states with <min_onpanel measurable markers (too few to confirm a program). Panel-based,
+        #   NOT KG marker count. See [[state-append-coverage-gate]].
+        _need = int(coverage*n_onpanel)
+        if coverage*n_onpanel - _need > 1e-9: _need += 1           # ceil
+        if n_onpanel>=min_onpanel and len(on)>=_need:              # eligible (≥3 measurable) AND coverage met
             seen_sig.add(sig)
             out.append({"name":st.get("name"),"markers_on":on,"n_on":len(on),"n_onpanel":n_onpanel,
                         "score":round(score,3),"pmids":st.get("pmids") or []})
@@ -487,38 +393,44 @@ def _state_axis_eval(sa, fon, lf, pin, gidx_U, frac=0.30, lf_on=1.5, pin_min=0.2
     return out
 
 def _candidate_subtypes(terms, ogt, up_rows, octx, parent_up_auc=None, region_share=None):
-    """이 클러스터에서 *정의 마커가 실제로 보이는* 온톨로지 term을 증거 scorecard로 랭킹(옆 후보).
-    + 각 후보의 1단계 자식이 이 클러스터에서 해소 가능한지(children_resolvable)도 같이 — 더 split할지 판단용(아래 lookahead).
-    품질 필터: pan(비변별) 마커만 떠선 후보로 안 침. → CA1/CA3 같은 진짜 subtype만 소수로 남음.
-    전부 온톨로지 런타임 유도 → organ 무관·하드코딩 0. 비강제(Step5 게이트가 최종).
-    ★ 부모 풀링(parent_up_auc): 균질 subtype이 과분할로 사라지는 것 방지. 자식 up(=형제 대비)에선
-    layer/relay 마커가 ~0.5로 평준화되지만, 부모(=뇌 전체 대비)에서 enriched였다면 그 정체성은 모든
-    자식에 상속된다. 그래서 term의 *자신* required 평가엔 부모 enrichment를 함께 본다(inherit=True).
-    단 children_resolvable(=더 쪼개면 분리?)엔 부모 풀링을 쓰지 않는다 — 균질 마커는 분할로 안 갈라지므로."""
-    # ★ pan_disc(≥12) 사용 — graph_evidence(_build_ident_maps)와 동일 기준. octx["pan"](≥4)을 쓰면 Cux2/Rorb/Fezf2
-    #   같은 층 변별 마커가 pan으로 죽어 n_nonpan_present가 0이 되고 SHOULD_SPLIT_DEEPER가 과소발화한다(통일, 2026-06-17).
+    """Rank ontology terms whose *defining markers are actually visible* in this cluster as an evidence
+    scorecard (side candidates), plus whether each candidate's one-level children are resolvable here
+    (children_resolvable) — used to decide whether to split further (lookahead below).
+    Quality filter: a term backed only by pan (non-discriminative) markers is not admitted, so only real
+    subtypes such as CA1/CA3 survive, and only a few of them.
+    Everything is derived from the ontology at runtime -> organ-agnostic, zero hardcoding. Non-binding
+    (the Step 5 gate is final).
+    ★ Parent pooling (parent_up_auc): prevents a homogeneous subtype from disappearing under over-split.
+    In a child's `up` (= vs siblings) layer/relay markers flatten to ~0.5, but if they were enriched in the
+    parent (= vs the whole brain) that identity is inherited by every child. So a term's *own* required
+    markers are evaluated with parent enrichment included (inherit=True).
+    Parent pooling is NOT used for children_resolvable (= would splitting separate them?), because a
+    homogeneous marker does not separate under a split."""
+    # ★ Uses pan_disc (>=12) — the same criterion as graph_evidence (_build_ident_maps). With octx["pan"]
+    #   (>=4), layer discriminators such as Cux2/Rorb/Fezf2 are killed as pan, n_nonpan_present becomes 0 and
+    #   SHOULD_SPLIT_DEEPER under-fires.
     pan=octx.get("pan_disc") or octx.get("pan") or set()
     up_auc={_U(r[0]):r[1] for r in (up_rows or [])}
     p_auc={_U(g):a for g,a in (parent_up_auc or {}).items()}
     ogt_u={_U(g):v for g,v in (ogt or {}).items()}
-    # 부모→자식 인덱스(1단계)
     children={}
     for tid,t in (terms or {}).items():
         for p in (t.get("P") or []):
             if p in terms: children.setdefault(p,[]).append(tid)
     def ev(g, inherit):
-        """(present_bool, auc, on_panel_bool, is_pan_bool). inherit=True면 부모 enrichment도 인정."""
-        # ★ 변별/비변별(isp) 판정을 graph_evidence의 anchor와 통일(2026-06-17): region_share가 주어지면
-        #   "비변별=영역 >2개에 퍼짐(region_share>SPEC_REGION_MAX=2)"으로 판정 — pan≥12로 broad 마커(PCP4 등)를
-        #   못 거르던 과다발화를 막고, 층 마커(Rorb/Cux2/Fezf2: region_share=1)는 변별로 살린다. region_share가
-        #   없으면(IDM 미생성) pan_disc(≥12) 집합으로 폴백.
+        """(present_bool, auc, on_panel_bool, is_pan_bool). With inherit=True, parent enrichment also counts."""
+        # ★ The discriminative / non-discriminative (isp) test matches graph_evidence's anchors: when
+        #   region_share is available, "non-discriminative" means "spread over more than 2 regions"
+        #   (region_share > SPEC_REGION_MAX = 2). This stops the over-firing caused by pan>=12 failing to filter
+        #   broad markers (PCP4 etc.), while layer markers (Rorb/Cux2/Fezf2: region_share=1) survive as
+        #   discriminators. Falls back to the pan_disc (>=12) set when region_share is unavailable (no IDM).
         gu=_U(g); isp=(region_share.get(gu,99)>2) if region_share else (gu in pan)
         if gu in up_auc and up_auc[gu]>=0.6: return (True, round(up_auc[gu],3), True, isp)
-        if inherit and p_auc.get(gu,0)>=0.6:                        # 부모에서 enriched → 상속된 정체성
+        if inherit and p_auc.get(gu,0)>=0.6:
             return (True, round(p_auc[gu],3), True, isp)
         e=ogt_u.get(gu)
-        if e is None: return (False, None, True, isp)               # 패널엔 있고 발현 약함
-        if e.get("panel") is False: return (None, None, False, isp) # off-panel: 미지(기각 근거 아님)
+        if e is None: return (False, None, True, isp)
+        if e.get("panel") is False: return (None, None, False, isp)
         a=e.get("auc")
         return ((a is not None and a>=0.5), (round(a,3) if a is not None else None), True, isp)
     def term_evidence(tid, inherit=True):
@@ -533,10 +445,12 @@ def _candidate_subtypes(terms, ogt, up_rows, octx, parent_up_auc=None, region_sh
             if panel is False: noff+=1
         return rec,npres,nnonpan,noff
     def disc_markers(tid):
-        """이 term의 모든 마커(R∪S∪DF) 중 '비-pan · on-panel · 강한(AUC≥0.55)'인 것들(유전자 dedup).
-        required가 off-panel(CA1의 Wfs1)이어도 supporting(Fibcd1)로 잡힘 → signal_split target 자동
-        도출의 핵심(누락 방지). 진짜로 존재하는 type은 *여러* 변별마커가 잡히고, 마커 1개만 교차상장된
-        spurious(예: 피질에 Cerebellar Golgi via Neurod6)는 1개라 아래 랭킹에서 밀린다."""
+        """Of all this term's markers (R u S u DF), those that are non-pan, on-panel and strong (AUC>=0.55),
+        deduplicated by gene.
+        Even when required is off-panel (Wfs1 for CA1), a supporting marker (Fibcd1) is picked up — the key
+        to deriving signal_split targets automatically without dropping types. A type that really exists
+        shows *several* discriminative markers; a spurious one carried by a single cross-listed marker
+        (e.g. Cerebellar Golgi in cortex via Neurod6) has only one and falls in the ranking below."""
         tt=terms.get(tid) or {}; d={}
         for g in (tt.get("R") or [])+(tt.get("S") or [])+(tt.get("DF") or []):
             pres,a,onpanel,isp=ev(g, True)
@@ -545,27 +459,30 @@ def _candidate_subtypes(terms, ogt, up_rows, octx, parent_up_auc=None, region_sh
                 if gu not in d or a>d[gu]: d[gu]=a
         return sorted(d.items(), key=lambda x:-x[1])
     def required_ok(tid):
-        """'고유(비-pan) 필수명찰' 검사. 이 term의 비-pan required 중 on-panel인 게 있으면 적어도
-        하나는 present(AUC≥0.55)여야 True. 전부 off-panel이거나 비-pan required가 없으면 True(보조명찰로
-        식별 — CA1: Wfs1/Mpped1 off-panel). UBC처럼 on-panel 필수(Eomes)가 안 뜨면 False → target 제외."""
+        """Check for an 'own (non-pan) required badge'. If this term has any non-pan required marker that is
+        on-panel, at least one of them must be present (AUC>=0.55) for this to return True. If they are all
+        off-panel, or there is no non-pan required marker, return True (the term is identified by supporting
+        markers — CA1: Wfs1/Mpped1 are off-panel). For a term like UBC whose on-panel required marker
+        (Eomes) does not fire, return False -> excluded as a target."""
         onp=[]
         for g in ((terms.get(tid) or {}).get("R") or []):
             pres,a,onpanel,isp=ev(g, True)
-            if onpanel and not isp:                              # 흔한(pan) 필수명찰은 무시
+            if onpanel and not isp:
                 onp.append(a is not None and a>=0.55)
         return (not onp) or any(onp)
-    out=[]; sugg=[]   # 자동 target 제안용(R-필터와 무관)
+    out=[]; sugg=[]
     for tid,t in (terms or {}).items():
         if not (t.get("R")): continue
-        dms=disc_markers(tid)                                      # 고유 변별마커들(모든 마커류에서)
-        if dms and required_ok(tid):                              # 변별마커 有 + 고유 필수명찰 검사 통과
+        dms=disc_markers(tid)
+        if dms and required_ok(tid):
             sugg.append({"term_id":tid,"label":t.get("L",""),"n_disc":len(dms),
                          "top_auc":dms[0][1],"disc_markers":[g for g,a in dms[:5]]})
-        rec,npres,nnonpan,noff=term_evidence(tid, inherit=True)     # 자신 정체성: 부모 상속 인정
-        # 품질 필터: 비-pan required ≥1, 또는 required ≥2 present (pan-only는 제외)
+        rec,npres,nnonpan,noff=term_evidence(tid, inherit=True)
+        # quality filter: >=1 non-pan required, or >=2 required present (pan-only is excluded)
         if not (nnonpan>=1 or npres>=2): continue
-        # child lookahead(1단계): 자식 중 비-pan required가 present인 것 개수/라벨
-        # inherit=False — 더 쪼개서 분리 가능한지는 '이 leaf 내부' 신호로만 판단(부모 상속 제외).
+        # child lookahead (one level): how many children have a non-pan required marker present, and which
+        # inherit=False — whether a further split would separate them is judged from signal *inside this leaf*
+        # only (parent inheritance excluded).
         kids=[]
         for kt in children.get(tid,[]):
             krec,knp,knn,kno=term_evidence(kt, inherit=False)
@@ -575,32 +492,40 @@ def _candidate_subtypes(terms, ogt, up_rows, octx, parent_up_auc=None, region_sh
                     "n_req_present":npres,"n_nonpan_present":nnonpan,"n_req":len(t.get("R")),"n_req_offpanel":noff,
                     "required":rec,"children_resolvable":kids})
     out.sort(key=lambda d:(-d["n_nonpan_present"], -d["n_req_present"], -max((r[1] or 0) for r in d["required"])))
-    # signal_targets_suggested: 고유 변별마커가 강한 type을 자동 target으로 제안.
-    # 랭킹 = (변별마커 개수, 최고 AUC) 내림차순 → 여러 마커가 잡히는 진짜 type(CA1 Fibcd1+Spink8,
-    # CA3 Grik4+Npy2r+Nectin3, DG Prox1+Dsp+Neurod1)이 상위, 1개만 교차상장된 spurious는 하위.
-    # CA1/CA3/DG는 required가 off-panel이어도 supporting으로 surface → agent가 누락 불가.
+    # signal_targets_suggested: propose types with strong own discriminative markers as automatic targets.
+    # Ranked by (number of discriminative markers, best AUC) descending -> a real type with several markers
+    # (CA1 Fibcd1+Spink8, CA3 Grik4+Npy2r+Nectin3, DG Prox1+Dsp+Neurod1) ranks high, while a spurious one
+    # carried by a single cross-listed marker ranks low.
+    # CA1/CA3/DG surface through supporting markers even when their required markers are off-panel, so the
+    # agent cannot miss them.
     signal_targets=sorted(sugg, key=lambda d:(-d["n_disc"], -d["top_auc"]))[:15]
     return out, signal_targets
 
 # ===================================================================== absolute identity (Leiden+absolute paradigm)
 _TIERD={"class":0,"subclass":2,"supertype":2,"cluster":3,"state":1,"":0}
 def _build_ident_maps(octx, genes, pan_n=12):
-    """온톨로지→identity 스코어용 인덱스(1회). term별 비-pan on-panel 변별마커/음성마커 인덱스, tier,
-    lineage 마커 인덱스 + lineage→class term, lineage-root 맵. 전부 유전자 전역 인덱스 기준(organ 무관).
-    ★pan 임계는 octx['pan'](≥4 term, signal_split용)보다 높은 pan_n(기본 12)을 별도 계산해 쓴다.
-    ≥4는 Cux2(4)/Rorb(5)/Fezf2(5) 같은 *층 변별 마커*까지 housekeeping처럼 제거해 피질층이 안 잡힌다.
-    ≥12면 진짜 pan(Slc17a7=39, Gad1=139, Calb1=46, Foxp2=18)만 거르고 층 마커는 변별마커로 살아남는다."""
+    """Build the ontology -> identity scoring index (once). Per term: indices of non-pan on-panel
+    discriminative markers and negative markers, tier, lineage marker indices, lineage -> class term, and a
+    lineage-root map. Everything is keyed on global gene indices (organ-agnostic).
+    ★ The pan threshold used here (pan_n, default 12) is computed separately and is higher than
+    octx['pan'] (>=4 terms, used for signal_split). At >=4, layer-discriminating markers such as Cux2 (4),
+    Rorb (5) and Fezf2 (5) are removed like housekeeping genes and cortical layers stop being detected.
+    At >=12 only true pan markers are filtered (Slc17a7=39, Gad1=139, Calb1=46, Foxp2=18) and layer
+    markers survive as discriminative markers."""
     terms=octx.get("terms",{}) or {}; LIN=octx.get("lineages") or {}
     gUp={_U(g):i for i,g in enumerate(genes)}
-    # ★ 접미사 마커명 정규화 (2026-06-16): KG 마커의 15%가 문맥 접미사(Drd1_strict, Foxp2_high, Tac1_subset,
-    #   Slc17a6_neuronal, Pou4f1_PAG, Aromatase_Cyp19a1, Sf1_Nr5a1 …)를 달고 있어 패널 심볼과 매칭 실패 →
-    #   의도한 마커가 죽어있었다. base 심볼로 재매칭: full→첫 토큰(gene_suffix)→마지막 토큰(alias_gene:
-    #   Aromatase_Cyp19a1→Cyp19a1). ★중요: 정규화는 NEGATIVE·DF·lineage에만 적용하고 DISC/PAN/region_share는
-    #   RAW 유지한다 — disc에 base를 복원하면(Foxp2_high×31 → Foxp2) region_share가 부풀어 Fezf2(L5 ET)·Drd2(D2-MSN)·
-    #   Foxp2(L6 CT) 같은 검증된 exclusive/defining anchor가 비-exclusive로 강등돼 광범위 회귀가 난다. 실제 피해를
-    #   준 건 죽은 NEGATIVE(eSPN의 Drd1_strict/Drd2_strict가 죽어 D1/D2로 veto 안 돼 모든 선조체 leaf 점령)이므로
-    #   negative만 살리면 충분(eSPN→Drd1/Drd2 negative 복원 → D1/D2 leaf에서 veto). DF 정규화는 df_offpanel 정확도
-    #   +DF-override만 돕고 region_share 불변(별도 맵). 엔진 on_enr/auc 임계가 발현 강도를 처리하므로 뉘앙스 손실 무해.
+    # ★ Marker-name suffix normalization: 15% of KG markers carry a context suffix (Drd1_strict, Foxp2_high,
+    #   Tac1_subset, Slc17a6_neuronal, Pou4f1_PAG, Aromatase_Cyp19a1, Sf1_Nr5a1 ...) and fail to match panel
+    #   symbols, so the intended marker is silently dead. They are re-matched on the base symbol:
+    #   full -> first token (gene_suffix) -> last token (alias_gene: Aromatase_Cyp19a1 -> Cyp19a1).
+    #   ★ IMPORTANT: normalization is applied ONLY to NEGATIVE, DF and lineage markers; DISC / PAN /
+    #   region_share stay RAW. Restoring base symbols in disc (Foxp2_high x31 -> Foxp2) inflates region_share
+    #   and demotes verified exclusive/defining anchors (Fezf2 for L5 ET, Drd2 for D2-MSN, Foxp2 for L6 CT) to
+    #   non-exclusive, causing a broad regression. The real damage came from dead NEGATIVE markers (eSPN's
+    #   Drd1_strict/Drd2_strict were dead, so eSPN was never vetoed on D1/D2 and occupied every striatal leaf),
+    #   so restoring negatives alone is sufficient. Normalizing DF only improves df_offpanel accuracy and the
+    #   DF override, and leaves region_share untouched (separate map). Losing the nuance is harmless because
+    #   the engine's on_enr/auc thresholds already handle expression strength.
     def _gidx(g):
         gu=_U(g)
         if gu in gUp: return gUp[gu]
@@ -612,24 +537,25 @@ def _build_ident_maps(octx, genes, pan_n=12):
     _cnt={}
     for _t in terms.values():
         for _k in ("R","S"):
-            for _m in (_t.get(_k) or []): _cnt[_m.upper()]=_cnt.get(_m.upper(),0)+1   # RAW(원본 동작 보존)
+            for _m in (_t.get(_k) or []): _cnt[_m.upper()]=_cnt.get(_m.upper(),0)+1
     PAN={_m for _m,_c in _cnt.items() if _c>=pan_n}
     term_disc={}; term_neg={}; term_neg_soft={}; term_tier={}; term_lab={}; term_def={}; term_core={}
-    term_dz={}                                    # tid -> disease_context ('normal' 기본). _is_state_term 이 KG 신뢰 판정에 씀
+    term_dz={}                                    # tid -> disease_context ('normal' by default). Used by _is_state_term to trust the KG
     for tid,t in terms.items():
         term_tier[tid]=t.get("T",""); term_lab[tid]=t.get("L",tid); dc=[]; seen=set()
         term_dz[tid]=(t.get("D") or "normal")
         for g in (t.get("R") or [])+(t.get("S") or [])+(t.get("DF") or []):
-            gu=_U(g)                                   # RAW 매칭 — disc/region_share는 정규화 안 함(anchor 보존)
+            gu=_U(g)
             if gu in PAN: continue
             j=gUp.get(gu)
             if j is not None and j not in seen: seen.add(j); dc.append(j)
         if dc: term_disc[tid]=dc
-        # ★ CORE identity markers = R∪DF (defining/required), SEPARATE from supporting(S). regime-C 게이트용
-        #   (_graph_evidence): KG는 HAS_DEFINING/REQUIRED(고유 정체)와 HAS_SUPPORTING(공발현·비배타)을 구분하는데
-        #   disc는 둘을 합쳐 supporting도 exclusive로 카운트한다 → core가 측정됐는데(on-panel) 꺼져 있어도(df_absent)
-        #   supporting 1~2개로 specific anchor가 성립하던 버그(CA2 Pfkp/Sv2b, OB-mitral Robo3, FC Notch2). RAW 매칭
-        #   (disc 동일 기준, PAN 제외)이라 share/정규화 불변.
+        # ★ CORE identity markers = R u DF (defining/required), SEPARATE from supporting (S). Used by the
+        #   regime-C gate (_graph_evidence): the KG distinguishes HAS_DEFINING/REQUIRED (own identity) from
+        #   HAS_SUPPORTING (co-expressed, non-exclusive), but disc merges the two and counts supporting markers as
+        #   exclusive -> a specific anchor could be established from 1-2 supporting markers even when the core was
+        #   measured (on-panel) but off (df_absent): CA2 Pfkp/Sv2b, OB-mitral Robo3, FC Notch2. Matching is RAW
+        #   (same criterion as disc, PAN excluded) so share and normalization are unaffected.
         _core=set()
         for g in (t.get("R") or [])+(t.get("DF") or []):
             gu=_U(g)
@@ -637,20 +563,22 @@ def _build_ident_maps(octx, genes, pan_n=12):
             j=gUp.get(gu)
             if j is not None: _core.add(j)
         if _core: term_core[tid]=_core
-        term_neg[tid]=[j for j in (_gidx(g) for g in (t.get("N") or [])) if j is not None]   # 정규화(죽은 negative 복원)
-        # ★ "_low" graded-negative = SOFT (2026-06-19): "Pcp4_low" 류는 "이 유전자가 낮아야 함"이라는 **상대적 발현
-        #   힌트**(절대 부재 아님)인데 _gidx가 base(Pcp4)로 정규화 → 광범위발현 유전자가 auc≥0.85면 강한 negative로
-        #   genuine identity를 hard-veto(MHb: Chrna3/Gpr151/Avil excl_on=3인데 ambient Pcp4 auc0.861이 전면거부).
-        #   "_low"는 graded라 hard-veto에서 제외(neg_strong 불산입, neg_on엔 남아 excl_on≥2일 때만 1개 허용=§4.1).
-        #   "_high"(Foxp2_high 등)는 "높으면 안 됨"이라 auc≥0.85 veto가 올바르므로 그대로 hard 유지.
+        term_neg[tid]=[j for j in (_gidx(g) for g in (t.get("N") or [])) if j is not None]
+        # ★ A "_low" graded negative is SOFT: "Pcp4_low" means "this gene should be *relatively* low", not that
+        #   it is absent — yet _gidx normalizes it to the base symbol (Pcp4), so a broadly expressed gene at
+        #   auc>=0.85 becomes a strong negative and hard-vetoes a genuine identity (MHb has excl_on=3 from
+        #   Chrna3/Gpr151/Avil, but ambient Pcp4 at auc 0.861 rejected it outright).
+        #   "_low" is therefore excluded from the hard veto (not counted in neg_strong; it stays in neg_on, where
+        #   one is tolerated when excl_on>=2, §4.1). "_high" (Foxp2_high etc.) means "must not be high", so the
+        #   auc>=0.85 veto is correct there and stays hard.
         _soft=set(_gidx(g) for g in (t.get("N") or []) if str(g).lower().endswith("_low"))
         term_neg_soft[tid]={j for j in _soft if j is not None}
         # DEFINING markers (a single one is sufficient) — kept separately for the DF-override.
-        dfi=[j for j in (_gidx(g) for g in (t.get("DF") or [])) if j is not None]             # 정규화(df_offpanel/override)
+        dfi=[j for j in (_gidx(g) for g in (t.get("DF") or [])) if j is not None]
         if dfi: term_def[tid]=dfi
     lin_idx={}; lin_class={}
     for lx,gs in LIN.items():
-        idxs=[j for j in (_gidx(g) for g in gs) if j is not None]                             # 정규화(lineage 마커)
+        idxs=[j for j in (_gidx(g) for g in gs) if j is not None]
         if idxs: lin_idx[lx]=idxs
     for tid,t in terms.items():
         lx=t.get("L","")
@@ -693,16 +621,20 @@ def _build_ident_maps(octx, genes, pan_n=12):
             "lin_idx":lin_idx,"lin_class":lin_class,"root":{tid:root(tid) for tid in terms},
             "genes":list(genes), "P":{tid:[p for p in (t.get("P") or []) if p in terms] for tid,t in terms.items()}}
 
-# ★ ANATOMICAL REGION-PRESENCE GATE (F-B, 2026-06-22) — brain module force-fit 차단.
-#   배경: 저감도 spatial(Stereo-seq)에서 정체성 약한 클러스터가, KG의 promiscuous region-exclusive 마커가
-#   noise로 ON 되며 **절편에 존재하지도 않는 region**(소뇌/뇌교)의 rare nucleus로 force-fit됨(예: 시상 뉴런
-#   749개가 cerebellar unipolar brush cell로). KG region 마커로는 부재 판정이 불가(promiscuous → cerebellar
-#   GABA가 thalamic보다 높게 나옴 = 정상 차단 회귀)이므로, **curated anatomical-region 마커**(아래)로 데이터셋
-#   수준 존재 여부를 1회 판정해, 부재 region의 region-group을 dominant/anchor 후보에서 제외한다.
-#   anatomical(coarse) 수준이라 weak-marker 하위(SNr=midbrain GABAergic; midbrain union이 Th/Slc6a3 포함)는
-#   부당 차단되지 않음. 비-brain module은 region-group 라벨이 매칭 안 돼 게이트 비활성(무영향).
-#   검증(stereoseq_brain): PRESENT hippocampus11%/cortex7.9/thalamus4.3/striatum3.1/midbrain2.5/amygdala2.2
-#   vs ABSENT olfactory_bulb0.026/pons-medulla0.024/cerebellum0.007 (present_thr=0.002로 명백 부재만 차단).
+# ★ ANATOMICAL REGION-PRESENCE GATE (F-B) — blocks force-fits in the brain module.
+#   Background: on low-sensitivity spatial data (Stereo-seq), a cluster with weak identity gets force-fit
+#   to a rare nucleus of a **region that is not even in the section** (cerebellum, pons) because a
+#   promiscuous region-exclusive marker in the KG switches ON from noise (e.g. 749 thalamic neurons called
+#   cerebellar unipolar brush cells). KG region markers cannot establish absence (they are promiscuous —
+#   cerebellar GABA scores higher than thalamic, which would regress the normal blocking), so a set of
+#   **curated anatomical-region markers** (below) is used once to decide presence at the dataset level, and
+#   region-groups of absent regions are removed from the dominant / anchor candidates.
+#   The test is at the coarse anatomical level, so weak-marker subtypes (SNr = midbrain GABAergic; the
+#   midbrain union includes Th/Slc6a3) are not unfairly blocked. In a non-brain module no region-group
+#   label matches and the gate is inactive (no effect).
+#   Validation (stereoseq_brain): PRESENT hippocampus 11% / cortex 7.9 / thalamus 4.3 / striatum 3.1 /
+#   midbrain 2.5 / amygdala 2.2 vs ABSENT olfactory_bulb 0.026 / pons-medulla 0.024 / cerebellum 0.007
+#   (present_thr=0.002 blocks only unambiguous absence).
 BRAIN_ANAT_MARKERS = {
     "cerebellum":     ["Gabra6", "Cbln3", "Pcp2", "Eomes"],
     "pons/medulla":   ["Pou4f1", "Lmx1b", "Phox2b", "Phox2a", "Hoxb5", "Tlx3", "Barhl1"],
@@ -716,7 +648,8 @@ BRAIN_ANAT_MARKERS = {
     "amygdala":       ["Lypd1", "C1ql3", "Cyp26b1"],
     "septum":         ["Zic1", "Zic4", "Trpc4"],
 }
-# (keyword, anat) — region-group 라벨 substring 매칭, 위→아래 first-match (hypothalam이 thalamic보다 먼저!)
+# (keyword, anat) — substring match against region-group labels, first match top-down
+# (hypothalam must come before thalamic!)
 GROUP_TO_ANAT = [
     ("hypothalam", "hypothalamus"), ("thalamic", "thalamus"), ("cerebell", "cerebellum"),
     ("ponto", "pons/medulla"), ("pontine", "pons/medulla"), ("medullary", "pons/medulla"),
@@ -727,11 +660,12 @@ GROUP_TO_ANAT = [
     ("fasciola", "hippocampus"),
     ("striatal", "striatum"), ("amygdal", "amygdala"), ("septal", "septum"),
 ]
-REGION_PRESENT_THR = 0.002   # dataset 존재율(>=2 anat 마커 co-expr cell 비율) 미만이면 그 region 부재
+REGION_PRESENT_THR = 0.002   # a region is absent when its dataset presence rate (fraction of cells co-expressing >=2 anatomical markers) is below this
 
 def _absent_region_groups(X, genes, octx, gmu, gsd, thr=REGION_PRESENT_THR):
-    """전체 데이터(init)에서 1회 계산. 반환: (absent_rg set[region-group term-id], present dict[anat→frac]).
-    subcluster는 부분집합이라 직접 계산 불가 → init 결과를 persist해 재사용."""
+    """Computed once over the full data (at init). Returns (absent_rg set[region-group term-id],
+    present dict[anat->frac]). A subcluster sees only a subset and cannot compute this itself, so the init
+    result is persisted and reused."""
     if gmu is None or gsd is None:
         return set(), {}
     genes = list(genes); gi = {g: i for i, g in enumerate(genes)}
@@ -788,11 +722,13 @@ def _graph_evidence(fon, lf, pin, IDM, octx, frac=0.30, lf_on=1.5, pin_min=0.25,
     #   is safe here ONLY because region-gating has already excluded the cross-region high-auc blips.
     def on_enr(g): return fon[g]>=frac or (lf[g]>=lf_on and pin[g]>=pin_min)
     def on_anchor(g): return on_enr(g) or (auc is not None and auc[g]>=auc_hi)
-    # ★ LINEAGE adaptive floor (2026-07-02): on_present는 lineage 판정 substrate. adaptive_floor ON이면 pin_floor를
-    #   여기에도 적용(region-agnostic — lineage는 region보다 먼저 결정) → rare lineage의 변별 required 마커(NK GNLY
-    #   pin~0.24 < 고정 0.25인데 15/6-cell dropout)가 codom에 뜬다. SAFE: codom 정체성은 여전히 disc_on(변별 마커)을
-    #   요구하므로(line ~728 repick/overlay), pin_floor를 넘은 leaky pan 마커는 false identity를 못 만들고 hijack-기각된다.
-    #   pin_floor 자체가 min(fixed, gpin×F)+Nmin guard라 흔한 ambient 마커엔 floor를 안 내림(rare-specific만). None(off)=무변경.
+    # ★ LINEAGE adaptive floor: on_present is the substrate for the lineage call. When adaptive_floor is ON,
+    #   pin_floor applies here too (region-agnostic — lineage is decided before region), so a rare lineage's
+    #   discriminative required marker (NK GNLY, pin~0.24 < the fixed 0.25 under 15/6-cell dropout) still
+    #   surfaces as codominant. SAFE: a codominant identity still requires disc_on (a discriminative marker),
+    #   so a leaky pan marker that clears pin_floor cannot create a false identity — it is rejected as a hijack.
+    #   pin_floor itself is min(fixed, gpin x F) plus an Nmin guard, so it never lowers the floor for common
+    #   ambient markers (only for rare-specific ones). None (off) = unchanged.
     def on_present(g): return (pin[g]>=pin_min or (pin_floor is not None and pin[g]>=pin_floor[g])) and (mean is None or mean[g]>0)
     def gname(g): return str(genes[g]) if (genes is not None and 0<=g<len(genes)) else str(g)
     children={}
@@ -801,56 +737,67 @@ def _graph_evidence(fon, lf, pin, IDM, octx, frac=0.30, lf_on=1.5, pin_min=0.25,
     def ev(tid):   # anchor evidence — uses LOOSE on_anchor (auc branch) since region-gating already excludes cross-region blips
         dc=disc.get(tid,[])
         excl=[g for g in dc if share.get(g,99)<=SPEC_REGION_MAX]  # exclusive: spans ≤N region-groups (hierarchy-aware)
-        # ★ POSITIVE-anchor bar within a GATED region (2026-06-17): low-copy layer/subtype markers (Rorb/Rspo1→L4,
-        #   Cux2→L2/3, Fezf2→L5) are RANK-enriched yet below both the absolute on_enr floor AND auc_hi=0.85 in
-        #   sparse platforms (Stereo-seq: a real L4 leaf shows Rorb auc~0.68, Rspo1~0.72, mean~0.01). With only the
-        #   strict bar NO child subtype passes ⇒ anchors empty ⇒ the region node surfaces via fallback ⇒ the whole
-        #   cortex collapses to generic 'neocortical glutamatergic neuron' even though the layer signal is present
-        #   (user-reported regression vs the force-assign era). FIX: when region_gated (cross-region blips already
-        #   structurally excluded, container node excluded from competition), POSITIVE markers (excl/df/n_on) use a
-        #   looser auc_pos bar so a quiet-but-enriched layer marker anchors its layer. NEGATIVES stay STRICT
-        #   (on_anchor, 0.85) — a weak negative must never veto a term; region scoring (onm) also stays strict.
-        # ★ DATA-DERIVED detection floor (opt-in, 2026-07-01) — positive-anchor rescue for sparse platforms.
-        #   FIXED pin_min/frac are absolute fractions unreachable under heavy dropout (0.5µm SSAM: L4 defining
-        #   Rspo1 pin~0.19 < 0.25 ⇒ dropped though lf~1.94 genuinely specific). pin_floor/fon_floor are per-gene
-        #   REFERENCE-FREE floors = min(fixed, gpin[g]×F) / min(fixed, ghi[g]×F) with an Nmin cell-count guard
-        #   folded in (computed in _profile_leaves). Applied ONLY here (positive anchors) + ONLY region_gated —
-        #   so negatives(on_anchor)/region-scoring stay STRICT. (2026-07-02: on_present(lineage) ALSO uses pin_floor —
-        #   region-agnostic — for rare-lineage recovery; safe because codom identity still requires disc_on, see on_present.)
-        #   None (default/off) ⇒ predicate identical to before (zero change to existing modules). Recovers Rspo1→L4;
-        #   Rorb/Etv1 stay off (low fold+high global detection). auc bars unchanged (already rank-normalized).
+        # ★ POSITIVE-anchor bar within a GATED region: low-copy layer/subtype markers (Rorb/Rspo1 -> L4,
+        #   Cux2 -> L2/3, Fezf2 -> L5) are RANK-enriched yet fall below both the absolute on_enr floor AND
+        #   auc_hi=0.85 on sparse platforms (Stereo-seq: a real L4 leaf shows Rorb auc~0.68, Rspo1~0.72,
+        #   mean~0.01). With only the strict bar NO child subtype passes => anchors empty => the region node
+        #   surfaces via fallback => the whole cortex collapses to a generic 'neocortical glutamatergic neuron'
+        #   even though the layer signal is there. FIX: when region_gated (cross-region blips are already
+        #   structurally excluded and the container node is out of the competition), POSITIVE markers
+        #   (excl/df/n_on) use a looser auc_pos bar so a quiet-but-enriched layer marker anchors its layer.
+        #   NEGATIVES stay STRICT (on_anchor, 0.85) — a weak negative must never veto a term; region scoring
+        #   (onm) also stays strict.
+        # ★ DATA-DERIVED detection floor (opt-in) — positive-anchor rescue for sparse platforms.
+        #   A FIXED pin_min/frac is an absolute fraction that is unreachable under heavy dropout (0.5 um vector
+        #   field: the L4 defining marker Rspo1 has pin~0.19 < 0.25 and is dropped even though lf~1.94 is
+        #   genuinely specific). pin_floor/fon_floor are per-gene REFERENCE-FREE floors = min(fixed, gpin[g] x F)
+        #   / min(fixed, ghi[g] x F) with an Nmin cell-count guard folded in (computed in _profile_leaves).
+        #   Applied ONLY here (positive anchors) and ONLY when region_gated — negatives (on_anchor) and region
+        #   scoring stay STRICT. on_present (lineage) also uses pin_floor, region-agnostically, to recover rare
+        #   lineages; that is safe because a codominant identity still requires disc_on (see on_present).
+        #   None (default/off) => the predicate is identical to before (zero change for existing modules).
+        #   Recovers Rspo1 -> L4; Rorb/Etv1 stay off (low fold + high global detection). The auc bars are
+        #   unchanged (already rank-normalized).
         def on_pos(g): return on_anchor(g) or (region_gated and auc is not None and auc[g]>=auc_pos) \
             or (region_gated and pin_floor is not None and lf[g]>=lf_on and pin[g]>=pin_floor[g]) \
             or (region_gated and fon_floor is not None and fon[g]>=fon_floor[g])
         excl_on=[g for g in excl if on_pos(g)]
-        _core_set=core_map.get(tid,())                       # regime-C: ON exclusive 중 core(R∪DF)인 것 수
+        _core_set=core_map.get(tid,())
         excl_on_core=sum(1 for g in excl_on if g in _core_set)
-        ng=[g for g in neg.get(tid,()) if on_anchor(g) and gname(g).upper() not in _cross_tx]  # negative-marker leak (cross-lineage transmitter ambient 제외)
-        _soft=neg_soft.get(tid,())  # "_low" graded 힌트는 hard-veto 제외(상대발현 힌트≠절대부재)
-        ng_strong=[g for g in ng if auc is not None and auc[g]>=auc_hi and g not in _soft]  # 강한 negative(rank-enriched, ambient 아님) — 진짜 반대증거
+        ng=[g for g in neg.get(tid,()) if on_anchor(g) and gname(g).upper() not in _cross_tx]  # negative-marker leak (cross-lineage transmitter ambient excluded)
+        _soft=neg_soft.get(tid,())  # a "_low" graded hint is excluded from the hard veto (a relative-expression hint is not absolute absence)
+        ng_strong=[g for g in ng if auc is not None and auc[g]>=auc_hi and g not in _soft]  # a strong negative (rank-enriched, not ambient) — genuine counter-evidence
         df=[g for g in defn.get(tid,()) if on_pos(g)]
-        # ★ CORE-absent (req-veto 일반화, 2026-06-27; df-guard 2026-06-28): core(R∪DF, pan제외, on-panel)가 ≥1 있는데
-        #   exclusive-core도 defining(df)도 하나도 ON이 아님 → 정체 근거 전무. df_absent(DEFINING 전용)이 DF 없고
-        #   required만 있는 term(immature granule: R=Dcx…, DF=[])을 못 막아 supporting(Neurod1)으로 force-fit되던 것
-        #   일반화. ★len(df)==0 필수: 비-exclusive defining이 ON인 df-anchored 진짜 type(L5 ET/L6 CT/L6b/MH-LH/
-        #   Sncg+)을 오차단하던 회귀(2026-06-28 회귀검증서 발견)를 방지 — defining이 ON이면 정당 anchor.
+        # ★ CORE-absent (a generalization of the required veto): the term has >=1 core marker (R u DF, pan
+        #   excluded, on-panel) yet neither an exclusive core marker nor a defining marker is ON -> there is no
+        #   identity evidence at all. df_absent (DEFINING only) could not stop a term that has no DF and only
+        #   required markers (immature granule: R=Dcx..., DF=[]) from being force-fit through a supporting marker
+        #   (Neurod1); this generalizes it.
+        #   ★ len(df)==0 is required: without it, a genuine df-anchored type whose non-exclusive defining marker
+        #   is ON (L5 ET, L6 CT, L6b, MH-LH, Sncg+) would be wrongly blocked. A defining marker that is ON is a
+        #   legitimate anchor.
         core_absent=bool(len(_core_set)>=1 and excl_on_core==0 and len(df)==0)
         n_on=sum(1 for g in dc if on_pos(g))
         supported=bool((len(excl_on)>=1 or (len(excl)==0 and n_on>=2)) and len(ng)==0)
-        # ★ DF-absent 가드 (2026-06-15): defn[tid]은 _build_ident_maps가 패널(adata.var_names)로 만들어 ON-PANEL
-        #   defining 마커만 담는다(off-panel DF는 애초 제외 → CA1 Wfs1류는 면제). defining은 "하나면 충분"한 최강
-        #   등급이므로, 그 역 — 측정됐는데(on-panel) 하나도 ON이 아니면(df==[]) 그 type일 가능성이 매우 낮다 →
-        #   force-fit. 이 term은 supporting만으로 anchor했어도 강등(아래 sort 1차키)·verdict에서 제외. auc≥0.85
-        #   분기로 quiet-but-enriched DF(cl50 Grik4 auc0.92)는 ON 처리되어 면제. DF 없는 term(대부분)은 영향 0.
+        # ★ DF-absent guard: defn[tid] is built by _build_ident_maps against the panel (adata.var_names) and
+        #   therefore holds only ON-PANEL defining markers (off-panel DFs are excluded from the start, so cases
+        #   like CA1's Wfs1 are exempt). A defining marker is the strongest grade — "one is enough" — so the
+        #   converse holds: if such a marker was measured (on-panel) and none is ON (df==[]), the type is very
+        #   unlikely => force-fit. Such a term is demoted (the primary sort key below) and excluded from the
+        #   verdict even if it anchored on supporting markers alone. The auc>=0.85 branch treats a
+        #   quiet-but-enriched DF as ON (cl50 Grik4 auc 0.92), which exempts it. Terms with no DF (most of them)
+        #   are unaffected.
         df_onpanel=defn.get(tid,())
         df_absent=bool(len(df_onpanel)>=1 and len(df)==0)
-        # ★ off-panel-defining 가드 (2026-06-16): df_absent(on-panel인데 OFF, quiet 가능 → 약한 tiebreak)와
-        #   범주가 다르다. term이 KG상 defining 마커를 가지는데(terms[tid].DF 비어있지 않음) 그게 *전부 off-panel*
-        #   (패널에 아예 없음 → defn[tid] 비어 df_onpanel==() )이면 그 type의 고유 정체는 이 패널로 **영원히
-        #   확인 불가**(quiet이 아니라 측정 자체가 없음). 이런 term은 broad/false-exclusive 보조마커(Kisspeptin의
-        #   Prlr/Tac2 — Kiss1 off-panel)만으로 force-fit되기 쉽다. df_absent와 달리 cortical 층은 절대 안 걸림
-        #   (층 defining Cux2/Fezf2/Foxp2/Rspo1/Car3는 모두 on-panel). 독립 exclusive 근거가 강하면(excl_on≥2)
-        #   defining 없이도 식별 가능하므로 면제; excl_on<2(단일 가능-false-exclusive)면 panel-blind force-fit.
+        # ★ off-panel-defining guard: a different category from df_absent (on-panel but OFF, possibly quiet -> a
+        #   weak tiebreak). If a term has defining markers in the KG (terms[tid].DF is non-empty) but they are
+        #   *all off-panel* (absent from the panel, so defn[tid] is empty and df_onpanel==()), that type's own
+        #   identity can **never** be confirmed with this panel (it is not quiet — it was never measured). Such a
+        #   term is easy to force-fit from broad / false-exclusive supporting markers (Kisspeptin's Prlr/Tac2,
+        #   since Kiss1 is off-panel). Unlike df_absent this never catches cortical layers (their defining markers
+        #   Cux2/Fezf2/Foxp2/Rspo1/Car3 are all on-panel). Strong independent exclusive evidence (excl_on>=2) makes
+        #   the type identifiable without a defining marker and is exempt; excl_on<2 (a single, possibly
+        #   false-exclusive marker) is a panel-blind force-fit.
         df_kg=terms.get(tid,{}).get("DF") or []
         df_offpanel=bool(len(df_kg)>=1 and len(df_onpanel)==0)
         return {"term_id":tid,"label":lab.get(tid,tid),"tier":tier.get(tid,""),
@@ -883,20 +830,23 @@ def _graph_evidence(fon, lf, pin, IDM, octx, frac=0.30, lf_on=1.5, pin_min=0.25,
                  "SLC6A4","SLC6A2","TPH2","CHAT","SLC18A3","SLC5A7","HDC"}
     def _is_neur(ln): return any(gname(g).upper() in NEURONAL_TX for g in lin_idx.get(ln,[]))
     _neur_present=any(_is_neur(ln) and any(on_present(g) for g in idxs) for ln,idxs in lin_idx.items())
-    # ★ 비-뉴런 오염 감지 (2026-06-16, ENRICHMENT 기반): 비-뉴런 class lineage(oligo=Plp1/Mbp/Mag, astro=Aqp4/Slc1a2,
-    #   micro=C1qa/Csf1r, VLMC=Col1a1/Dcn …)가 ≥2개 마커 ENRICHED(on_anchor=vs-rest auc≥0.85)이고 **뉴런 transmitter는
-    #   하나도 enriched 아니면** → 진짜 비-뉴런 fragment. presence(ambient neuropil)가 아니라 ENRICHMENT로 판정하므로,
-    #   뉴런 클러스터에 박힌 fiber-tract/혈관/미세아교 오염 조각이 ambient Snap25/Gad를 가져도 glia로 풀린다(parent-
-    #   constraint 해제 + 뉴런우선 해제 → ~19k cell glia가 striatal/midbrain GABA로 오라벨되던 버그). ★진짜 뉴런은
-    #   glial이 ambient(non-enriched, auc<0.85)라 _nn_enr<2 → 안 풀림(cl9 L6b: up=Cplx3/Nxph3 enriched, Plp1/Mbp는
-    #   ambient라 enrich 안 됨 → 보호). transmitter가 enriched면(_neur_enr>0) 진짜 뉴런이므로 절대 해제 안 함.
-    #   (보수적: 뉴런 transmitter가 하나도 present 안 할 때만 — ambient neuropil이 검출되는 fiber-tract/혈관 오염은
-    #   여기서 못 풀고, 아래 _validate GLIAL_MISLABEL 백스톱이 up-기반으로 잡아 agent가 glia로 재라벨한다.)
-    # ★ 뉴런우선 예외 = ENRICHMENT 대칭 (2026-07-08): 비-뉴런 lineage 가 **≥2 마커 ENRICHED**(on_anchor)이고
-    #   뉴런 transmitter 는 **enriched 가 아님**(ambient 로 present 만)이면 진짜 비-뉴런. 이전엔 `not _neur_present`
-    #   (뉴런 transmitter 가 하나도 검출 안 될 때만)이라 neuropil 에 박힌 microglia(ambient 뉴런신호 항상 present)를
-    #   못 구제 → GABA/뉴런으로 오배정(cl24). present→enriched 로 바꿔, 진짜 뉴런(transmitter enriched)은 그대로 보호하고
-    #   ≥2 특이마커 enriched 인 microglia(뉴런신호는 ambient=non-enriched)만 빠져나오게 한다. glia≥2 는 단일마커 노이즈 차단.
+    # ★ Non-neuronal contamination detection (ENRICHMENT based): when a non-neuronal class lineage
+    #   (oligo = Plp1/Mbp/Mag, astro = Aqp4/Slc1a2, micro = C1qa/Csf1r, VLMC = Col1a1/Dcn ...) has >=2 markers
+    #   ENRICHED (on_anchor = vs-rest auc>=0.85) and **no neuronal transmitter is enriched**, the leaf is a
+    #   genuine non-neuronal fragment. The test is ENRICHMENT, not presence (ambient neuropil), so a
+    #   fiber-tract / vascular / microglial contamination fragment embedded in neuronal territory is released
+    #   to glia even while it carries ambient Snap25/Gad (this releases the parent constraint and the neuronal
+    #   priority; without it ~19k glial cells were mislabelled as striatal/midbrain GABAergic).
+    #   ★ A real neuron is protected: its glial signal is ambient (non-enriched, auc<0.85) so _nn_enr<2
+    #   (cl9 L6b: up = Cplx3/Nxph3 enriched, Plp1/Mbp ambient and not enriched). When a transmitter IS
+    #   enriched (_neur_enr>0) the leaf is a real neuron and is never released.
+    # ★ The neuronal-priority exception is ENRICHMENT-symmetric: a non-neuronal lineage with **>=2 markers
+    #   ENRICHED** (on_anchor) while neuronal transmitters are **not enriched** (merely present as ambient) is
+    #   genuinely non-neuronal. Requiring `not _neur_present` instead (i.e. no neuronal transmitter detected at
+    #   all) failed to rescue microglia embedded in neuropil — ambient neuronal signal is always present — and
+    #   they were misassigned to GABAergic/neuronal types (cl24). Using enriched rather than present keeps real
+    #   neurons (transmitter enriched) protected while letting microglia with >=2 enriched specific markers out.
+    #   The glia>=2 requirement blocks single-marker noise.
     _neur_enriched=any(_is_neur(ln) and any(on_anchor(g) for g in idxs) for ln,idxs in lin_idx.items())
     _nn_on=any((not _is_neur(ln)) and ln in lin_class and sum(1 for g in idxs if on_anchor(g))>=2 for ln,idxs in lin_idx.items())
     # ★ COMPARATIVE non-neuronal dominance (2026-07-15): on dense/KDE spatial data (Stereo-seq) glial identity
@@ -937,18 +887,22 @@ def _graph_evidence(fon, lf, pin, IDM, octx, frac=0.30, lf_on=1.5, pin_min=0.25,
         best=max(strength.items(), key=lambda kv:kv[1]); LIN_RATIO=0.5
         codom=sorted([ln for ln,s in strength.items() if s>=LIN_RATIO*best[1]], key=lambda ln:-strength[ln])
         lineage_ambiguous=len(codom)>=2
-        # ★ NON-IDENTITY LINEAGE OVERLAY (2026-06-23, 일반화). CASE: 한 클러스터의 변별 정체성은 lineage B인데
-        #   (B의 변별 required 마커 ON), 다른 lineage A의 프로그램도 함께 present하다. 단 A의 존재가 *오직 비특이
-        #   (pan_disc=R+S를 ≥12 term이 공유) required 마커로만* 뒷받침되고 A의 변별(∉pan_disc) required 마커가 0개면
-        #   → A는 경쟁 정체성이 아니라 B 위에 얹힌 프로그램 overlay(활성화/전이 상태, 예: EndMT/EMT) 또는 ambient.
-        #   lineage strength는 "단일 required 마커 max"라 A의 비특이 마커 하나가 broad-shared로 높게 뜨면 lineage를
-        #   가로챌(hijack) 수 있다. 계열·유전자명 비종속: "변별 ON-required=0" 구조로만 정의 — KG marker-sharing 통계
-        #   (octx.pan_disc, _build 동일 기준)만 사용. evidence-not-verdict: overlay_lineages/lineage_repick으로 surface.
+        # ★ NON-IDENTITY LINEAGE OVERLAY (generalized). CASE: a cluster's discriminative identity is lineage B
+        #   (B's discriminative required markers are ON), yet the program of another lineage A is present too. If
+        #   A's presence rests *only on non-discriminative required markers* (pan_disc = R+S shared by >=12 terms)
+        #   and A has 0 discriminative (not in pan_disc) required markers ON, then A is not a competing identity
+        #   but a program overlaid on B (an activation/transition state such as EndMT/EMT) or ambient signal.
+        #   Lineage strength is "the max over single required markers", so one non-discriminative marker of A
+        #   scoring high through broad sharing can hijack the lineage. This is independent of lineage and gene
+        #   names: it is defined purely by the structure "discriminative ON-required = 0", using only KG
+        #   marker-sharing statistics (octx.pan_disc, the same criterion as _build). Evidence, not verdict: it is
+        #   surfaced as overlay_lineages / lineage_repick.
         _PAN=octx.get("pan_disc") or set()
         def _disc_on(ln): return [g for g in lin_idx.get(ln,[]) if on_present(g) and gname(g).upper() not in _PAN]
-        # (1) REPICK action: overlay lineage(disc_on=∅)가 raw max strength를 차지 → 변별 ON-required≥2인 codom
-        #   경쟁자로 best 재지정(≥2는 단일 ambient bleed 마커로 인한 오재지정 차단). 자기보호: 진짜 SMC는 MYH11/CNN1
-        #   (∉pan_disc) ON → disc_on≥1 → 절대 강등 안 됨; ¬lineage_ambiguous면 발동 0.
+        # (1) REPICK action: an overlay lineage (disc_on = {}) holds the raw max strength -> re-designate best to
+        #   a codominant competitor with >=2 discriminative ON-required markers (>=2 blocks a re-designation
+        #   caused by a single ambient-bleed marker). Self-protection: a real SMC has MYH11/CNN1 (not in
+        #   pan_disc) ON -> disc_on>=1 -> it is never demoted; with no lineage_ambiguous this never fires.
         if lineage_ambiguous and not _disc_on(best[0]):
             _alts=[ln for ln in codom if ln!=best[0] and len(_disc_on(ln))>=2]
             if _alts:
@@ -959,20 +913,24 @@ def _graph_evidence(fon, lf, pin, IDM, octx, frac=0.30, lf_on=1.5, pin_min=0.25,
                                 "reason":"codominant non-specific hijack: winner held only by pan_disc(broad-shared) required marker(s); deferred to discriminative-corroborated codominant lineage"}
                 best=(_new, strength[_new])
         cls=lin_class[best[0]]; cls_root=IDM["root"].get(cls,cls)
-        # (2) OVERLAY surface: codominant present lineage 중 정체성(best)이 아니고 변별 ON-required=0인 것 = 프로그램/
-        #   ambient(정체성 아님). agent가 고발현 program 보고 정체성을 그쪽으로 갈아타는 것을 차단(cl8 EC→myofibroblast).
+        # (2) OVERLAY surface: among codominant present lineages, one that is not the identity (best) and has 0
+        #   discriminative ON-required markers is a program / ambient signal, not an identity. This stops the
+        #   agent from switching identity to a high-magnitude program (cl8 EC -> myofibroblast).
         overlay_lineages=[{"lineage":lab.get(lin_class.get(ln),ln),"present":[gname(g) for g in lin_idx.get(ln,[]) if on_present(g)]}
                           for ln in codom if ln!=best[0] and not _disc_on(ln)]
-        # (3) INDISCRIMINABLE LINEAGES → 공통조상/Unknown (2026-06-23, cl12 type). CASE: best lineage의 on_present
-        #   required 마커가 *전부 다른 codom lineage와 공유*돼(PTPRC ∈ myeloid.R & lymphocyte.R, 둘의 top 신호)
-        #   best 고유(codom-private) 변별 마커가 0개 = codom을 구분할 증거가 없음 → 어느 한쪽을 confident하게 고를 수
-        #   없다. RULE: 최심 공통조상 class로 라벨(없으면 Unknown). ★pan_disc 아님 — codom-private로만 판정하므로 뇌
-        #   transmitter(Slc17a7 ∈ glut만, GABA엔 없음=private)는 안 걸려 진짜 glut/GABA doublet은 보호(split 경로
-        #   유지). repick이 이미 정체성(B)을 찾았으면(lineage_repick≠None) skip — cl8은 여기 안 옴.
+        # (3) INDISCRIMINABLE LINEAGES -> common ancestor / Unknown. CASE: every on_present required marker of
+        #   the best lineage is *shared with another codominant lineage* (PTPRC is in both myeloid.R and
+        #   lymphocyte.R and is the top signal of both), so best has 0 own (codominant-private) discriminative
+        #   markers = there is no evidence that separates the codominants -> neither can be chosen confidently.
+        #   RULE: label the deepest common ancestor class (Unknown when there is none).
+        #   ★ This is not pan_disc — the test is codominant-private, so brain transmitters (Slc17a7 is in glut
+        #   only, absent from GABA = private) never trigger it and a genuine glut/GABA doublet stays protected
+        #   (the split path is preserved). Skipped when repick already found the identity B
+        #   (lineage_repick != None) — cl8 never reaches here.
         if lineage_ambiguous and lineage_repick is None:
             _oth_best=set().union(*[{gname(g).upper() for g in lin_idx.get(o,[])} for o in codom if o!=best[0]])
             _priv_best=[g for g in lin_idx.get(best[0],[]) if on_present(g) and gname(g).upper() not in _oth_best]
-            if not _priv_best:                                          # best 고유 변별 0 → 구분 불가
+            if not _priv_best:
                 lineage_unresolved=True
                 def _anc(tid):
                     ch=[tid]; seen={tid}
@@ -982,32 +940,36 @@ def _graph_evidence(fon, lf, pin, IDM, octx, frac=0.30, lf_on=1.5, pin_min=0.25,
                         ch.append(nx); seen.add(nx)
                     return ch
                 _common=set.intersection(*[set(_anc(lin_class.get(ln,ln))) for ln in codom])
-                for x in _anc(lin_class.get(best[0],best[0])):           # best 경로에서 가장 깊은 공통조상
+                for x in _anc(lin_class.get(best[0],best[0])):
                     if x in _common: unresolved_to=lab.get(x,x); break
-        # ★ dual-transmitter cross-root 도달(2026-06-15): MHb(cholinergic-glutamatergic)는 root=glut인데 cl28처럼
-        #   glut transmitter OFF·cholinergic ON이면 cholinergic lineage로 검출돼 도달 불가했음. 검출 lineage의 전달물질
-        #   심볼을 모아, 그걸 자기 R에 가진 cross-root term(MHb=Chat/Slc18a3 보유)을 아래 anchor 루프가 region-gate
-        #   우회로 후보에 포함시킨다(공동방출 뉴런 복원).
+        # ★ dual-transmitter cross-root reachability: MHb (cholinergic-glutamatergic) has root=glut, so a leaf
+        #   like cl28 with the glut transmitter OFF and cholinergic ON is detected as the cholinergic lineage and
+        #   MHb becomes unreachable. The transmitter symbols of the detected lineage are collected, and the anchor
+        #   loop below admits cross-root terms that carry them in their own R (MHb holds Chat/Slc18a3) as
+        #   region-gate bypass candidates, recovering co-releasing neurons.
         lin_tx_sym={gname(g).upper() for g in lin_idx.get(best[0],[])}
-    # ★ cross-lineage transmitter negative 무시 (2026-06-16): lineage gate가 이미 glut/GABA/등을 확정했으므로,
-    #   leaf lineage가 아닌 다른 lineage의 transmitter(GABAergic leaf의 pan-glut Slc17a7/6/8, glut leaf의 Gad1/2)를
-    #   negative로 카운트하면 8µm ambient bleed에 항상 leak해 진짜 type을 부당 veto한다 — D1/D2-MSN이 pan-glut
-    #   negative 때문에 모든 선조체 leaf에서 탈락하고 eSPN(가짜 negative)만 생존하던 직접 원인. leaf 자신의 lineage
-    #   transmitter는 그대로 유지(진짜 음성 근거). ev()의 ng 계산에서 _cross_tx를 제외한다.
+    # ★ Ignore cross-lineage transmitter negatives: the lineage gate has already fixed glut/GABA/etc., so
+    #   counting another lineage's transmitter as a negative (pan-glut Slc17a7/6/8 on a GABAergic leaf, Gad1/2
+    #   on a glut leaf) always leaks under 8 um ambient bleed and unfairly vetoes the real type — this was the
+    #   direct cause of D1/D2-MSN failing on every striatal leaf through the pan-glut negative while eSPN (a
+    #   false negative) survived. A leaf's own lineage transmitter is kept as genuine negative evidence.
+    #   _cross_tx is therefore excluded from the ng computation in ev().
     _leaf_lins=[ln for ln,tid in lin_class.items() if IDM["root"].get(tid,tid)==cls_root]
     _own_tx={gname(g).upper() for ln in _leaf_lins for g in lin_idx.get(ln,[]) if gname(g).upper() in NEURONAL_TX}
     _cross_tx={x for x in NEURONAL_TX if x not in _own_tx}
-    # ★ REGION-COHERENT DESCENT WITHIN the lineage: among the lineage class's region-groups (depth-1 children —
-    #   neocortical / thalamic / hippocampal pyramidal …), pick the DOMINANT by expression-weighted (relative,
-    #   not an absolute floor) sum over its subtree's ENRICHED EXCLUSIVE markers; ≥2 concordant markers required
-    #   so a lone broad gene (Stmn1) can't raise a region. ONLY that region's subtypes are anchor candidates ⇒
-    #   cross-region blips (CA2 in a thalamic glut cluster) are structurally excluded WITHOUT a magnitude floor,
-    #   so low-abundance layer markers (Fezf2→L5) survive. Gene-based, spatial-free.
-    # region scoring을 lineage의 **모든** region에 대해 먼저(allow와 무관) — fragment-escape 판정에 필요.
+    # ★ REGION-COHERENT DESCENT WITHIN the lineage: among the lineage class's region-groups (depth-1 children
+    #   — neocortical / thalamic / hippocampal pyramidal ...), pick the DOMINANT by expression-weighted
+    #   (relative, not an absolute floor) sum over its subtree's ENRICHED EXCLUSIVE markers; >=2 concordant
+    #   markers are required so a lone broad gene (Stmn1) cannot raise a region. ONLY that region's subtypes
+    #   are anchor candidates => cross-region blips (CA2 in a thalamic glut cluster) are structurally excluded
+    #   WITHOUT a magnitude floor, so low-abundance layer markers (Fezf2 -> L5) survive. Gene-based,
+    #   spatial-free.
+    # Region scoring runs first over **all** regions of the lineage (independent of allow) — it is needed for
+    # the fragment-escape decision.
     rg_terms={}
     for t in terms:
         if IDM["root"].get(t)==cls_root: rg_terms.setdefault(region_of.get(t,t),[]).append(t)
-    _absent=absent_rg or set()   # F-B: 데이터셋에 부재한 region-group은 후보 제외(dominant/floor/anchor)
+    _absent=absent_rg or set()
     region_groups_all=[rg for rg in children.get(cls,[]) if tier.get(rg)!="class" and rg not in _absent]
     rg_score={}; rg_hasdf={}
     for rg in region_groups_all:
@@ -1021,7 +983,7 @@ def _graph_evidence(fon, lf, pin, IDM, octx, frac=0.30, lf_on=1.5, pin_min=0.25,
         onm=[g for g in gg if on_anchor(g)]
         if len(onm)>=2:
             rg_score[rg]=sum(lvl(g) for g in onm)
-            rg_hasdf[rg]=any(on_anchor(g) for g in rdf if share.get(g,99)<=SPEC_REGION_MAX)  # defining 마커 ON?
+            rg_hasdf[rg]=any(on_anchor(g) for g in rdf if share.get(g,99)<=SPEC_REGION_MAX)
     # ★ COMPARATIVE region establishment (2026-07-15): the strict pass above needs ≥2 region-exclusive markers
     #   at on_anchor (auc≥0.85 OR fon≥0.30). On dense KDE spatial data (Stereo-seq) a region master TF
     #   (Satb2→neocortical) caps at auc~0.70 and the layer markers are DILUTED at the mixed-cluster level
@@ -1058,16 +1020,19 @@ def _graph_evidence(fon, lf, pin, IDM, octx, frac=0.30, lf_on=1.5, pin_min=0.25,
                 _rdf=set(defn.get(_r1,()))
                 for t in rg_terms.get(_r1,()): _rdf|=set(defn.get(t,()))
                 rg_hasdf[_r1]=any(auc[g]>=_REG_CMP_AUC for g in _rdf if share.get(g,99)<=SPEC_REGION_MAX)
-    # ★ FRAGMENT-ESCAPE (2026-06-18): subcluster가 부모 region(restrict_root→allow)에 제약됐는데, 제약 **밖** region이
-    #   더 강하게(score 우위) + 그 region에 **defining 마커가 ON**으로 뜨면 = 부모에 다수로 섞였던 소수가 다른-region
-    #   정체로 고립된 것(stomics cl6: 피질 다수 + BLA 19% 소수 → 분할로 BLA blob 고립). 부모 제약을 해제해 자식이 자기
-    #   정체로 resolve하게 한다. defining 게이트 + score우위로 leaky cross-region force-fit(옛 cortex→pontine 버그)은 차단
-    #   (단일 leaky 마커는 ≥2 on_anchor도 defining도 못 만족). 부모가 region 못 정한 경우(allow=lineage class만)도 동일.
+    # ★ FRAGMENT-ESCAPE: a subcluster is constrained to the parent region (restrict_root -> allow), but a
+    #   region **outside** that constraint scores higher AND has a **defining marker ON** — that means a
+    #   minority which was mixed into the parent has been isolated with a different-region identity
+    #   (stomics cl6: a cortical majority plus a 19% BLA minority -> the split isolates the BLA blob). The
+    #   parent constraint is released so the child can resolve to its own identity. The defining gate plus the
+    #   score lead blocks a leaky cross-region force-fit (a single leaky marker satisfies neither >=2
+    #   on_anchor nor a defining marker). The same applies when the parent never fixed a region
+    #   (allow = the lineage class only).
     if allow is not None and rg_score:
         _ina=lambda rg: rg in allow
         _best_in=max((s for rg,s in rg_score.items() if _ina(rg)), default=0.0)
         _esc=[rg for rg,s in rg_score.items() if (not _ina(rg)) and rg_hasdf.get(rg) and s>_best_in]
-        if _esc: allow=None        # 제약 해제 → 자식이 다른 region(BLA)로 탈출 가능
+        if _esc: allow=None        # release the constraint -> the child may escape to a different region (BLA)
     region_groups=[rg for rg in region_groups_all if (allow is None or rg in allow)]
     rg_score={rg:s for rg,s in rg_score.items() if rg in region_groups}
     REGION_RATIO=0.6
@@ -1081,86 +1046,109 @@ def _graph_evidence(fon, lf, pin, IDM, octx, frac=0.30, lf_on=1.5, pin_min=0.25,
     #   at e.g. 'neocortical glutamatergic neuron', NOT the bare lineage class.
     anchors=[]
     for tid in terms:
-        # dual-transmitter cross-root term(MHb): root이 달라도 검출 lineage의 전달물질을 R에 가지면 후보 + region-gate 우회
+        # dual-transmitter cross-root term (MHb): admitted as a candidate and allowed to bypass the region gate
+        # when it carries the detected lineage's transmitter in R, even under a different root
         cross_dual=bool(lin_tx_sym and IDM["root"].get(tid)!=cls_root and tier.get(tid)!="class"
                         and ({str(g).upper() for g in (terms.get(tid,{}).get("R") or [])} & lin_tx_sym))
         if IDM["root"].get(tid)!=cls_root and not cross_dual: continue
         if tier.get(tid)=="class": continue
-        if region_of.get(tid,tid) in _absent and not cross_dual: continue   # F-B: 부재 region leaf 제외(non-region-gated 경로 포함)
+        if region_of.get(tid,tid) in _absent and not cross_dual: continue
         if allow is not None and tid not in allow: continue        # parent-constrained: only descendants of restrict_root
         if region_gated and not cross_dual and region_of.get(tid,tid) not in dominant: continue
-        # ★ region-group 컨테이너 노드(neocortical/thalamic/… = dominant의 원소 자신)는 main 경쟁에서 제외 —
-        #   자기 region-exclusive 마커(Slc30a3/Mef2c)가 적어 ratio=1.0로 자식 층(L4 excl_n8 ratio0.25)을 부당하게
-        #   이겨 모든 피질 층을 generic으로 붕괴시킴(2026-06-15). 의도대로 자식 leaf가 하나도 anchor 안 될 때만
-        #   아래 fallback으로 surface한다(주석: 'If none anchors, surface the dominant region-group node').
+        # ★ The region-group container node (neocortical / thalamic / ... = the element of dominant itself) is
+        #   excluded from the main competition: it has few region-exclusive markers of its own (Slc30a3/Mef2c),
+        #   so at ratio=1.0 it unfairly beats its child layers (L4 with excl_n 8 has ratio 0.25) and collapses
+        #   every cortical layer to the generic node. It surfaces, as intended, only through the fallback below
+        #   when no child anchors at all (see: 'If none anchors, surface the dominant region-group node').
         if region_gated and not cross_dual and tid in dominant: continue
         e=ev(tid)
-        # off-panel-defining 가드: KG defining이 전부 off-panel(df_offpanel)이고 독립 exclusive 근거가 약하면
-        #   (excl_on<2) panel-blind force-fit → anchor에서 제외 → 아래 region-node fallback으로 부모 region/class
-        #   surface(Kisspeptin: Kiss1 off-panel + Prlr 단일 excl → hypothalamic GABAergic으로 하강). excl_on≥2면 통과.
+        # off-panel-defining guard: when the KG defining markers are all off-panel (df_offpanel) and the
+        #   independent exclusive evidence is weak (excl_on<2), this is a panel-blind force-fit -> excluded from
+        #   the anchors -> the region-node fallback below surfaces the parent region/class (Kisspeptin: Kiss1 is
+        #   off-panel and Prlr is a single exclusive -> descend to hypothalamic GABAergic). excl_on>=2 passes.
         if e["df_offpanel"] and e["excl_on"]<2: continue
-        # ★ REGIME-C 게이트 (df_absent + supporting-only, 2026-06-26): core(R∪DF) defining 마커가 ON-PANEL인데
-        #   하나도 ON이 아니고(df_absent) ON된 exclusive가 전부 SUPPORTING(excl_on_core==0)이면 → confident
-        #   specific anchor 불가 → region/class floor로 하강. KG가 구분한 defining/required(고유 정체) vs
-        #   supporting(공발현)을 엔진이 합쳐 supporting만으로 measured-absent term을 mint하던 버그 차단
-        #   (CA2 Pfkp/Sv2b→oligo/cortex 조각, OB-mitral Robo3→피질, FC Notch2/Zfp536→CA1).
-        #   ★ Regime-A 보존: defining이 전부 OFF-PANEL이면 df_absent=False(df_onpanel 비어 위 가드 미발동) → supporting
-        #     으로 정상 anchor(사용자 지침). ★ Regime-B 보존: 진짜 layer의 quiet defining은 auc_pos(0.65) rescue로
-        #     on_pos→df 비어있지 않음→df_absent=False → 영향 0(2026-06-15 reverted hard-demote 회귀 재발 없음).
-        #   df_absent인데 core-specific(R∪DF) 1개라도 ON(excl_on_core≥1)이면 통과(정체 근거 존재).
-        #   ★ 2026-06-27: df_absent(DF전용)→core_absent(R∪DF)로 일반화. DF가 비고 REQUIRED만 있는 term이
-        #   required measured-but-off인데 supporting만으로 통과하던 것(immature granule Prox1/Dcx OFF→Stmn1로
-        #   force-fit)을 차단. Regime-A(required 전부 off-panel→_core_set 비어 core_absent=False) 보존,
-        #   Regime-B(quiet required/df가 auc_pos 0.65 rescue→excl_on_core≥1→core_absent=False) 보존.
+        # ★ REGIME-C gate (df_absent + supporting-only): when the core (R u DF) defining marker is ON-PANEL yet
+        #   none is ON (df_absent) and every ON exclusive marker is SUPPORTING (excl_on_core == 0), a confident
+        #   specific anchor is impossible -> descend to the region/class floor. This blocks the bug where the
+        #   engine merged the KG's distinction between defining/required (own identity) and supporting
+        #   (co-expression) and minted a measured-absent term from supporting markers alone (CA2 Pfkp/Sv2b on
+        #   oligo/cortex fragments, OB-mitral Robo3 in cortex, FC Notch2/Zfp536 on CA1).
+        #   ★ Regime A is preserved: if the defining markers are all OFF-PANEL then df_absent=False (df_onpanel is
+        #     empty so the guard above does not fire) -> anchoring on supporting markers proceeds normally.
+        #   ★ Regime B is preserved: a genuine layer's quiet defining marker is rescued by auc_pos (0.65) ->
+        #     on_pos -> df is non-empty -> df_absent=False -> no effect.
+        #   When df_absent but at least one core-specific (R u DF) marker is ON (excl_on_core>=1) it passes
+        #   (identity evidence exists).
+        #   Generalized from df_absent (DF only) to core_absent (R u DF): a term with no DF and only REQUIRED
+        #   markers, whose required markers were measured but are off, could still pass on supporting markers
+        #   alone (immature granule with Prox1/Dcx OFF force-fit through Stmn1). Regime A (required markers all
+        #   off-panel -> _core_set empty -> core_absent=False) and Regime B (a quiet required/df rescued by
+        #   auc_pos 0.65 -> excl_on_core>=1 -> core_absent=False) both remain intact.
         if e.get("core_absent",False): continue
-        # ★ EMPTY-REGION 비대칭 anchor 게이트 (2026-06-18): region_gated면 후보가 이미 dominant_region 안으로
-        #   제한돼 cross-region blip이 구조적으로 배제되므로 exclusive 1개로 충분(기존 동작 그대로). 그러나
-        #   dominant_region이 비면(region_gated=False) 후보가 계통 전체로 열려 먼 region subtype이 단일 leaky
-        #   exclusive 마커 하나(thalamic=Cbln4, OB mitral=Robo3)로 force-fit된다(xenium cl11 피질→thalamic, cl8).
-        #   region 미확정 시엔 specific anchor에 exclusive ≥2 OR defining ON 요구 — 단일 비-defining 마커는
-        #   cross-region 호출을 못 떠받친다. 진짜 피질 층은 df(Rspo1→L4, Ldb2→L5 ET, Cux2→L2/3)가 ON이라 df 분기로
-        #   살아남고(cl11 → L4 IT), defining 없는 thalamic 단일-Cbln4는 차단 → 피질로 정정. region_gated 경로는 불변.
-        # ★ df_absent 단일-마커 가드 (2026-07-02): region_gated여도 anchor가 df_absent(on-panel defining이 있으나
-        #   전부 OFF)이면서 exclusive가 단 1개(비-defining)면 채택하지 않는다 — region-scoring이 엉뚱한 subcluster를
-        #   한 region으로 잘못 잡았을 때(subcortical Slc17a6+/Gad1+ 조각이 Ndst4 하나로 allocortical dominant) 그
-        #   region의 자식이 df_absent+단일 exclusive로 clear_top anchor가 되어 region-floor 오라벨(allocortical)을
-        #   낳던 문제. 세 허용경로: (a) df_on≥1(quiet defining ON=진짜 층, L4 Rspo1 auc_pos), (b) excl_on≥2(다중
-        #   exclusive, L4 Rorb+Whrn), (c) excl_on≥1 & not df_absent(on-panel defining이 아예 없는 off-panel-defining
-        #   type=panel-blind 보존). df_absent & df_on==0 & excl_on==1만 차단 → anchors 비면 class_or_unknown로 정직 하강.
+        # ★ EMPTY-REGION asymmetric anchor gate: when region_gated, the candidates are already confined to
+        #   dominant_region and cross-region blips are structurally excluded, so a single exclusive marker is
+        #   enough (unchanged behaviour). But when dominant_region is empty (region_gated=False) the candidates
+        #   open up to the whole lineage and a distant region's subtype gets force-fit from one leaky exclusive
+        #   marker (thalamic = Cbln4, OB mitral = Robo3; xenium cl11 cortex -> thalamic, cl8).
+        #   With no region fixed, a specific anchor requires exclusive >=2 OR a defining marker ON — a single
+        #   non-defining marker cannot carry a cross-region call. Genuine cortical layers survive through the df
+        #   branch (Rspo1 -> L4, Ldb2 -> L5 ET, Cux2 -> L2/3 are ON), so cl11 -> L4 IT, while a thalamic call
+        #   resting on Cbln4 alone with no defining marker is blocked and corrected to cortex. The region_gated
+        #   path is unchanged.
+        # ★ df_absent single-marker guard: even when region_gated, an anchor that is df_absent (it has on-panel
+        #   defining markers but all are OFF) and has exactly one (non-defining) exclusive marker is not accepted.
+        #   Otherwise, when region scoring wrongly assigns an unrelated subcluster to a region (a subcortical
+        #   Slc17a6+/Gad1+ fragment becoming allocortical-dominant through Ndst4 alone), a child of that region
+        #   becomes a clear_top anchor with df_absent + a single exclusive marker and produces a region-floor
+        #   mislabel (allocortical). Three admissible paths: (a) df_on>=1 (a quiet defining marker ON = a real
+        #   layer, L4 Rspo1 via auc_pos), (b) excl_on>=2 (multiple exclusives, L4 Rorb+Whrn), (c) excl_on>=1 and
+        #   not df_absent (a type with no on-panel defining marker at all = off-panel-defining, preserved as
+        #   panel-blind). Only df_absent & df_on==0 & excl_on==1 is blocked -> if that empties anchors, the leaf
+        #   descends honestly to class_or_unknown.
         _anchor_ok = ((e["df_on"]>=1 or e["excl_on"]>=2 or (e["excl_on"]>=1 and not e.get("df_absent",False)))
                       if region_gated else (e["excl_on"]>=2 or e["df_on"]>=1))
-        # ★ negative veto 완화(2026-06-19, 블로커B): 강한 negative(auc≥0.85=rank-enriched 진짜 반대증거)는 항상 veto.
-        #   약한 negative(on_enr-only=ambient/오염 수준)는 positive 증거가 강할 때(excl_on≥2)만 1개 허용 — 공간데이터의
-        #   KDE/이웃 bleed로 들어온 단일 약-negative가 강한 anchor를 전면 거부하던 문제(MHb Th 32% → excl_on=3 거부). §4.1 일관.
+        # ★ Relaxed negative veto: a strong negative (auc>=0.85 = rank-enriched, genuine counter-evidence) always
+        #   vetoes. A weak negative (on_enr only = ambient/contamination level) is tolerated, at most one, and
+        #   only when the positive evidence is strong (excl_on>=2) — a single weak negative introduced by KDE /
+        #   neighbour bleed in spatial data used to reject a strong anchor outright (MHb Th at 32% rejected
+        #   excl_on=3). Consistent with §4.1.
         _neg_ok = e.get("neg_strong",e["neg_on"])==0 and (e["neg_on"]==0 or e["excl_on"]>=2)
         if _anchor_ok and _neg_ok:
             e["path"]=path_to_root(tid); anchors.append(e)
     if not anchors and region_gated:
         for rg in sorted(dominant, key=lambda r:-rg_score[r]):
             e=ev(rg)
-            if e["neg_on"]>0: continue          # region node도 negative leak이면 surface 안 함(Slc17a6+ 클러스터에 DG region 등)
-            # ★ Fix A (2026-06-23): region 노드를 floor로 surface하려면 그 region의 OWN exclusive/defining 마커가 ≥1 ON이어야 함.
-            #   pan 마커(Slc17a7)만 ON인 generic 클러스터가 region-floor(DG 등)로 force-fit되던 것 차단 — 피질의 가짜
-            #   'dentate gyrus glutamatergic neuron'(Prox1/C1ql2=0)·markerless region-floor 제거. region-특이 마커
-            #   (DG=Prox1/C1ql2, neocort=Satb2/Slc30a3, thalamic=Tcf7l2)가 하나도 ON 아니면 → surface 안 함 →
-            #   anchors 비어 class_or_unknown → lineage class('glutamatergic neuron')로 정직하게 하강.
-            #   (leaf anchor 경로·region_gated auc_pos 층마커 보존과 무관: 여기는 'anchor 전무 시 region 노드 fallback'만.)
+            if e["neg_on"]>0: continue          # a region node is not surfaced either when it has a negative leak (e.g. a DG region on an Slc17a6+ cluster)
+            # ★ Fix A: to surface a region node as a floor, >=1 of that region's OWN exclusive/defining markers must
+            #   be ON. This blocks a generic cluster carrying only pan markers (Slc17a7) from being force-fit to a
+            #   region floor (DG etc.) — it removes the bogus cortical 'dentate gyrus glutamatergic neuron'
+            #   (Prox1/C1ql2 = 0) and markerless region floors. When no region-specific marker (DG = Prox1/C1ql2,
+            #   neocortical = Satb2/Slc30a3, thalamic = Tcf7l2) is ON, the node is not surfaced -> anchors are empty
+            #   -> class_or_unknown -> honest descent to the lineage class ('glutamatergic neuron').
+            #   (Unrelated to the leaf-anchor path and to region_gated auc_pos layer-marker preservation: this is only
+            #   the 'region-node fallback when there is no anchor at all'.)
             if e["excl_on"]<1 and e["df_on"]<1: continue
             e["path"]=path_to_root(rg); anchors.append(e)
-    # ★ EMBEDDED-TYPE RESCUE (2026-06-28): 혈관/면역(SMC/endo/pericyte 등) 세포는 조직에 박혀 KDE가 주변
-    #   glia/neuron RNA를 voxel에 번뜨림 → 클러스터 절대 프로파일이 주변세포 지배 + off-lineage라 anchor 후보에서
-    #   탈락(cl69: Acta2 34× enriched인데 Mbp 절대지배 → oligo, cl103: Cldn5 18× → astro). 고특이 core 마커
-    #   (R∪DF, share≤SPEC_REGION_MAX)가 rank(auc≥0.90) + fold(lf≥log2 10 = 10배) 둘 다 강하면 그 term을
-    #   anchor로 surface(lineage/neg/absolute 우세 무시). 3중 게이트라 broad/ambient는 미발동 — microglia 3~5×는
-    #   fold<10 → floor 유지(정확). agent는 rescued 플래그+rescue_markers 보고 절대-우세 glia 대신 vascular 판정(SKILL §4).
+    # ★ EMBEDDED-TYPE RESCUE: vascular / immune cells (SMC, endothelium, pericyte ...) are embedded in the
+    #   tissue, so KDE bleeds surrounding glial/neuronal RNA into their voxels -> the cluster's absolute
+    #   profile is dominated by the surrounding cells and, being off-lineage, it drops out of the anchor
+    #   candidates (cl69: Acta2 is 34x enriched but Mbp dominates absolutely -> oligo; cl103: Cldn5 18x ->
+    #   astro). When a highly specific core marker (R u DF, share <= SPEC_REGION_MAX) is strong by BOTH rank
+    #   (auc>=0.90) and fold (lf >= log2 10 = 10x), that term is surfaced as an anchor (ignoring lineage,
+    #   negatives and absolute dominance). The triple gate keeps broad/ambient signal out — microglia at 3-5x
+    #   have fold<10 and the floor is kept (correctly). The agent sees the rescued flag and rescue_markers and
+    #   calls vascular instead of the absolutely-dominant glia (SKILL §4).
     if auc is not None and lf is not None:
         _RESC_AUC=0.90; _RESC_LF=float(np.log2(5.0)); _anch={a["term_id"] for a in anchors}
-        # ★ 2026-06-28 튜닝: fold 임계 10→5 (microglia cl75 특이마커 Tmem119 6×=진짜인데 10× 미달로 놓침;
-        #   auc≥0.90 + non-parenchymal 한정이 ambient 배제하므로 5×로 낮춤). + DEFINING 마커는 share 필터 우회
-        #   (ependymal Foxj1=DF인데 share=4로 share≤2에 걸려 46×인데도 rescue 안 되던 버그 — DF는 큐레이션-특이).
-        # ★ NON-PARENCHYMAL 한정: 조직에 박혀 KDE-smear로 절대-우세를 빼앗기는 건 혈관/면역/수막/맥락총/상의 계열뿐.
-        #   neuron(glut/GABA/transmitter)·macroglia(astro/oligo/OPC)는 parenchymal이라 rescue 대상 아님(그쪽 오라벨은
-        #   sibling/region 문제로 별도 처리). 이 게이트 없으면 모든 type의 defining 마커가 fold≥10이라 flood됨(검증서 55→).
+        # ★ Tuning: the fold threshold is 5, not 10 (microglia cl75's specific marker Tmem119 at 6x is genuine but
+        #   was missed by a 10x bar; auc>=0.90 plus the non-parenchymal restriction already excludes ambient
+        #   signal). DEFINING markers bypass the share filter (ependymal Foxj1 is a DF with share=4, so a share<=2
+        #   rule rejected it despite 46x — a DF is curated-specific by construction).
+        # ★ NON-PARENCHYMAL only: being embedded in tissue and losing absolute dominance to KDE smear happens only
+        #   to the vascular / immune / meningeal / choroid-plexus / ependymal families. Neurons (glut, GABA,
+        #   transmitter types) and macroglia (astro, oligo, OPC) are parenchymal and are not rescue targets (their
+        #   mislabels are sibling/region problems handled elsewhere). Without this gate every type's defining
+        #   marker reaches fold>=10 and the rescue floods.
         _NONPAR=('endothel','pericyte','smooth muscle','leptomening','mural','perivascular','fibroblast',
                  'macrophage','microg','choroid','ependym','arachnoid','vascular','erythro','neutrophil',
                  'lymphocyte','monocyte','mast','tanycyte')
@@ -1169,17 +1157,20 @@ def _graph_evidence(fon, lf, pin, IDM, octx, frac=0.30, lf_on=1.5, pin_min=0.25,
             return any(k in _rl or k in _tl for k in _NONPAR)
         for tid in terms:
             if tid in _anch or not _nonpar(tid): continue
-            _dfset=set(defn.get(tid,()))   # DEFINING은 share 필터 우회(큐레이션-특이; ependymal Foxj1 share=4)
+            _dfset=set(defn.get(tid,()))   # DEFINING markers bypass the share filter (curated-specific; ependymal Foxj1 has share=4)
             strong=[g for g in core_map.get(tid,())
                     if (g in _dfset or share.get(g,99)<=SPEC_REGION_MAX) and auc[g]>=_RESC_AUC and lf[g]>=_RESC_LF]
             if strong:
                 e=ev(tid); e["rescued"]=True; e["rescue_markers"]=[gname(g) for g in strong][:6]
                 e["path"]=path_to_root(tid); anchors.append(e)
-    # df_absent(defining 측정+OFF)는 **약한 tiebreak일 뿐** — excl_on/ratio/n_on이 우선. 이렇게 안 하면 DF 없는
-    #   generic region node(절대 df_absent 아님)가 정의마커만 quiet한 진짜 층(L4=Rorb/Whrn excl_on2, Rspo1 quiet)을
-    #   항상 이겨 피질 층이 전부 generic으로 붕괴함(2026-06-15 회귀). force-fit(mitral)은 ratio로 이미 밀리므로 정렬
-    #   강등 불필요. df_absent는 flag(목록·_validate)로만 agent에 전달, 정렬은 동률일 때만 마지막으로 가른다.
-    # rescued(embedded vascular/immune)는 절대-우세에 묻히지 않게 상위로 — agent가 보게(최종 판정은 agent, SKILL §4).
+    # df_absent (a defining marker was measured and is OFF) is **only a weak tiebreak** — excl_on / ratio /
+    #   n_on come first. Otherwise a generic region node with no DF (and therefore never df_absent) always
+    #   beats a genuine layer whose defining marker is merely quiet (L4: Rorb/Whrn give excl_on 2 while Rspo1
+    #   is quiet), collapsing every cortical layer to the generic node. A force-fit (mitral) is already pushed
+    #   down by ratio, so no sort demotion is needed. df_absent is passed to the agent as a flag only (in the
+    #   listing and in _validate) and breaks ties last.
+    # rescued (embedded vascular/immune) is sorted to the top so it is not buried by absolute dominance — the
+    # agent must see it (the final call is the agent's, SKILL §4).
     anchors.sort(key=lambda x:(x.get("rescued",False), x["excl_on"], round(x["excl_on"]/max(x["excl_n"],1),2), x["n_on"], not x.get("df_absent",False)), reverse=True)
     # verdict hint (the agent decides; this is a summary): clear top = unique max excl_on; tie = ambiguous.
     if not anchors: verdict="class_or_unknown"
@@ -1202,7 +1193,8 @@ def _graph_evidence(fon, lf, pin, IDM, octx, frac=0.30, lf_on=1.5, pin_min=0.25,
     a2tid={a["label"]:a["term_id"] for a in anchors}
     a2anchor={a["label"]:a for a in anchors}
     def _distinct_on(tid_a, tid_b):
-        # tid_a의 고유(공유 아닌) exclusive 마커 중 ON인 것 → tid_a를 tid_b와 구별하는 켜진 증거
+        # among tid_a's own (unshared) exclusive markers, the ones that are ON -> switched-on evidence that
+        # distinguishes tid_a from tid_b
         ea={g for g in disc.get(tid_a,[]) if share.get(g,99)<=SPEC_REGION_MAX}
         eb={g for g in disc.get(tid_b,[]) if share.get(g,99)<=SPEC_REGION_MAX}
         return [gname(g) for g in (ea-eb) if on_anchor(g)]
@@ -1218,35 +1210,39 @@ def _graph_evidence(fon, lf, pin, IDM, octx, frac=0.30, lf_on=1.5, pin_min=0.25,
                 partners=[al for i,hits in enumerate(side_anchors) if i not in tsides for al in hits]
                 if partners:
                     par=partners[0]; tt=a2tid.get(top_label); pt=a2tid.get(par)
-                    # ★ 3분기(2026-06-14): 각 후보의 *고유*(공유 아닌) 마커가 ON인지로 해소.
-                    #   양쪽 고유 ON → 두 type 혼합 → split(needs_subclustering). 한쪽만 ON → discriminator가
-                    #   그쪽 지지 → 그 type. 둘 다 OFF(공유 마커만) → 진짜 모호 → Unknown.
+                    # ★ Three-way resolution: decided by whether each candidate's *own* (unshared) markers are ON.
+                    #   Both sides' own markers ON -> a mixture of two types -> split (needs_subclustering). Only one side ON
+                    #   -> the discriminator supports that side -> that type. Both OFF (only shared markers) -> genuinely
+                    #   ambiguous -> Unknown.
                     td=_distinct_on(tt,pt) if (tt and pt) else []
                     pd=_distinct_on(pt,tt) if (tt and pt) else []
-                    # 양쪽 고유 마커가 ON → 두 type 공존(cl64 CA2 Cacng5/Map3k15/Acan + FC Scgn) → split. 한쪽만 → 그쪽
-                    #   resolve. 둘 다 OFF(공유만) → unknown. split이면 needs_subclustering으로 FC를 CA2로 뭉치지 않게(사용자
-                    #   2026-06-15): FC 못 찾아도 fragment는 CA2 / hippocampal / Unknown으로 갈리고 FC부분이 CA2로 안 남음.
-                    # ★ resolve 가드(2026-06-19, 이슈#3·14 FC): resolve 대상의 정체 확인용 **defining이 off-panel
-                    #   이거나(df_offpanel) on-panel인데 전부 OFF(df_absent)** 이고, 그 type의 distinct ON이 **1개뿐**이면
-                    #   = 약한 단일 비-defining 마커로 단정하는 force-fit → resolve 막고 아래 공통조상 class floor로.
-                    #   (FC defining Necab2 off-panel인데 Zfp536/Igfbp4 1개로 FC 단정하던 문제. 진짜 FC는 distinct ≥2라 통과.)
+                    # Both sides' own markers ON -> the two types coexist (cl64 CA2 Cacng5/Map3k15/Acan + FC Scgn) -> split.
+                    #   Only one -> resolve to that side. Both OFF (shared only) -> unknown. On a split, needs_subclustering
+                    #   prevents lumping FC into CA2: even if FC is not found, the fragments separate into CA2 / hippocampal /
+                    #   Unknown and the FC part does not remain labelled CA2.
+                    # ★ Resolve guard: if the defining marker that would confirm the resolve target is **off-panel
+                    #   (df_offpanel) or on-panel but entirely OFF (df_absent)**, and that type has only **one** distinct ON
+                    #   marker, then committing would be a force-fit from a single weak non-defining marker -> block the
+                    #   resolve and fall to the common-ancestor class floor below. (FC's defining marker Necab2 is off-panel,
+                    #   yet FC was being asserted from Zfp536/Igfbp4 alone. A genuine FC has distinct >= 2 and passes.)
                     def _df_unconf(lbl):
                         an=a2anchor.get(lbl) or {}; return bool(an.get("df_offpanel") or an.get("df_absent"))
                     if td and pd:      action,resolves="split",None
                     elif td and not (_df_unconf(top_label) and len(td)<2):  action,resolves="resolve",top_label
                     elif pd and not (_df_unconf(par) and len(pd)<2):        action,resolves="resolve",par
                     else:
-                        # ★ 공유마커만 ON, 양쪽 고유마커 OFF(또는 off-panel) → 둘 중 하나로 단정 불가.
-                        #   Unknown이 아니라 두 멤버의 **deepest 공통 조상 CLASS**로 정직하게 귀착(2026-06-18, 사용자 요청).
-                        #   confusion-pair = "이 type들이 나올 것으로 예상하고 split한" 맥락이므로(=기대한 celltype),
-                        #   그 안에서 공유마커만이면 공통 region/class가 정답(FC vs CA2 → hippocampal pyramidal neuron).
-                        #   FC처럼 변별 defining이 off-panel이면 여기로 와서 CA2 단정 대신 상위 class가 됨.
+                        # ★ Only shared markers are ON and both sides' own markers are OFF (or off-panel) -> neither can be
+                        #   asserted. Rather than Unknown, fall honestly to the **deepest common ancestor CLASS** of the two
+                        #   members. A confusion pair arises in a context where the split was made *expecting* these types, so
+                        #   when only shared markers fire the common region/class is the right answer (FC vs CA2 -> hippocampal
+                        #   pyramidal neuron). A type like FC, whose discriminating defining marker is off-panel, lands here and
+                        #   gets the parent class instead of being asserted as CA2.
                         _pa=path_to_root(tt) if tt else []; _pb=path_to_root(pt) if pt else []
                         _common=None
                         for _x,_y in zip(_pa,_pb):
                             if _x==_y: _common=_x
                             else: break
-                        action,resolves="unknown",_common      # resolves_to=공통 조상 class(없으면 None→Unknown 폴백)
+                        action,resolves="unknown",_common
                     confusion_unresolved={"pair":c[0],"terms":[top_label]+partners[:3],
                                           "discriminators":(c[2] if len(c)>2 else []),
                                           "action":action,"mixture":bool(td and pd),"resolves_to":resolves,
@@ -1259,10 +1255,10 @@ def _graph_evidence(fon, lf, pin, IDM, octx, frac=0.30, lf_on=1.5, pin_min=0.25,
     #   are diluted (2µm: cl2=Drd1+Drd2, cl15=Cux2+Rorb, cl7.1=L5 Fezf2+L6 Foxp2). A cluster with NO subtype's
     #   own exclusive marker present (cl4 region-less generic glut) is NOT flagged ⇒ no noise. ≥2 distinct → split.
     WEAK_AUC=0.6
-    cand=[]   # (tid, region, wk[gene idx]) — mixture 후보
+    cand=[]
     for tid in terms:
         if IDM["root"].get(tid)!=cls_root or tier.get(tid)=="class": continue
-        if region_of.get(tid,tid) in _absent: continue   # F-B: 부재 region은 mixture 후보에서도 제외
+        if region_of.get(tid,tid) in _absent: continue
         if allow is not None and tid not in allow: continue
         if region_gated and region_of.get(tid,tid) not in dominant: continue
         exc=[g for g in disc.get(tid,()) if share.get(g,99)<=SPEC_REGION_MAX]
@@ -1270,16 +1266,22 @@ def _graph_evidence(fon, lf, pin, IDM, octx, frac=0.30, lf_on=1.5, pin_min=0.25,
         wk=[g for g in exc if on_anchor(g) or (auc is not None and auc[g]>=WEAK_AUC)]
         if not wk or any(on_anchor(g) for g in neg.get(tid,())): continue
         cand.append((tid, region_of.get(tid,tid), wk))
-    # ★ EMPTY-REGION mixture 정리 — KG-region grouping (발현 기반, 공간 無; 2026-06-18): ⚠️ 여기서 'region'은 **KG 계층의
-    #   region-group**(neocortical/thalamic = region_of, 그래프 구조)이고 판정은 **마커 발현**(on_anchor/auc)만 쓴다 — 세포
-    #   xy좌표를 안 쓰므로 scRNA-seq에서도 동일 작동(dominant_region·graph-descent와 같은 원리). 'spatial coherence'(15-NN
-    #   공간 이웃 비율)와 무관. region_gated면 위 region-gate가 이미 cross-region을 제거하고 diluted 층을 느슨히(1-마커)
-    #   잡는다(2µm 의도 보존). 그러나 region 미확정(region_gated=False)이면 mixture가 계통 전체로 열려 단일 leaky 마커의
-    #   cross-region 잡음(thalamic 2개가 Cbln4 하나 공유, OB=Robo3, 중뇌=Ntrk3)이 섞인다. 판별: 진짜 under-clustered
-    #   mixture는 **같은 KG-region-group에 distinct exclusive 마커 ≥2개**가 발현 ON(피질=Rspo1+Ldb2…); 잡음은 *서로 다른
-    #   region에 흩어진 단일 마커* 또는 *형제끼리 1개 마커 공유*(Cbln4)다. region별 distinct ON exclusive 마커 union을
-    #   세어 ≥2인 region의 subtype만 남긴다 — 희석된 진짜 층(cl12 L5 IT/ET/L5b, 마커 distinct)은 살고, Cbln4 공유
-    #   thalamic·고립 단일마커는 제거. (마커 개수 OR df 기준은 희석 층을 죽여 cl12 회귀 → 폐기.)
+    # ★ EMPTY-REGION mixture cleanup — KG-region grouping (expression based, no spatial input).
+    #   NOTE: 'region' here means a **region-group in the KG hierarchy** (neocortical/thalamic = region_of, a
+    #   graph structure) and the decision uses **marker expression only** (on_anchor/auc). Cell xy coordinates
+    #   are never used, so this behaves identically on scRNA-seq (the same principle as dominant_region and
+    #   the graph descent). It is unrelated to 'spatial coherence' (a 15-NN neighbour fraction).
+    #   When region_gated, the region gate above has already removed cross-region candidates and catches
+    #   diluted layers loosely (a single marker). But when the region is undetermined (region_gated=False) the
+    #   mixture opens up to the whole lineage and cross-region noise from a single leaky marker creeps in (two
+    #   thalamic types sharing one Cbln4, OB = Robo3, midbrain = Ntrk3).
+    #   Discriminator: a genuine under-clustered mixture has **>=2 distinct exclusive markers ON within the
+    #   same KG region-group** (cortex = Rspo1 + Ldb2 ...); noise is *a single marker scattered across
+    #   different regions* or *one marker shared between siblings* (Cbln4). Count the union of distinct ON
+    #   exclusive markers per region and keep only the subtypes of regions with >=2 — diluted genuine layers
+    #   survive (cl12 L5 IT/ET/L5b, whose markers are distinct) while Cbln4-sharing thalamic types and isolated
+    #   single markers are removed. (A criterion based on marker count OR df killed diluted layers and is not
+    #   used.)
     if not region_gated and cand:
         _reg_mk={}
         for _tid,_reg,_wk in cand: _reg_mk.setdefault(_reg,set()).update(_wk)
@@ -1345,34 +1347,35 @@ def _bimodal_split(Xleaf, IDM, octx, lineage_label, genes_arr,
     return [{"label":lab.get(r,r),"markers_present":[str(genes_arr[g]) for g in _reg_d.get(r,[])[:4]]}
             for r in (best[1],best[2])]
 
-# ★ 2026-07-19: state 판정은 **KG의 tier 가 유일한 정본**이다.
-#   예전에는 라벨 키워드(_DEV_STATE_KW: developmental/neuroblast/radial glia/immature/reactive…)로도
-#   state 를 추정했다. 그 결과 KG 가 tier='class'/'subclass' 로 명시한 **정상 세포형 38개**가 이름
-#   때문에 top 후보에서 빠졌다(Radial glia, Neuroblast, Immature B cell / neutrophil / platelet /
-#   cardiomyocyte, ISP thymocyte, immature enterocyte, immature Sertoli cell …). 성숙 단계는 골수·흉선
-#   같은 조직에서 다수를 차지하는 실재 세포라 이 억제는 체계적 미검출이었다. 예외 목록이
-#   ("immature granule",) 하나뿐이었던 것도 같은 오탐을 개별 땜질하던 흔적.
-#
-#   이 단순화의 전제는 KG 쪽 정리가 선행됐다는 것이다(2026-07-19, 순서대로 수행):
-#     1) 세포인데 disease_context 로 막혀 있던 2건 → 질병을 OBSERVED_IN_DISEASE 엣지로 옮기고
-#        프로퍼티 제거 (reapply_disease_context_cleanup.py)
-#     2) 발생 시기 200건 → disease_context 에서 `developmental_stage` 로 분리, slim-index 는 `DS`
-#        로 노출 (reapply_developmental_stage_axis.py). 발생은 질병이 아니며, 태아 데이터에서는
-#        radial glia 가 정답이어야 한다. 성체/태아 판단은 DS 를 근거로 **expert agent** 가 한다.
-#     3) tier='state' 오분류 158건 감별 (reapply_state_vs_celltype.py)
-#   그 결과 "라벨은 state 같은데 KG 는 정체 + 비정상 맥락" 인 위험군이 0 이 되어 키워드가 불필요해졌다.
-#   질병은 여기서 보지 않는다 — disease 는 필터가 아니라 힌트이고(§7), 질병 샘플의 정상 세포
-#   (cDC1/Treg/naive CD4 T cell in breast cancer 등 233건)는 정상 라벨로 나와야 한다.
+# ★ The KG tier is the **only** source of truth for the state decision.
+#   Inferring state from label keywords (developmental / neuroblast / radial glia / immature / reactive
+#   ...) excluded **38 normal cell types** that the KG explicitly marks tier='class'/'subclass' from the
+#   top candidates purely because of their names (radial glia, neuroblast, immature B cell / neutrophil /
+#   platelet / cardiomyocyte, ISP thymocyte, immature enterocyte, immature Sertoli cell ...). Maturation
+#   stages are real cells that make up much of tissues such as bone marrow and thymus, so this suppression
+#   was a systematic failure to detect them.
+#   This simplification presumes the KG-side cleanup that precedes it:
+#     1) 2 cells blocked by disease_context -> the disease was moved to an OBSERVED_IN_DISEASE edge and
+#        the property removed
+#     2) 200 developmental stages -> separated from disease_context into `developmental_stage`, exposed in
+#        the slim-index as `DS`. Development is not disease, and in fetal data radial glia must be the
+#        correct answer. Whether a sample is adult or fetal is judged by the **expert agent** from DS.
+#     3) 158 tier='state' misclassifications resolved
+#   As a result there is no longer any term that "looks like a state by label while the KG calls it an
+#   identity in an abnormal context", so the keyword heuristic is unnecessary.
+#   Disease is not consulted here — disease is a hint, not a filter (§7), and normal cells from a diseased
+#   sample (cDC1 / Treg / naive CD4 T cell in breast cancer, 233 of them) must come out with normal labels.
 def _is_state_term(label, tier):
-    """STATE 판정 = KG 의 tier 가 'state' 인가. 라벨·질병 맥락은 보지 않는다.
-    state 는 base-agnostic 조건(proliferating/IFN-stimulated/hypoxic)이며 라벨 뒤에 ', <state>' 로
-    이어붙는다(STATE-AXIS). 세포 이름을 가진 것은 state 가 아니라 Term 이다."""
+    """STATE decision = whether the tier in the KG is 'state'. Labels and disease context are not consulted.
+    A state is a base-agnostic condition (proliferating / IFN-stimulated / hypoxic) and is appended to the
+    label as ', <state>' (STATE-AXIS). Anything that carries a cell name is a Term, not a state."""
     return tier == "state"
 def _disease_terms(idx, disease):
-    """caller가 --disease <name>로 지정한 질병에 해당하는 ontology term들을 추출.
-    매칭: term의 D(disease_context)가 normal이 아니고 disease 파라미터와 양방향 부분일치(대소문자 무시).
-    반환 {tid:{L,D,R,S,DF}} — _profile_leaves가 leaf별 disease_candidates(마커 지지도)로 surface한다.
-    disease 미지정/normal이면 {} (정상 경로 그대로)."""
+    """Extract the ontology terms matching the disease the caller passed via --disease <name>.
+    Matching: the term's D (disease_context) is not normal and overlaps the disease parameter in either
+    direction (case-insensitive).
+    Returns {tid:{L,D,R,S,DF}} — _profile_leaves surfaces these per leaf as disease_candidates (with marker
+    support). Returns {} when disease is unset or normal (the normal path is unchanged)."""
     dz=(disease or "").strip().lower()
     if not dz or dz in ("normal","none"): return {}
     out={}
@@ -1383,22 +1386,24 @@ def _disease_terms(idx, disease):
                       "R":list(t.get("R") or []),"S":list(t.get("S") or []),"DF":list(t.get("DF") or []),
                       "A":list(t.get("A") or []),"MP":list(t.get("MP") or [])}
     return out
-_MIM_SPEC_SHARE_MAX=3   # 흉내 프로그램으로 인정할 마커의 최대 gene-degree(share). pan 마커(CD3E/PTPRC…) 배제.
+_MIM_SPEC_SHARE_MAX=3   # maximum gene-degree (share) for a marker to count as part of a mimicked program; excludes pan markers (CD3E/PTPRC...)
 def _mimicry_terms(idx):
-    """lineage-mimicry/전이 term = MIMICS_PHENOTYPE(MP)와 identity-anchor(A)를 둘 다 가진 term.
-    tier와 무관(mimetic TEC는 tier=class, EMT는 tier=state) — 정의 속성은 MP+A 보유다.
-    이 term들로 _profile_leaves가 leaf별 transition_candidates(anchor 잔존 + 흉내 프로그램 present)를 만들어,
-    '흉내 대상 lineage로 force-fit하지 말고 origin+state로 판정'을 evidence-strong하게 surface한다
-    (STATE_TRANSITION_DESIGN §엔진규칙, anchor-tiebreaker).
-    ★ Qspec = 흉내 프로그램의 SPECIFIC 마커만(share≤MAX) — pan-lineage 마커(CD3D/CD52/IRF8…)가
-      모든 그 lineage 클러스터에서 전이를 거짓발동시키는 것을 막는다(VALID-EVIDENCE 원칙과 동일).
-    반환 {tid:{L,D,A,MP,R,S,DF,P,Qspec}}."""
+    """lineage-mimicry / transition terms = terms that carry BOTH MIMICS_PHENOTYPE (MP) and an
+    identity-anchor (A). Independent of tier (a mimetic TEC is tier=class, EMT is tier=state) — the defining
+    property is holding MP + A.
+    From these terms _profile_leaves builds per-leaf transition_candidates (origin anchors retained +
+    the mimicked program present), so that 'do not force-fit to the mimicked lineage; call origin + state'
+    is surfaced as strong evidence (STATE_TRANSITION_DESIGN §engine rules, anchor tiebreaker).
+    ★ Qspec = only the SPECIFIC markers of the mimicked program (share<=MAX) — this stops pan-lineage
+      markers (CD3D/CD52/IRF8...) from falsely triggering a transition in every cluster of that lineage
+      (the same principle as VALID-EVIDENCE).
+    Returns {tid:{L,D,A,MP,R,S,DF,P,Qspec}}."""
     terms=((idx or {}).get("terms",{}) or {})
     def _gm(t): return [str(x) for x in (list(t.get("R") or [])+list(t.get("S") or [])+list(t.get("DF") or []))]
     share={}                                            # gene -> #terms listing it (R+S+DF)
     for t in terms.values():
         for g in set(x.upper() for x in _gm(t)): share[g]=share.get(g,0)+1
-    def _anc_markers(tid, seen=None):                   # origin(조상) 마커 — 흉내 프로그램에서 제외할 origin lineage 마커
+    def _anc_markers(tid, seen=None):
         seen=seen or set(); acc=set()
         for p in (terms.get(tid,{}).get("P") or []):
             if p in seen or p not in terms: continue
@@ -1417,16 +1422,17 @@ def _mimicry_terms(idx):
                 if u not in s: s.add(u); o.append(g)
             return o
         A=_dedup(A)
-        # 흉내 프로그램 = 자기 마커 중 (anchor 아님) AND (low-share 특이) AND (origin 조상 마커 아님), 중복제거
+        # the mimicked program = a term's own markers that are (not an anchor) AND (low-share specific) AND (not an origin/ancestor marker), deduplicated
         Qspec=_dedup([g for g in _gm(t) if g.upper() not in _A and share.get(g.upper(),99)<=_MIM_SPEC_SHARE_MAX and g.upper() not in _anc])
         out[tid]={"L":t.get("L",tid),"D":(t.get("D") or "normal"),"A":A,"MP":MP,
                   "R":list(t.get("R") or []),"S":list(t.get("S") or []),"DF":list(t.get("DF") or []),
                   "P":list(t.get("P") or []),"Qspec":Qspec}
-    # ★ StateAxis 기반 transition (2026-07-26): mimics+anchor_markers 를 가진 StateAxis(sa)도 transition
-    #   후보로 흡수한다. StateAxis 재구조화로 EMT/EndMT/dedifferentiation 등이 Term-level A/MP 에서 sa 로
-    #   옮겨졌으므로, 여기서 통합해 leaf 판정 시 false-split 가드를 유지한다(상피 base + mesenchymal program
-    #   = EMT state 이지 상피/mesenchymal 혼합 아님 → split 금지). StateAxis.markers 는 이미 큐레이션된
-    #   program signature 이므로 share 필터 없이 (anchor 제외) 그대로 Qspec 으로 쓴다.
+    # ★ StateAxis-based transitions: a StateAxis (sa) carrying mimics + anchor_markers is also absorbed as a
+    #   transition candidate. The StateAxis restructuring moved EMT / EndMT / dedifferentiation from
+    #   Term-level A/MP to sa, so they are merged here to keep the false-split guard at leaf judgment time
+    #   (an epithelial base plus a mesenchymal program is the EMT state, not an epithelial/mesenchymal
+    #   mixture -> do not split). StateAxis.markers is already a curated program signature, so it is used as
+    #   Qspec directly (minus the anchors) with no share filter.
     def _dd(seq):
         s=set(); o=[]
         for g in seq:
@@ -1440,18 +1446,19 @@ def _mimicry_terms(idx):
         prog=[str(x) for x in (st.get("markers") or [])]
         if not (A and prog): continue
         _A={x.upper() for x in A}
-        Qspec=_dd([g for g in prog if g.upper() not in _A])          # 흉내 program = anchor 제외 program 마커
+        Qspec=_dd([g for g in prog if g.upper() not in _A])
         if not Qspec: continue
         out["SA:"+str(name)]={"L":str(name),"D":"normal","A":_dd(A),
                   "MP":[{"lineage":mim,"program":str(name)}],
                   "R":[],"S":[],"DF":[],"P":[],"Qspec":Qspec,
-                  "of":[str(x) for x in (st.get("of") or [])]}       # origin lineages (STATE_OF 대상)
+                  "of":[str(x) for x in (st.get("of") or [])]}
     return out
 def _state_terms(idx):
-    """Module의 모든 state term(tier=state 또는 dev/reactive 키워드)을 추출.
-    ★ disease는 필터가 아니라 힌트(2026-06-22): --disease 미지정이어도 이 term들을 leaf별 disease_candidates로
-    항상 surface해, 마커가 우세하면 agent가 그 state로 판정할 수 있게 한다(SKILL §7). disease 지정 시 _disease_terms와
-    교차해 hint=True 표시. 반환 {tid:{L,D,R,S,DF}}."""
+    """Extract every state term in the module (tier=state, or a dev/reactive keyword).
+    ★ disease is a hint, not a filter (2026-06-22): these terms are always surfaced per leaf as
+    disease_candidates even when --disease is unset, so the agent can assign that state when its markers
+    dominate (SKILL §7). When disease IS given, they are intersected with _disease_terms and flagged
+    hint=True. Returns {tid:{L,D,R,S,DF}}."""
     out={}
     for tid,t in ((idx or {}).get("terms",{}) or {}).items():
         if _is_state_term(t.get("L",""), t.get("T","")):
@@ -1479,7 +1486,7 @@ def _identity_scores(fon, lf, M, pin=None, frac=0.30, lf_high=2.0, lf_on=1.5, pi
        strength >= codom_ratio * the strongest root's strength. When one lineage clearly dominates and the
        others are weak ambient/neuropil bleed (KDE/bin diffusion), it is NOT a chimera (single identity)."""
     disc=M["disc"]; neg=M["neg"]; tier=M["tier"]; lab=M["lab"]; root=M["root"]; share=M.get("share",{}); defn=M.get("defn",{})
-    dzm=M.get("dz",{})                                   # tid -> disease_context (state 판정이 KG를 신뢰하도록)
+    dzm=M.get("dz",{})
     if pin is None: pin=fon          # pin not provided → fold branch effectively inert (conservative)
     SPEC_SHARE_MAX=3; SPEC_COV_MIN=0.5
     def W(g): return 1.0/max(share.get(g,0),1)                  # marker specificity weight (1/#terms listing it)
@@ -1532,9 +1539,10 @@ def _identity_scores(fon, lf, M, pin=None, frac=0.30, lf_high=2.0, lf_on=1.5, pi
     # ★ SPECIFIC-EVIDENCE per candidate — computed HERE because both the valid-evidence `top` gate AND the
     #   chimera/co-dominance test below use it (see §5 of SKILL). (SPEC_SHARE_MAX/COV_MIN defined above for _on.)
     def _spec_stats(c):
-        # share≤SPEC_SHARE_MAX 변별마커 + 이 term의 DOMINANT broad-DEFINING 마커(_df_dom; region_share 무관).
-        #   broad-DF로 정의되는 타입(Sst+ interneuron)이 spec_pass/spec_ok 통과하도록. low-share DF는 이미
-        #   disc에 포함됨. leaky/비dominant broad-DF는 auc<auc_hi라 미포함 → spec_cov 부풀리기로 오발 차단.
+        # discriminative markers with share <= SPEC_SHARE_MAX plus this term's DOMINANT broad-DEFINING marker
+        #   (_df_dom; independent of region_share), so that a type defined by a broad DF (Sst+ interneuron) can
+        #   pass spec_pass / spec_ok. Low-share DFs are already in disc. A leaky or non-dominant broad DF has
+        #   auc < auc_hi and is excluded, so spec_cov cannot be inflated into a false positive.
         spec=set(g for g in disc.get(c["term_id"],()) if share.get(g,99)<=SPEC_SHARE_MAX) | set(_df_dom(c["term_id"]))
         return len(spec), sum(1 for g in spec if _on(g))
     for c in cand:
@@ -1618,9 +1626,10 @@ def _identity_scores(fon, lf, M, pin=None, frac=0.30, lf_high=2.0, lf_on=1.5, pi
     #   agent can call it when its markers dominate — even with --disease omitted. Surface strong state terms in
     #   `ranked` (flagged is_state) WITHOUT making them auto-`top` (decision stays with the agent, §7).
     for c in cand: c["is_state"]=_is_state_term(c["label"], c["tier"])
-    # ★ SPECIFICITY GATE (2026-07-02): state가 ranked에 promotable로 오르려면 자기 '고유(specific) 마커'가 실제 ON
-    #   이어야 함(spec_on≥1, spec_n≥1). 공유 reactive 마커(Gfap 등)만 켜진 조각이 disease state로 뜨던 것 차단
-    #   (DAA/DAM FP). spec_n==0(panel-blind)의 trivial spec_pass도 여기선 불인정 — 근거가 측정돼야 승격.
+    # ★ SPECIFICITY GATE: for a state to appear in ranked as promotable, its own (specific) markers must
+    #   actually be ON (spec_on>=1, spec_n>=1). This blocks a fragment carrying only shared reactive markers
+    #   (Gfap etc.) from surfacing as a disease state (DAA/DAM false positives). The trivial spec_pass of
+    #   spec_n==0 (panel-blind) does not count here either — the evidence must have been measured to promote.
     state_strong=sorted([c for c in cand if c["is_state"] and c["n_on"]>=2 and c["neg"]==0 and c["spec_pass"]
                          and c.get("spec_on",0)>=1 and c.get("spec_n",0)>=1
                          and c not in ranked], key=lambda c:(c["dec"], c["wspec"], c["n_on"]), reverse=True)
@@ -1640,20 +1649,24 @@ def _identity_scores(fon, lf, M, pin=None, frac=0.30, lf_high=2.0, lf_on=1.5, pi
 def _rankcols(M): return np.asarray(rankdata(M, method="average", axis=0), dtype=np.float64)
 
 def _exclusive_mixture(Xleaf, IDM, octx, lineage_label, genes_arr, split_frac=0.15, min_cells=80, hi_thr=None):
-    """★ MUTUAL-EXCLUSIVITY mixture (2026-06-24, CASE+RULE, 하드코딩 없음).
-    CASE: leaf가 한 lineage CLASS에 머물렀는데(class_floor/ambiguous), 그 lineage의 sibling subtype 둘이
-      MUTUALLY EXCLUSIVE — X의 positive(R/DF) 마커가 Y의 NEGATIVE 마커이고 그 역도 성립. 한 세포는 동시에
-      가질 수 없는 마커쌍(CD4 vs CD8: CD4SP R=CD4·neg=CD8 / CD8SP R=CD8·neg=CD4)이라, 클러스터가 X+Y- 세포와
-      X-Y+ 세포의 혼합이면 cluster-평균으론 둘 다 '낮게 present(서로 희석)'로 보인다 → MEAN-기반 top/mixture가
-      못 잡고 class_floor로 떨어진다(한쪽이 강한 게 아니라 둘 다 낮은데 비슷 = 혼합의 신호).
-    RULE: 상호배타 쌍을 KG 구조에서 자동 도출(X.pos ∩ Y.neg ≠∅ AND Y.pos ∩ X.neg ≠∅, same-lineage sibling).
-      leaf의 PER-CELL로 각 세포를 X-side(X마커+ Y마커-) / Y-side(Y+ X-)로 분류 →
-        · 양쪽 배타집단이 둘 다 ≥split_frac → verdict 'split' (진짜 X+Y 혼합 → needs_subclustering)
-        · 한쪽만 ≥split_frac        → 'dominant:<label>' (우세 subtype 호출; 반대편 부재가 증거 — CD4 dropout이어도
-                                       CD8-부재로 CD4SP 확정)
-        · 어느 쪽도 부족(연속체/dropout) → 미발동.
-    [[_bimodal_split]](low-share 양성 마커만)과 보완: 여기선 reciprocal pos↔neg를 써 공유도 높은 lineage
-    마커(CD4/CD8)도 잡는다. 순수 ADDITIVE(기존 트리거 불변). 반환 [{pair,markers,frac_exclusive,verdict}] 또는 None."""
+    """★ MUTUAL-EXCLUSIVITY mixture (2026-06-24, CASE+RULE, no hardcoding).
+    CASE: the leaf stopped at one lineage CLASS (class_floor/ambiguous), yet two sibling subtypes of that
+      lineage are MUTUALLY EXCLUSIVE — X's positive (R/DF) marker is Y's NEGATIVE marker and vice versa.
+      A single cell cannot carry both (CD4 vs CD8: CD4SP R=CD4, neg=CD8 / CD8SP R=CD8, neg=CD4), so when the
+      cluster mixes X+Y- cells with X-Y+ cells, the cluster mean shows both as 'weakly present' (they dilute
+      each other) -> a MEAN-based top/mixture test misses it and the leaf falls to class_floor (the signal of
+      a mixture is not that one side is strong, but that both are low and similar).
+    RULE: derive the mutually exclusive pair from the KG structure automatically
+      (X.pos n Y.neg != {} AND Y.pos n X.neg != {}, same-lineage siblings).
+      Classify each cell of the leaf PER-CELL as X-side (X marker+, Y marker-) or Y-side (Y+, X-):
+        - both exclusive groups >= split_frac -> verdict 'split' (a genuine X+Y mixture -> needs_subclustering)
+        - only one >= split_frac              -> 'dominant:<label>' (call the dominant subtype; the absence of
+                                                 the other side is the evidence — even with CD4 dropout, the
+                                                 absence of CD8 confirms CD4SP)
+        - neither is sufficient (continuum/dropout) -> not triggered.
+    Complements [[_bimodal_split]] (which uses only low-share positive markers): here reciprocal pos<->neg
+    also catches high-share lineage markers (CD4/CD8). Purely ADDITIVE (existing triggers unchanged).
+    Returns [{pair,markers,frac_exclusive,verdict}] or None."""
     terms=octx.get("terms",{}); lab=IDM["lab"]; root=IDM["root"]; tier=IDM["tier"]
     cls=IDM["lin_class"].get(lineage_label)
     if cls is None: return None
@@ -1661,15 +1674,16 @@ def _exclusive_mixture(Xleaf, IDM, octx, lineage_label, genes_arr, split_frac=0.
     sibs=[t for t in terms if root.get(t)==cls_root and tier.get(t)!="class"
           and (terms[t].get("D") or "normal")=="normal"]
     U=lambda xs:{str(g).upper() for g in (xs or [])}
-    # exclusive 변별자 = DEFINING(DF, '단독 충분' curated 마커)만. required(R)는 RAG1 같은 maturation-stage
-    #   공유마커를 포함해 lineage-배타가 아닌 거짓 쌍(CD8 vs RAG1-immature)을 만든다 → DF로 제한해 진짜 lineage 변별만.
+    # exclusive discriminators = DEFINING markers only (DF, curated as 'one is sufficient'). required (R)
+    #   includes maturation-stage shared markers such as RAG1 and would create false pairs that are not
+    #   lineage-exclusive (CD8 vs RAG1-immature) -> restricting to DF keeps only genuine lineage discriminators.
     pos={t:U(terms[t].get("DF")) for t in sibs}
     neg={t:U(terms[t].get("N")) for t in sibs}
     pairs=[]
     for i in range(len(sibs)):
         for j in range(i+1,len(sibs)):
             X,Y=sibs[i],sibs[j]
-            mx=pos[X]&neg[Y]; my=pos[Y]&neg[X]            # X-defining이 Y-negative, 상호 → 상호배타 쌍
+            mx=pos[X]&neg[Y]; my=pos[Y]&neg[X]
             if mx and my: pairs.append((X,Y,sorted(mx),sorted(my)))
     if not pairs: return None
     if hasattr(Xleaf,"toarray"): Xleaf=Xleaf.toarray()
@@ -1679,20 +1693,23 @@ def _exclusive_mixture(Xleaf, IDM, octx, lineage_label, genes_arr, split_frac=0.
     out=[]
     for X,Y,mx,my in pairs:
         xi=[gidx[g] for g in mx if g in gidx]; yi=[gidx[g] for g in my if g in gidx]
-        if not xi or not yi: continue                     # 한쪽 마커가 off-panel이면 배타 판정 불가
-        # ★ ENRICHMENT 기반 ON (2026-06-26): 단순 검출(>0)은 sparse SSAM KDE에서 노이즈(trace bleed)도 ON으로
-        #   세어 가짜 mixture를 만든다(cl17: Wfs1/Prox1 절대평균 0.001인데 19/20% '검출'→가짜 CA1+DG split).
-        #   hi_thr(전역 gmu+gsd, fon의 ON 정의와 동일)가 주어지면 그 임계 초과만 ON으로 — 노이즈 제거.
+        if not xi or not yi: continue
+        # ★ ENRICHMENT-based ON: plain detection (>0) also counts noise (trace bleed) as ON on a sparse KDE
+        #   vector field and manufactures fake mixtures (cl17: Wfs1/Prox1 have absolute means of 0.001 yet are
+        #   'detected' in 19/20% of cells -> a fake CA1+DG split). When hi_thr (the global gmu+gsd, the same ON
+        #   definition used by fon) is supplied, only values above it count as ON — removing the noise.
         if hi_thr is not None:
             xon=(Xleaf[:,xi]>=np.asarray(hi_thr)[xi]).any(axis=1); yon=(Xleaf[:,yi]>=np.asarray(hi_thr)[yi]).any(axis=1)
         else:
             xon=(Xleaf[:,xi]>0).any(axis=1); yon=(Xleaf[:,yi]>0).any(axis=1)
         fX=float((xon&~yon).mean()); fY=float((~xon&yon).mean()); fBoth=float((xon&yon).mean())
-        # ★ 진짜 상호배타 가드: 이중양성(둘 다 발현) 세포가 배타집단보다 드물어야 한다. 마커가 자주 공존하면
-        #   (CCR7 naive vs CD4: naive CD4는 CCR7+CD4+) 구조상 pos∩neg라도 진짜 배타 아님 → 제외.
+        # ★ Genuine mutual-exclusivity guard: double-positive cells (expressing both) must be rarer than the
+        #   exclusive groups. When the markers frequently co-occur (CCR7 naive vs CD4: naive CD4 is CCR7+ CD4+),
+        #   the pair is not truly exclusive even if pos n neg holds structurally -> excluded.
         if fBoth >= 0.5*min(fX, fY): continue
-        # SPLIT만: 양쪽 배타집단이 둘 다 충분 = 진짜 X+Y 혼합. 한쪽만(발달 연속체/단일정체)이면 미발동
-        #   — mixture가 아니라 '어느 쪽 단일'이며 정상 scoring 영역(dominant 남발=노이즈).
+        # SPLIT only: both exclusive groups sufficiently large = a genuine X+Y mixture. If only one side is
+        #   (a developmental continuum or a single identity), do not fire — that is not a mixture but 'which
+        #   single one', which normal scoring handles (over-issuing dominant would be noise).
         if fX>=split_frac and fY>=split_frac:
             out.append({"pair":[lab.get(X,X),lab.get(Y,Y)],"markers":[mx,my],
                         "frac_exclusive":[round(fX,2),round(fY,2)],"verdict":"split",
@@ -1705,16 +1722,20 @@ def _profile_leaves(X, genes, leaf_arr, leaves, ont_gene_set, ont_protected,
                     auc_up=0.6, auc_dn=0.4, top_hp=50, parent_up_auc=None,
                     gmu=None, gsd=None, restrict_root=None, dz_terms=None, st_terms=None, mt_terms=None, profile_cap=0, auc_pos=0.65, absent_rg=None,
                     adaptive_floor=False, af_F=3.0, af_Nmin=10):
-    """leaf별 profile. up/dn 무제한(AUC 임계만), hp=50.
-    identity_evidence = density(vf_norm) + specificity_peak + lineage_markers_present + housekeeping_share + cross_lineage."""
-    # ★ stratified subsample (2026-06-17 속도): 전체 cell의 AUC rank 계산(rankdata axis=0)이 650k에서 ~11분으로
-    #   파이프라인 최대 병목. 마커는 population 신호라 leaf별 충분한 cell이면 AUC가 안정 → profile_cap 초과 시 leaf별
-    #   층화 subsample(작은 leaf는 전량 유지, 큰 leaf만 비례 축소). 전역 gmu/gsd는 init이 FULL 데이터로 계산해 넘기므로
-    #   absolute identity 기준은 불변. 결정성 위해 seed 고정. profile_cap=0이면 full(정확도 최우선).
+    """Per-leaf profile. up/dn unbounded (AUC threshold only), hp=50.
+    identity_evidence = density(vf_norm) + specificity_peak + lineage_markers_present +
+    housekeeping_share + cross_lineage."""
+    # ★ Stratified subsample (speed): computing the AUC rank over all cells (rankdata axis=0) takes ~11 min
+    #   at 650k and is the pipeline's biggest bottleneck. Markers are a population signal, so the AUC is
+    #   stable once a leaf has enough cells -> above profile_cap, subsample per leaf in a stratified way
+    #   (small leaves are kept in full, only large leaves shrink proportionally). The global gmu/gsd are
+    #   computed by init on the FULL data and passed in, so the absolute-identity reference is unchanged.
+    #   The seed is fixed for determinism. profile_cap=0 means full (accuracy first).
     leaf_arr=np.asarray(leaf_arr); _n_full=X.shape[0]
-    # ★ TRUE leaf 크기(subsample 전) 보존 → entry["n"]은 실제 cell 수로 리포트(agent의 절대-수 판단·희귀타입 sanity
-    #   보존). AUC/pin/mean 등 통계는 subsample로 계산하되, 보고되는 n/n_out만 TRUE. (finalize gate는 state의 TRUE
-    #   cluster_paths를 별도로 써서 무관.)
+    # ★ The TRUE leaf size (before subsampling) is preserved -> entry["n"] reports the real cell count, which
+    #   keeps the agent's absolute-count reasoning and rare-type sanity checks valid. Statistics (AUC, pin,
+    #   mean ...) are computed on the subsample, but the reported n / n_out are TRUE. (The finalize gate is
+    #   unaffected: it uses the state's TRUE cluster_paths separately.)
     _lv,_lc=np.unique(leaf_arr, return_counts=True); _true_n={k:int(v) for k,v in zip(_lv.tolist(),_lc.tolist())}
     if profile_cap and _n_full>profile_cap:
         _MINKEEP=2500; _rng=np.random.default_rng(0); _frac=profile_cap/_n_full; _parts=[]
@@ -1727,10 +1748,10 @@ def _profile_leaves(X, genes, leaf_arr, leaves, ont_gene_set, ont_protected,
         _sel=np.sort(np.concatenate(_parts))
         X=np.ascontiguousarray(X[_sel]); leaf_arr=leaf_arr[_sel]
         if vf_norm is not None: vf_norm=np.asarray(vf_norm)[_sel]
-        print(f"[profile] stratified subsample {len(_sel)}/{_n_full} cells (cap={profile_cap}, MINKEEP={_MINKEEP}) — AUC/rank 가속", flush=True)
+        print(f"[profile] stratified subsample {len(_sel)}/{_n_full} cells (cap={profile_cap}, MINKEEP={_MINKEEP}) — speeds up AUC/rank", flush=True)
     n_cells, n_genes = X.shape
     genes_arr=np.asarray(genes); ranks=_rankcols(X)
-    gidx_U={str(g).upper():i for i,g in enumerate(genes_arr.tolist())}   # disease_candidates 마커 매칭(대소문자 무시)
+    gidx_U={str(g).upper():i for i,g in enumerate(genes_arr.tolist())}
     leaf_to_idx={l:k for k,l in enumerate(leaves)}
     cli=np.fromiter((leaf_to_idx.get(p,-1) for p in leaf_arr), dtype=np.int64, count=n_cells)
     valid=cli>=0; rows=cli[valid]; cols=np.nonzero(valid)[0]; K=len(leaves)
@@ -1756,19 +1777,23 @@ def _profile_leaves(X, genes, leaf_arr, leaves, ont_gene_set, ont_protected,
     ont_off=sorted(g for g in (ont_gene_set or set()) if g not in panel)
     ont_on_idx=np.array([np.where(genes_arr==g)[0][0] for g in ont_on], dtype=np.int64) if ont_on else np.array([],dtype=np.int64)
 
-    # absolute identity (전역 기준) 사전계산: 전역 high임계 THR=gmu+gsd, leaf별 frac_on = (M@HI)/n_in.
-    # gmu/gsd는 init에서 전체 데이터로 계산해 persist → 모든 round에서 동일(조각화 불변).
+    # absolute identity (global reference) precomputed: the global high threshold THR = gmu+gsd, and per leaf
+    # frac_on = (M@HI)/n_in.
+    # gmu/gsd are computed by init over the full data and persisted -> identical in every round
+    # (invariant to fragmentation).
     IDM=None; _gpin_arr=_ghi_arr=None
     if gmu is not None and gsd is not None:
         IDM=_build_ident_maps(octx, genes_arr)
         gmu_arr=np.asarray(gmu,dtype=np.float64); gsd_arr=np.asarray(gsd,dtype=np.float64)
-        sumHI=M@((X>=(gmu_arr+gsd_arr)).astype(np.float64))   # (K, G) leaf별 high세포 수
-        if adaptive_floor:   # ★ 데이터-유도 floor용 전역 baseline (reference-free): 전역 검출률/강발현률 (1회)
+        sumHI=M@((X>=(gmu_arr+gsd_arr)).astype(np.float64))
+        if adaptive_floor:   # ★ global baseline for the data-derived floor (reference-free): global detection rate / strong-expression rate (computed once)
             _gpin_arr=np.asarray(totBin,dtype=np.float64).ravel()/max(n_cells,1)
             _ghi_arr=np.asarray((X>=(gmu_arr+gsd_arr)).sum(axis=0),dtype=np.float64).ravel()/max(n_cells,1)
             print(f"[adaptive-floor] ON (F={af_F}, Nmin={af_Nmin}) — region-gated positive floor = min(fixed, ambient×F); "
                   f"median gpin={np.median(_gpin_arr):.4f} ghi={np.median(_ghi_arr):.4f}", flush=True)
 
+    # union of all state-program markers on this panel → per-leaf mean stored for the WITHIN-BASE state gate (finalize)
+    _sa_gi={str(_g).upper():gidx_U[str(_g).upper()] for _stx in (octx.get("sa") or []) for _g in (_stx.get("markers") or []) if str(_g).upper() in gidx_U}
     profiles={}
     for k,path in enumerate(leaves):
         ni=int(n_in_per[k]); no=n_cells-ni
@@ -1777,12 +1802,10 @@ def _profile_leaves(X, genes, leaf_arr, leaves, ont_gene_set, ont_protected,
         pin=sumBin[k]/ni
         order=np.argsort(mi)[::-1]
         rank_of=np.empty(n_genes,dtype=np.int64); rank_of[order]=np.arange(1,n_genes+1)
-        # up/dn (무제한 — AUC 임계만)
         up=[[genes_arr[i],round(float(auc[i]),3),round(float(mi[i]),3),round(float(mo[i]),3)]
             for i in np.argsort(auc)[::-1] if auc[i]>=auc_up]
         dn=[[genes_arr[i],round(float(auc[i]),3),round(float(mi[i]),3),round(float(mo[i]),3)]
             for i in np.argsort(auc) if auc[i]<=auc_dn]
-        # hp (top 50, HK 제외)
         hp=[]
         for i in order:
             if hk_mask[i]: continue
@@ -1793,26 +1816,23 @@ def _profile_leaves(X, genes, leaf_arr, leaves, ont_gene_set, ont_protected,
         for j,i in enumerate(ont_on_idx):
             ogt[ont_on[j]]={"rank":int(rank_of[i]),"mean":round(float(mi[i]),3),"auc":round(float(auc[i]),3),"panel":True}
         for g in ont_off: ogt[g]={"rank":None,"mean":None,"auc":None,"panel":False}
-        # flags (lineage/specific/sibling는 onto_ctx에서 — 온톨로지 유도, organ 무관)
+        # flags (lineage / specific / sibling come from onto_ctx — ontology-derived, organ-agnostic)
         LINS=octx["lineages"]; SPEC=octx["specific"]; PAN=octx["pan"]
         up_genes={r[0] for r in up}; up_up={_U(g) for g in up_genes}
         multi=[ln for ln,gs in LINS.items() if len(up_up&gs)>=2]
-        # subclass_mixing: 부모를 공유하는 sibling subclass가 ≥2개, 각각 required ≥2개가 up에 강함
+        # subclass_mixing: >=2 sibling subclasses share a parent and each has >=2 required markers strong in up
         layer_mix=[p for p,ch in octx["siblings"].items()
                    if sum(1 for c in ch if len(octx["term_req"].get(c,set())&up_up)>=2)>=2]
         has_spec=bool(up_up&SPEC)
         any_class=any(len(up_up&gs)>=2 for gs in LINS.values())
         pan_class=(len(multi)<=1 and any_class and not has_spec)
         n_hk15=int(sum(1 for i in order[:15] if hk_mask[i])); bgscore=round(n_hk15/15.0,3)
-        # identity_evidence (bg 대체)
         nonhk_order=[i for i in order if not hk_mask[i]]
-        # specificity_peak: non-HK 중 AUC 최고 (>=auc_up)
         sp_peak=None
         if nonhk_order:
             best=max(nonhk_order, key=lambda i: auc[i])
             if auc[best]>=auc_up:
                 sp_peak=[genes_arr[best],round(float(auc[best]),3),round(float(mi[best]),3),round(float(mo[best]),3)]
-        # lineage_markers_present: ontology R∪S on-panel 중 pct_in>=0.4
         lin_present=[g for g in ont_on if (ogt[g]["mean"] is not None) and pin[np.where(genes_arr==g)[0][0]]>=0.4
                      and g.upper() not in PAN]
         # housekeeping_share + cross_lineage
@@ -1848,16 +1868,19 @@ def _profile_leaves(X, genes, leaf_arr, leaves, ont_gene_set, ont_protected,
             hits=[[genes_arr[gU[g]], round(float(auc[gU[g]]),3), round(float(pin[gU[g]]),3)]
                   for g in gs if g in gU and pin[gU[g]]>=0.1]
             if hits: lscan[ln]=sorted(hits, key=lambda r:-r[1])
-        # candidate_subtypes (옆 후보 scorecard + 1단계 child lookahead) — agent가 기억 의존 없이
-        # CA1/CA3 등 subtype을 빠짐없이 검토 + 고른 term을 더 쪼갤지 판단.
-        # region_share(영역 인식 변별도, _build_ident_maps와 동일)를 심볼 키로 변환해 넘김 → candidate_subtypes의
-        #   변별 판정을 graph_evidence anchor와 통일. IDM 없으면 None(→ pan_disc 폴백).
+        # candidate_subtypes (a scorecard of side candidates + a one-level child lookahead) — lets the agent
+        # review every subtype such as CA1/CA3 without relying on memory, and decide whether to split the chosen
+        # term further.
+        # region_share (region-aware discriminativeness, the same as in _build_ident_maps) is converted to symbol
+        #   keys and passed in, so candidate_subtypes judges discriminativeness the same way graph_evidence's
+        #   anchors do. None when there is no IDM (-> pan_disc fallback).
         _rs_sym=({_U(IDM["genes"][g]):c for g,c in (IDM.get("region_share") or {}).items() if 0<=g<len(IDM.get("genes") or [])}
                  if IDM is not None else None)
         cands, sig_targets=_candidate_subtypes(octx.get("terms",{}), ogt, up, octx, parent_up_auc=parent_up_auc, region_share=_rs_sym)
-        # subtype_groups: signal_targets 중 *같은 부모를 가진 sibling subtype이 ≥2개 공존* → 이 leaf를 그
-        # 부모 밑 subtype들로 한 단계 더 쪼갤 수 있다는 직접 신호(최대 깊이 재귀용). 예: CA1 deep(Bcl6)+
-        # CA1 superficial(Calb1)이 둘 다 떠 있으면 → {parent:CA1, children:[deep,superficial]}.
+        # subtype_groups: when *>=2 sibling subtypes sharing the same parent coexist* among signal_targets, that
+        # is a direct signal that this leaf can be split one level further into the subtypes under that parent
+        # (used for maximum-depth recursion). E.g. if CA1 deep (Bcl6) and CA1 superficial (Calb1) are both up ->
+        # {parent: CA1, children: [deep, superficial]}.
         terms_=octx.get("terms",{}); _grp={}
         _lab2tid={s["label"]:s["term_id"] for s in sig_targets}
         for s in sig_targets:
@@ -1866,14 +1889,14 @@ def _profile_leaves(X, genes, leaf_arr, leaves, ont_gene_set, ont_protected,
         subtype_groups=[{"parent_id":par,"parent_label":terms_[par].get("L",""),
                          "child_term_ids":ch,"children":[terms_[c].get("L","") for c in ch]}
                         for par,ch in _grp.items() if len(ch)>=2]
-        _tn=_true_n.get(path, ni)                              # TRUE leaf 크기(subsample 무관) — 리포트용
+        _tn=_true_n.get(path, ni)
         entry={"n":_tn,"n_out":_n_full-_tn,"n_sub":ni,"up":up,"dn":dn,"hp":hp,"ontology_gene_table":ogt,
                "identity_evidence":identity, "lineage_scan":lscan, "candidate_subtypes":cands,
                "signal_targets_suggested":sig_targets, "subtype_groups":subtype_groups,
                "flags":{"multi_lineage":multi,"layer_mixing":layer_mix,"pan_class_only":bool(pan_class),"background_score":bgscore},
                "sibling_contrast":sib}
         if no<MIN_N_OUT: entry["warn"]="n_out_too_small"
-        # absolute identity_scores (전역 기준, 조각화 불변) — Leiden+absolute 판단의 핵심 근거
+        # absolute identity_scores (global reference, invariant to fragmentation) — the core evidence behind the Leiden + absolute judgment
         if IDM is not None:
             fon=sumHI[k]/max(ni,1); lf=np.log2((mi+1e-9)/(gmu_arr+1e-9))
             entry["identity_scores"]=_identity_scores(fon, lf, IDM, pin=pin, auc=auc)
@@ -1887,17 +1910,18 @@ def _profile_leaves(X, genes, leaf_arr, leaves, ont_gene_set, ont_protected,
             # ★ graph-descent EVIDENCE — the redesigned primary identity substrate (the agent reasons over
             #   the KG it built). identity_scores is kept only as a supplementary absolute-fold summary.
             entry["graph_evidence"]=_graph_evidence(fon, lf, pin, IDM, octx, mean=mi, auc=auc, restrict_root=restrict_root, auc_pos=auc_pos, absent_rg=absent_rg, pin_floor=_pf, fon_floor=_ff)
-            # (구 Step 0.5 cluster-level compartment(neuropil/fiber tract) emission은 2026-07-21 제거 —
-            #  process는 clustering-based 경로에서 라벨하지 않는다. 사용자가 명시 요청하는 scoring-based
-            #  annotation(score-profile/apply/finalize)이 유일한 process 탐지 경로다.)
+            # Processes are not labelled on the clustering-based path, and process detection is not part of this
+            #  release.
             # DF-confirmed terms in this leaf (a DEFINING marker is fold-ON: log2fold>=1.5 AND detected>=25%).
             # Used by the finalize split-review gate (§8.1) + DF_MULTI_SUBTYPE to flag splits with a real 2nd identity.
-            # ★ LINEAGE-GATED (2026-06-17): leaf의 dominant lineage(graph_evidence.lineage)에 속한 term만 df_present에
-            #   넣는다. 이유: 공유 마커 DEFINING(CD4=CD4 T cell DF인데 골수계 mono/macro/DC에도 발현)이 lineage 무관하게
-            #   잡히면, 골수계 클러스터가 "CD4 T cell"을 df_present에 넣어 DF_MULTI_SUBTYPE/gate를 오염시킨다. lineage
-            #   게이트로 골수계 오염은 막고, T-lineage 내 CD4(DF)+CD8B(DF) 공존(=진짜 CD4/CD8 혼합)은 그대로 감지된다.
-            #   (mwb에서도 glut leaf의 ambient oligo DF 같은 cross-lineage 가짜 split 신호가 덤으로 제거됨.) lineage가
-            #   None(no_lineage)이면 게이트 미적용(보수적 fallback). DF-override 앵커링은 이미 dom_root 게이트라 무관.
+            # ★ LINEAGE-GATED: only terms belonging to the leaf's dominant lineage (graph_evidence.lineage) go into
+            #   df_present. Why: a shared DEFINING marker (CD4 is the DF of CD4 T cell but is also expressed by
+            #   myeloid mono/macro/DC) picked up regardless of lineage would let a myeloid cluster put "CD4 T cell"
+            #   into df_present and contaminate DF_MULTI_SUBTYPE / the gate. The lineage gate blocks the myeloid
+            #   contamination while a genuine CD4(DF) + CD8B(DF) coexistence within the T lineage (a real CD4/CD8
+            #   mixture) is still detected. (It also removes cross-lineage false split signals such as ambient oligo
+            #   DFs on a glut leaf.) When lineage is None (no_lineage) the gate is not applied (conservative
+            #   fallback). DF-override anchoring is unaffected — it is already gated by dom_root.
             _defn=IDM.get("defn",{}); _lab=IDM.get("lab",{}); _root=IDM.get("root",{})
             _lin_root=IDM.get("lin_class",{}).get((entry.get("graph_evidence") or {}).get("lineage"))
             _dfp=[tid for tid,gs in _defn.items() if any(lf[g]>=1.5 and pin[g]>=0.25 for g in gs)]
@@ -1914,21 +1938,23 @@ def _profile_leaves(X, genes, leaf_arr, leaves, ont_gene_set, ont_protected,
                     and _ge_b.get("verdict") in ("ambiguous_tie","class_or_unknown","confusion_unresolved")):
                 _bim=_bimodal_split(X[np.asarray(leaf_arr)==path], IDM, octx, _ge_b.get("lineage"), genes_arr)
                 if _bim: entry["bimodal_subtypes"]=_bim
-            # ★ MUTUAL-EXCLUSIVITY mixture (2026-06-24) — 상호배타 마커쌍(CD4/CD8 등)의 per-cell 혼합 감지.
-            #   lineage가 정해졌으면 항상 평가(verdict 무관) — class_floor로 떨어진 same-lineage 아형 혼합/우세를
-            #   구제한다. ADDITIVE(KG reciprocal pos↔neg로 자동 도출, 하드코딩 없음).
+            # ★ MUTUAL-EXCLUSIVITY mixture — detects a per-cell mixture of mutually exclusive marker pairs (CD4/CD8
+            #   etc.). Evaluated whenever the lineage is known (regardless of verdict), which rescues a same-lineage
+            #   subtype mixture or dominance that fell to class_floor. ADDITIVE (derived automatically from KG
+            #   reciprocal pos<->neg, no hardcoding).
             _exm_lin=(entry.get("identity_scores") or {}).get("dominant_lineage") or _ge_b.get("lineage")
-            if _exm_lin:                                    # dominant_lineage 우선(graph lineage는 transmitter gate로 흔들림)
+            if _exm_lin:                                    # prefer dominant_lineage (the graph lineage is perturbed by the transmitter gate)
                 _Xl=X[np.asarray(leaf_arr)==path]
                 _hi=(gmu_arr+gsd_arr) if (gmu is not None and gsd is not None) else None
                 _exm=_exclusive_mixture(_Xl, IDM, octx, _exm_lin, genes_arr, hi_thr=_hi)
                 if _exm: entry["exclusive_mixture"]=_exm
-            # ★ CONTEXT-AXIS (§4.3, 2026-06-21) — DETERMINISTIC zonation/layer subtyping. lineage가 module 선언
-            #   ca축의 applies_to면 pole별 context_markers 점수화 → mixed(≥2 pole 존재)면 부모에서 분할대상,
-            #   sub-leaf면 dominant_pole→suggested_subtype 제안. lineage는 graph_evidence가 확정(여기선 불변).
+            # ★ CONTEXT-AXIS (§4.3) — DETERMINISTIC zonation/layer subtyping. When the lineage matches the applies_to
+            #   of a ca axis declared by the module, score the per-pole context_markers -> if mixed (>=2 poles present)
+            #   the parent becomes a split target; on a sub-leaf, propose dominant_pole -> suggested_subtype. The
+            #   lineage is fixed by graph_evidence and never changed here.
             _ge_ca=entry.get("graph_evidence") or {}
             _ca_lin=_ge_ca.get("lineage")
-            # region/anchor-aware 매칭용 라벨: dominant_region + anchor 라벨 + anchor 조상 path 라벨
+            # labels used for region/anchor-aware matching: dominant_region + anchor labels + the anchor's ancestor path labels
             _ca_extra=set(_ge_ca.get("dominant_region") or [])
             for _an in (_ge_ca.get("anchors") or []):
                 if _an.get("label"): _ca_extra.add(_an["label"])
@@ -1938,7 +1964,7 @@ def _profile_leaves(X, genes, leaf_arr, leaves, ont_gene_set, ont_protected,
             _ca=_context_axis_eval(_ca_lin, octx.get("ca") or [], fon, lf, pin, gidx_U, extra_labels=_ca_extra)
             if _ca:
                 entry["context_axis"]=_ca
-                # flag: ≥2 pole 존재(mixed) → 부모면 §4.3대로 subcluster; dominant_pole 있으면 그 subtype 확정대상
+                # flag: >=2 poles present (mixed) -> subcluster the parent per §4.3; when a dominant_pole exists, that subtype is the target
                 entry["flags"]["context_axis_mixed"]=any(a.get("mixed") for a in _ca)
                 entry["flags"]["context_axis_pole"]=next((a.get("dominant_pole") for a in _ca if a.get("dominant_pole")), None)
             # ★ STATE-AXIS (base-agnostic cell states): each State judged independently (ENRICHED program
@@ -1947,34 +1973,40 @@ def _profile_leaves(X, genes, leaf_arr, leaves, ont_gene_set, ont_protected,
             _sax=_state_axis_eval(octx.get("sa") or [], fon, lf, pin, gidx_U)
             if _sax:
                 entry["state_axis"]=_sax
-            # ★ disease_candidates — disease는 필터가 아니라 힌트(2026-06-22). _is_state_term이 정상 scoring
-            #   코어(top/coh/chimera)에서 state를 빼므로(broad 마커 force-fit 방지) 여기서 별도 노출하되, --disease
-            #   미지정이어도 module의 모든 state term(st_terms)을 항상 surface한다 → 마커가 우세하면 agent가 그 state로
-            #   판정 가능(SKILL §7). --disease 매칭분(dz_terms)은 hint=True로 표시·우선정렬. 같은 ON 정의 사용.
+            if _sa_gi:                                     # per-leaf mean of every state marker → within-base gate (finalize)
+                entry["state_marker_means"]={_g: round(float(mi[_i]),4) for _g,_i in _sa_gi.items()}
+            # ★ disease_candidates — disease is a hint, not a filter. _is_state_term keeps states out of the normal
+            #   scoring core (top/coh/chimera) to prevent force-fits from broad markers, so they are exposed
+            #   separately here; and every state term of the module (st_terms) is always surfaced even when --disease
+            #   is not given, so the agent can assign a state when its markers dominate (SKILL §7). Terms matching
+            #   --disease (dz_terms) are flagged hint=True and sorted first. The same ON definition is used.
             _src = st_terms if st_terms else dz_terms
             if _src:
-                # ★ SPECIFICITY GATE (2026-07-02, disease-state FP fix): 병 상태를 raw ON 개수가 아니라 '고유+enriched'
-                #   마커로 판정한다. Gfap/Serpina3n/Vim/Cd44 같은 pan-reactive 마커는 여러 state가 공유(high share)
-                #   하거나 ambient(약발현)로 켜져, 마커 목록이 긴 state가 '개수'로 1등이 되어 정상 조직에서 disease
-                #   state로 승격되던 문제(DAA/DAM 가짜양성; 건강 뇌 23셀→AD astrocyte). n_specific_on = ON 마커 중
-                #   low-share(≤3, 그 상태에 비교적 고유) AND rank-enriched(auc≥0.85, ambient 아님)인 것 수. 0이면
-                #   공유/ambient 마커뿐 → 정상 대응(reactive/fibrous astro)으로 fallback해야 한다(SKILL §2.5). surface는
-                #   유지(진짜 state 미검출 방지), 승격 판정만 n_specific_on으로.
+                # ★ SPECIFICITY GATE (disease-state false-positive fix): a disease state is judged by its 'own +
+                #   enriched' markers, not by a raw count of ON markers. Pan-reactive markers such as
+                #   Gfap/Serpina3n/Vim/Cd44 are shared across many states (high share) or switch on as ambient (weak
+                #   expression), so a state with a long marker list won the 'count' and was promoted to a disease state in
+                #   normal tissue (DAA/DAM false positives; 23 cells in a healthy brain became AD astrocytes).
+                #   n_specific_on = the number of ON markers that are low-share (<=3, relatively unique to that state) AND
+                #   rank-enriched (auc>=0.85, not ambient). When it is 0 the evidence is only shared/ambient markers and
+                #   the leaf must fall back to the normal counterpart (reactive/fibrous astrocyte, SKILL §2.5). The term is
+                #   still surfaced (so a genuine state is not missed); only the promotion decision uses n_specific_on.
                 _shmap=(IDM.get("region_share") or IDM.get("share") or {}) if IDM else {}
                 dzc=[]
                 for _tid,_info in _src.items():
                     ons=[]; spons=[]; tot=0
-                    _rdf={str(g).upper() for g in (_info.get("R",[])+_info.get("DF",[]))}  # identity-정의 마커(supporting 제외)
+                    _rdf={str(g).upper() for g in (_info.get("R",[])+_info.get("DF",[]))}
                     for _g in (_info.get("R",[])+_info.get("S",[])+_info.get("DF",[])):
                         _gi=gidx_U.get(str(_g).upper())
                         if _gi is None: continue
                         tot+=1
                         if fon[_gi]>=0.30 or (lf[_gi]>=1.5 and pin[_gi]>=0.25):
                             ons.append(_g)
-                            # 고유 증거 = REQUIRED/DEFINING 중 low-share(≤3) + enriched(auc≥0.85)인 것만.
-                            #   supporting은 공유·corroborative라 불인정(Ctsb/Gsn/Hspb1 같은 KG-저share 일반 stress
-                            #   마커가 supporting으로 게이트를 뚫는 것 방지). DAA required=Gfap/Serpina3n(둘 다 high-share)
-                            #   → spons=0 → promotable=False → 정상 astro로 fallback.
+                            # own evidence = REQUIRED/DEFINING markers that are low-share (<=3) AND enriched (auc>=0.85).
+                            #   supporting markers do not count (they are shared and merely corroborative), which stops generic
+                            #   low-share stress markers in the KG (Ctsb/Gsn/Hspb1) from getting through the gate as supporting.
+                            #   DAA's required set is Gfap/Serpina3n (both high share) -> spons=0 -> promotable=False -> falls back to
+                            #   a normal astrocyte.
                             if str(_g).upper() in _rdf and _shmap.get(_gi,99)<=3 and auc is not None and auc[_gi]>=0.85:
                                 spons.append(_g)
                     if ons:
@@ -1985,18 +2017,21 @@ def _profile_leaves(X, genes, leaf_arr, leaves, ont_gene_set, ont_protected,
                                     "hint":bool(dz_terms and _tid in dz_terms)})
                 dzc.sort(key=lambda d:(-int(d["hint"]), -d["n_specific_on"], -d["n_on"]))
                 if dzc: entry["disease_candidates"]=dzc[:8]
-            # ★ transition_candidates — anchor-tiebreaker (STATE_TRANSITION_DESIGN §엔진규칙, evidence-strong).
-            #   lineage-mimicry term(MP+A 보유, tier 무관)에 대해: origin identity-anchor(A) 마커 잔존 present
-            #   AND 흉내 프로그램(R/S/DF의 비-anchor 마커) 동시 present면 → 이 leaf는 흉내 대상 lineage가 아니라
-            #   'origin lineage + 전이상태'. 흉내 lineage로의 force-fit/chimera 오판 방지를 위해 최상위 신호로 surface.
+            # ★ transition_candidates — the anchor tiebreaker (STATE_TRANSITION_DESIGN §engine rules,
+            #   evidence-strong). For a lineage-mimicry term (carrying MP + A, regardless of tier): if the origin
+            #   identity-anchor (A) markers are still present AND the mimicked program (the non-anchor markers of
+            #   R/S/DF) is present at the same time, then this leaf is not the mimicked lineage but 'the origin lineage
+            #   in a transition state'. Surfaced as a top-priority signal to prevent a force-fit or chimera call
+            #   toward the mimicked lineage.
             if mt_terms:
                 def _on_g(_g):
                     _gi=gidx_U.get(str(_g).upper())
                     if _gi is None: return False
                     return fon[_gi]>=0.30 or (lf[_gi]>=1.5 and pin[_gi]>=0.25)
-                # ★ origin-lineage 게이트: transition term의 origin lineage가 leaf의 dominant lineage와 같을 때만
-                #   발동(흉내 대상이 아니라 origin이 일치해야 '그 origin의 전이상태'다). 다르면 cross-lineage 거짓발동
-                #   (mTEC term이 endothelial/T 클러스터에 발동) 차단. leaf lineage 미정(None)이면 게이트 미적용(보수적).
+                # ★ origin-lineage gate: a transition fires only when the transition term's origin lineage equals the
+                #   leaf's dominant lineage (it is 'a transition state of that origin' only if the origin matches, not the
+                #   mimicked target). A mismatch would fire across lineages (an mTEC term firing on an endothelial or T
+                #   cluster). When the leaf's lineage is undetermined (None) the gate is not applied (conservative).
                 _geL=(entry.get("graph_evidence") or {}).get("lineage") if IDM is not None else None
                 _leaf_root=IDM["root"].get(IDM.get("lin_class",{}).get(_geL)) if (IDM is not None and _geL) else None
                 trc=[]
@@ -2005,9 +2040,9 @@ def _profile_leaves(X, genes, leaf_arr, leaves, ont_gene_set, ont_protected,
                         _troot=IDM["root"].get(_tid)
                         if _troot is not None and _troot!=_leaf_root: continue   # origin lineage ≠ leaf lineage
                     anchor_on=[g for g in _info.get("A",[]) if _on_g(g)]
-                    if not anchor_on: continue                       # origin 잔존 없음 → 미발동(진짜 흉내 lineage일 수 있음)
-                    spec_on=[g for g in _info.get("Qspec",[]) if _on_g(g)]   # 흉내 lineage SPECIFIC 마커(pan 제외)
-                    if len(spec_on)<2: continue                      # ★ 특이 흉내 프로그램 ≥2 ON일 때만 발동(pan-마커 거짓발동 차단)
+                    if not anchor_on: continue
+                    spec_on=[g for g in _info.get("Qspec",[]) if _on_g(g)]
+                    if len(spec_on)<2: continue                      # ★ fires only when >=2 specific mimicked-program markers are ON (blocks false firing from pan markers)
                     trc.append({"term_id":_tid,"label":_info["L"],"D":_info["D"],
                                 "anchor_retained":anchor_on,"acquired_on":spec_on[:8],
                                 "mimics":[{"lineage":m.get("lineage"),"program":m.get("program","")} for m in _info.get("MP",[])],
@@ -2016,13 +2051,14 @@ def _profile_leaves(X, genes, leaf_arr, leaves, ont_gene_set, ont_protected,
                     trc.sort(key=lambda d:(-d["n_anchor"], -d["n_acquired"]))
                     entry["transition_candidates"]=trc[:6]
                     _mlin=sorted({m["lineage"] for d in trc for m in d["mimics"] if m.get("lineage")})
-                    entry["transition_note"]=("identity-anchor 잔존 → transition_candidates는 origin lineage+전이상태다. "
-                        "흉내 대상 lineage("+", ".join(_mlin)+")로 순수 판정하지 말 것; anchor 마커가 origin 정체성 증거.")
+                    entry["transition_note"]=("identity anchors retained -> transition_candidates is the origin lineage in a transition state. "
+                        "Do not call it purely as the mimicked lineage ("+", ".join(_mlin)+"); the anchor markers are evidence of the origin identity.")
         profiles[path]=entry
     return profiles
 
 def _write_overview(out, rnd, profiles):
-    """#1 cross-cluster overview: 한 round의 모든 leaf를 나란히 비교(전문가의 '표 비교' 복원)."""
+    """#1 cross-cluster overview: compare every leaf of a round side by side (restores the expert's
+    'table comparison')."""
     rows={}
     for path,e in profiles.items():
         ls=e.get("lineage_scan",{})
@@ -2041,21 +2077,22 @@ def _save_state(out,st):
     with open(_sp(out),"w") as f: json.dump(st,f)
 
 def _vf_setup(adata):
-    """obs['vf_norm'] 있으면 (배열, 하위25% 임계) 반환, 없으면 (None,None)."""
+    """Returns (array, bottom-25% threshold) when obs['vf_norm'] exists, else (None, None)."""
     if "vf_norm" in adata.obs:
         vf=np.asarray(adata.obs["vf_norm"].values, dtype=np.float64)
         return vf, float(np.percentile(vf,25))
     return None, None
 
 def _check_input_matrix(adata, force=False):
-    """init 진입 게이트: 표준 annotator는 adata.X만 읽는다(--layer 없음). 두 전제를
-    검증한다 — X=log-normalized(정수 raw count 아님), var_names=gene symbol(Ensembl ID 아님).
-    둘 다 위반해도 파이프라인은 조용히 완주하지만 라벨은 쓰레기가 된다(마커축 통계가 lognorm을
-    가정, 마커 매칭이 심볼 기준). 그래서 여기서 fail-fast. --force로 무시 가능(비표준 입력 자인)."""
+    """init entry gate: the standard annotator reads only adata.X (there is no --layer). Two preconditions
+    are verified — X = log-normalized (not integer raw counts) and var_names = gene symbols (not Ensembl
+    IDs). Violating either still lets the pipeline run to completion silently, but the labels become
+    garbage (the marker-axis statistics assume lognorm, and marker matching is symbol based). Hence
+    fail-fast here. Can be overridden with --force (acknowledging non-standard input)."""
     import re as _re
     X=adata.X
     n=adata.n_obs
-    # ---- 표본 추출(대형 h5ad 전체를 densify하지 않도록 앞 N행만) --------------------
+    # ---- sampling (read only the first N rows so a large h5ad is never densified in full) --------------
     rows=min(n,2000)
     Xs=X[:rows]
     Xs=np.asarray(Xs.todense()) if hasattr(Xs,"todense") else np.asarray(Xs)
@@ -2066,34 +2103,35 @@ def _check_input_matrix(adata, force=False):
     ens=sum(1 for g in vn if _re.match(r'^ENS[A-Z]*[GT]?\d{6,}(\.\d+)?$', g) or _re.match(r'^ENSMUS[GT]\d', g))
     if vn and ens/len(vn) > 0.5:
         ex=next((g for g in vn if g.upper().startswith("ENS")), vn[0])
-        problems.append(f"var_names가 gene symbol이 아니라 Ensembl ID로 보입니다(표본 {ens}/{len(vn)}개, 예: '{ex}'). "
-                        f"마커는 심볼(EPCAM, Snap25)로 매칭하므로 Ensembl ID면 마커가 하나도 안 잡힙니다. "
-                        f"adata.var_names를 gene symbol로 바꾸세요.")
-    # ---- (2) X = log-normalized? (정수 raw count 감지) ---------------------------
+        problems.append(f"var_names look like Ensembl IDs rather than gene symbols (sampled {ens}/{len(vn)}, e.g. '{ex}'). "
+                        f"Markers are matched by symbol (EPCAM, Snap25), so with Ensembl IDs no marker will match at all. "
+                        f"Convert adata.var_names to gene symbols.")
+    # ---- (2) is X log-normalized? (detect integer raw counts) ---------------------------
     finite=Xs[np.isfinite(Xs)]
     if finite.size:
         if np.any(finite < 0):
-            problems.append("X에 음수가 있습니다 — log-normalized가 아닌 정규화로 보입니다"
-                            "(z-scored/scaled, 또는 Pearson residual 등). "
-                            "annotator는 비음수 log-normalized X를 기대합니다 — scale/residual 이전 단계를 사용하세요.")
+            problems.append("X contains negative values — this looks like a normalization other than log-normalization"
+                            "(z-scored/scaled, or Pearson residuals, etc.). "
+                            "The annotator expects non-negative log-normalized X — use the stage before scaling/residuals.")
         else:
             nz=finite[finite>0]
             allint = nz.size>0 and np.allclose(nz, np.round(nz))
             xmax=float(finite.max())
-            # log-normalized X는 log1p 결과라 사실상 절대 all-integer가 아니다 → all-integer면 raw count.
-            # (max 임계에 의존하지 않는다: 저심도 데이터도 걸러야 하고, max>1 은 binary mask 오탐만 배제.)
+            # log-normalized X is the result of log1p and is virtually never all-integer -> all-integer means raw counts.
+            # (This does not rely on a max threshold: low-depth data must be caught too, and max>1 only rules out a
+            # binary mask false positive.)
             if allint and xmax>1:
-                problems.append(f"X가 정수 raw count로 보입니다(비영 값이 전부 정수, max={xmax:.0f}). "
-                                f"annotator는 log-normalized X를 기대합니다(count는 마커축 통계를 왜곡). "
-                                f"sc.pp.normalize_total(adata, target_sum=1e4) 후 sc.pp.log1p(adata)를 적용하세요.")
+                problems.append(f"X looks like integer raw counts (all non-zero values are integers, max={xmax:.0f}). "
+                                f"The annotator expects log-normalized X (counts distort the marker-axis statistics). "
+                                f"Apply sc.pp.normalize_total(adata, target_sum=1e4) followed by sc.pp.log1p(adata).")
     if problems:
         msg="\n".join(f"   • {p}" for p in problems)
         if force:
-            print(f"[init][WARN:INPUT_MATRIX] 입력 전제 위반(--force로 강행):\n{msg}", flush=True)
+            print(f"[init][WARN:INPUT_MATRIX] input precondition violated (proceeding because of --force):\n{msg}", flush=True)
         else:
-            sys.exit(f"[init][ERROR:INPUT_MATRIX] 입력 h5ad가 annotator 전제를 위반합니다:\n{msg}\n"
-                     f"   → 고친 뒤 다시 실행하거나, 비표준 입력임을 인지하고 강행하려면 --force. "
-                     f"→ caller는 사용자에게 위 문제를 그대로 전달할 것.")
+            sys.exit(f"[init][ERROR:INPUT_MATRIX] the input h5ad violates the annotator's preconditions:\n{msg}\n"
+                     f"   -> fix it and rerun, or pass --force to proceed knowing the input is non-standard. "
+                     f"-> the caller should relay the problem above to the user verbatim.")
 
 # ===================================================================== init
 def cmd_init(a):
@@ -2101,16 +2139,18 @@ def cmd_init(a):
     print(f"[init] loading {a.h5ad} (cluster_col={a.cluster_col})", flush=True)
     adata=ad.read_h5ad(a.h5ad)
     if a.cluster_col not in adata.obs:
-        sys.exit(f"[init] obs에 cluster 컬럼 '{a.cluster_col}' 없음. 사용가능: {list(adata.obs.columns)}")
-    _check_input_matrix(adata, force=getattr(a,"force_input",False))   # X=lognorm / var_names=symbol 전제 검증
+        sys.exit(f"[init] cluster column '{a.cluster_col}' not found in obs. Available: {list(adata.obs.columns)}")
+    _check_input_matrix(adata, force=getattr(a,"force_input",False))
     cps=adata.obs[a.cluster_col].astype(str).values.copy()
-    # 사용자가 준 cluster/annotation 컬럼의 모든 라벨이 leaf(=annotation 대상). clustering-based
-    #   annotation은 사용자 클러스터링(외부/노트북)을 그대로 입력받는다.
+    # every label in the cluster/annotation column the user supplied is a leaf (= a target for annotation).
+    #   Clustering-based annotation takes the user's clustering (from a notebook or elsewhere) as given.
     leaves=sorted(set(cps.tolist()),
                   key=lambda s:[int(x) for x in s.split(".")] if s.replace('.','').isdigit() else [10**9,s])
-    # ★ subcluster 표현공간(use_rep): subcluster의 neighbors를 통합 임베딩(scVI 등)에서 재계산.
-    #   미지정('auto')이면 obsm에서 통합 임베딩 자동탐지; 'recompute'/'none'이면 raw 대신 normalize+log1p+PCA fallback.
-    #   (예전 동작=raw count PCA는 stress/library-size에 지배돼 정체성 분할 실패 → 더 이상 기본 아님.)
+    # ★ subcluster representation (use_rep): neighbors for a subcluster are recomputed on an integrated
+    #   embedding (scVI etc.). With 'auto' (the default) an integrated embedding is auto-detected in obsm;
+    #   with 'recompute'/'none' the fallback is normalize + log1p + PCA rather than raw.
+    #   (Raw-count PCA is dominated by stress and library size and fails to split identities, so it is no
+    #   longer the default.)
     rep=a.use_rep
     if rep in (None,"auto",""):
         rep=next((c for c in ("X_scVI","X_scANVI","X_scanvi","X_pca_harmony","X_harmony","X_pca","X_PCA")
@@ -2118,13 +2158,14 @@ def cmd_init(a):
     elif rep in ("recompute","none","raw","RECOMPUTE"):
         rep=None
     elif rep not in adata.obsm:
-        sys.exit(f"[init] --use-rep '{rep}' 가 obsm에 없음. 사용가능 obsm: {list(adata.obsm)} "
-                 "(또는 --use-rep recompute 로 normalize+log1p+PCA 재계산).")
+        sys.exit(f"[init] --use-rep '{rep}' is not in obsm. Available obsm: {list(adata.obsm)} "
+                 "(or use --use-rep recompute to redo normalize + log1p + PCA).")
     print(f"[init] subcluster representation: {rep or 'recompute (normalize_total+log1p+PCA)'}", flush=True)
-    # ★ subcluster metric/n_neighbors는 **초기 클러스터링과 반드시 같아야** 한다(다르면 조용히 틀어짐).
-    #   입력 h5ad를 만든 클러스터링(사용자 노트북/외부)이 uns['cellman_cluster_params']에 metric/n_neighbors를
-    #   남겨두면 여기서 그대로 상속한다 — 없으면 기본(euclidean/15). --subcluster-metric/-n-neighbors로 직접
-    #   지정하면 uns를 이깁니다(외부에서 다른 설정으로 클러스터링해 온 h5ad용).
+    # ★ The subcluster metric / n_neighbors **must match the initial clustering** — if they differ, results
+    #   silently drift. When the clustering that produced the input h5ad (a user notebook or an external tool)
+    #   records metric/n_neighbors in uns['cellman_cluster_params'], they are inherited here; otherwise the
+    #   defaults (euclidean/15) apply. Passing --subcluster-metric / -n-neighbors explicitly overrides uns
+    #   (for an h5ad clustered elsewhere with different settings).
     _cp={}
     try:
         _raw=adata.uns.get("cellman_cluster_params")
@@ -2133,7 +2174,7 @@ def cmd_init(a):
     sc_metric=getattr(a,"sc_metric",None) or _cp.get("metric") or "euclidean"
     sc_n_neighbors=int(getattr(a,"sc_n_neighbors",None) or _cp.get("n_neighbors") or 15)
     if _cp and not getattr(a,"sc_metric",None):
-        print(f"[init] uns['cellman_cluster_params']에서 초기 클러스터링 설정 상속: "
+        print(f"[init] inheriting the initial clustering settings from uns['cellman_cluster_params']: "
               f"metric={sc_metric} n_neighbors={sc_n_neighbors} (backend={_cp.get('backend')})", flush=True)
     if rep is None:
         print(f"[init] subcluster feature: log-normalize + metric={sc_metric} + n_neighbors={sc_n_neighbors}", flush=True)
@@ -2141,38 +2182,40 @@ def cmd_init(a):
         "cluster_paths":cps.tolist(),"leaves":leaves,"round":1,"parent_of":{p:None for p in leaves},
         "output":a.output,"disease":a.disease,"use_rep":rep,
         "sc_metric":sc_metric,"sc_n_neighbors":sc_n_neighbors,
-        # ★ adaptive-floor도 persist(2026-07-02): init에서 한 번 --adaptive-floor면 모든 subcluster 라운드가 상속
-        #   (subcluster-metric과 동일 방식) — 라운드마다 재지정 불필요.
-        "adaptive_floor":bool(getattr(a,"adaptive_floor",False)),"af_F":float(getattr(a,"af_F",3.0)),"af_Nmin":int(getattr(a,"af_Nmin",10))}  # disease/use_rep/sc_*/adaptive_floor persist(모든 round 공유)
+        # ★ adaptive-floor is persisted as well: passing --adaptive-floor once at init makes every subcluster
+        #   round inherit it (the same mechanism as subcluster-metric) — no need to repeat it each round.
+        "adaptive_floor":bool(getattr(a,"adaptive_floor",False)),"af_F":float(getattr(a,"af_F",3.0)),"af_Nmin":int(getattr(a,"af_Nmin",10))}
     _save_state(a.out, st)
-    # ontology URL 자동 구성: --ontology-url 직접지정 > (species/organ + 기본/지정 서버) ; 로컬은 --ontology.
+    # ontology URL resolution: an explicit --ontology-url > (species/organ + the default or given server); a local file comes from --ontology.
     url=a.ontology_url
     if not url and not a.ontology:
         if not (a.species and a.organ):
-            sys.exit("[init] --species/--organ 가 필요합니다(또는 --ontology-url / 로컬 --ontology). "
-                     "서버는 자동으로 기본 Cell-Ontology 서버에 연결됩니다.")
+            sys.exit("[init] --species/--organ are required (or --ontology-url / a local --ontology). "
+                     "The client connects to the default Cell-Ontology server automatically.")
         url=f"{_resolve_server(a.server_url)}/module/{a.species}/{a.organ}/slim-index"
         print(f"[init] ontology server: {_resolve_server(a.server_url)} (module {a.species}/{a.organ})", flush=True)
     idx=_fetch_slim_index(a.out, url, a.ontology)
     if not idx or not _ontology_gene_set(idx):
-        sys.exit("[init] FATAL: ontology(slim-index) 비어있음 — 서버/ module 확인. ontology-blind 금지.")
+        sys.exit("[init] FATAL: the ontology (slim-index) is empty — check the server / module. Running ontology-blind is not allowed.")
     ogs=_ontology_gene_set(idx); prot=_ontology_protected(idx); octx=_onto_ctx(idx)
     print(f"[init] ontology markers {len(ogs)} (protected {len(prot)}); lineages {len(octx['lineages'])} "
           f"(derived={'yes' if _derive_lineages(idx) else 'fallback'})", flush=True)
     X=np.asarray(adata.X.todense() if hasattr(adata.X,"todense") else adata.X)
     vf,low=_vf_setup(adata)
-    print(f"[init] vf_norm: {'있음' if vf is not None else '없음(밀도축 비활성)'}", flush=True)
-    # ★ 전역 per-gene 통계(전체 데이터) 1회 계산 → persist. 모든 round의 absolute identity 스코어가
-    #   이 전역 기준을 재사용 → 조각나도 정체성 안 붕괴(local 대조 의존 제거).
+    print(f"[init] vf_norm: {'present' if vf is not None else 'absent (density axis disabled)'}", flush=True)
+    # ★ Global per-gene statistics (over the full data) are computed once and persisted. Every round's
+    #   absolute-identity score reuses this global reference, so identity does not collapse under
+    #   fragmentation (no dependence on a local contrast).
     gmu=np.asarray(X.mean(axis=0)).ravel(); gsd=np.asarray(X.std(axis=0)).ravel()
     np.savez(os.path.join(a.out,"_global_stats.npz"), mean=gmu, std=gsd, genes=np.array(list(adata.var_names),dtype=object))
-    print(f"[init] global per-gene stats saved (_global_stats.npz, {len(gmu)} genes) — absolute identity 기준", flush=True)
+    print(f"[init] global per-gene stats saved (_global_stats.npz, {len(gmu)} genes) — the absolute-identity reference", flush=True)
     dz_terms=_disease_terms(idx, a.disease); st_terms=_state_terms(idx); mt_terms=_mimicry_terms(idx)
-    if mt_terms: print(f"[init] mimicry/transition terms {len(mt_terms)} (MP+anchor) → leaf별 transition_candidates(anchor-tiebreaker, §state-transition)", flush=True)
-    print(f"[init] state terms {len(st_terms)} → leaf별 disease_candidates로 항상 surface (disease=힌트; 판정은 agent §7)"
-          + (f"; --disease='{a.disease}' 매칭 {len(dz_terms)}개 hint" if a.disease else "; --disease 미지정(모든 state 고려)"), flush=True)
-    # ★ F-B: anatomical region-presence 게이트 (전체 데이터 1회 계산 → persist). 부재 region(소뇌/뇌교 등)을
-    #   anchor/dominant/floor 후보에서 제외해 force-fit 차단. brain-anat 매칭 region-group만 영향(비-brain module 무영향).
+    if mt_terms: print(f"[init] mimicry/transition terms {len(mt_terms)} (MP+anchor) -> per-leaf transition_candidates (anchor tiebreaker, §state-transition)", flush=True)
+    print(f"[init] state terms {len(st_terms)} -> always surfaced per leaf as disease_candidates (disease is a hint; the agent decides, §7)"
+          + (f"; --disease='{a.disease}' matched {len(dz_terms)} as hints" if a.disease else "; --disease not given (all states considered)"), flush=True)
+    # ★ F-B: the anatomical region-presence gate (computed once over the full data and persisted). Absent
+    #   regions (cerebellum, pons, ...) are removed from the anchor / dominant / floor candidates, blocking
+    #   force-fits. Only region-groups matching brain anatomy are affected (no effect on non-brain modules).
     absent_rg, _rpres = _absent_region_groups(X, list(adata.var_names), octx, gmu, gsd)
     _rlab=_build_ident_maps(octx, np.asarray(list(adata.var_names)))["lab"]
     json.dump({"absent_region_groups":sorted(absent_rg),
@@ -2201,9 +2244,11 @@ def _pick_backend(gpu):
 
 def _hcmd_subcluster(a):
     st=_load_state(a.out)
-    # ★ Unknown re-pool 모드: 현 라운드 Unknown-결정 leaf들의 셀을 cross-parent로 모아 하나의 synthetic 부모
-    #   U{round}로 Leiden 재클러스터. 흩어진 동일-type Unknown 조각이 재응집 → 다음 라운드 재판정. 최종 라운드까지
-    #   진짜 Unknown인 것만 finalize에서 'Unknown' 라벨. (사용자 2026-06-27: Unknown은 마지막 라운드 전까진 종착 아님.)
+    # ★ Unknown re-pool mode: the cells of leaves decided Unknown in the current round are gathered across
+    #   parents into a single synthetic parent U{round} and re-clustered with Leiden. Scattered Unknown
+    #   fragments of the same type re-aggregate and are re-judged in the next round. Only what is still
+    #   genuinely Unknown at the last round is labelled 'Unknown' at finalize. (Unknown is not terminal until
+    #   the final round.)
     repool=bool(getattr(a,"repool_unknown",False))
     unk_leaves=[]
     if repool:
@@ -2214,7 +2259,7 @@ def _hcmd_subcluster(a):
         paths=[f"U{st['round']+1}"]                       # synthetic pooled parent
     else:
         paths=json.loads(a.paths)
-    # --resolution: 스칼라(모든 path 동일) 또는 JSON dict {path:res}(클러스터별 맞춤 — finalize start_resolution).
+    # --resolution: a scalar (the same for every path) or a JSON dict {path: res} (per cluster — the finalize start_resolution).
     try: _rj=json.loads(a.resolution)
     except Exception: _rj=None
     if isinstance(_rj, dict): res_map={str(k):float(v) for k,v in _rj.items()}; res_def=None
@@ -2225,29 +2270,32 @@ def _hcmd_subcluster(a):
     adata=ad.read_h5ad(st["h5ad_path"])
     cps=np.array(st["cluster_paths"], dtype=object)
     genes=list(adata.var_names)
-    rep=st.get("use_rep")                              # ★ subcluster 표현공간(init에서 결정). None이면 normalize+log1p+PCA 재계산.
+    rep=st.get("use_rep")                              # ★ subcluster representation (decided at init). None -> recompute normalize + log1p + PCA.
     new_all=[]; parent_prof={}
     for path in paths:
         if repool:
-            mask=np.isin(cps, unk_leaves); n=int(mask.sum())   # cross-parent Unknown 풀
+            mask=np.isin(cps, unk_leaves); n=int(mask.sum())
             print(f"[repool] pooling {n} cells from {len(unk_leaves)} Unknown leaves -> {path}", flush=True)
         else:
             if path not in st["leaves"]: print(f"[skip] {path} not leaf"); continue
             mask=(cps==path); n=int(mask.sum())
-        # policy성 min-cells 없음(작다고 background 취급/분할 차단 안 함 — 희귀 세포 보호).
-        # 단 PCA/이웃그래프가 수학적으로 불가능한 극소만 건너뜀(=분할 연산 불가, background 아님).
+        # there is no policy min-cells (a small leaf is never treated as background or blocked from splitting —
+        # rare cells are protected).
+        # Only sizes for which PCA / the neighbour graph are mathematically impossible are skipped (= the split
+        # operation is undefined, not background).
         if n<3:
             st.setdefault("unresolved_paths",[]).append(path)
-            print(f"[skip] {path} n={n}<3: 분할 연산 불가(극소). background 아님 — 현 leaf 유지.", flush=True)
+            print(f"[skip] {path} n={n}<3: too small to split (the operation is undefined). Not background — the current leaf is kept.", flush=True)
             continue
-        res=_res_p(path)                                  # ★ 클러스터별 맞춤 resolution
+        res=_res_p(path)                                  # ★ per-cluster resolution
         sub=adata[mask].copy()
         npc=min(50, sub.n_vars-1, max(2, sub.n_obs-1))
-        nn=min(int(st.get("sc_n_neighbors",15)),sub.n_obs-1)  # ★ init에서 persist된 n_neighbors(미지정 15)
-        # ★ use_rep 있으면 통합 임베딩(scVI 등) subset에서 neighbors 재계산(정체성 보존, top-level과 일관).
-        #   없으면 raw 대신 normalize_total+log1p+PCA 후 neighbors(raw-count PCA의 library-size/stress 지배 회피).
+        nn=min(int(st.get("sc_n_neighbors",15)),sub.n_obs-1)  # ★ n_neighbors persisted at init (15 when unset)
+        # ★ With use_rep, neighbors are recomputed on the subset of the integrated embedding (scVI etc.),
+        #   preserving identity and staying consistent with the top level. Without it, normalize_total + log1p +
+        #   PCA precede neighbors instead of raw (avoiding the library-size / stress dominance of raw-count PCA).
         use_rep=rep if (rep and rep in sub.obsm) else None
-        # ★ 초기 클러스터링과 일관된 metric (init에서 persist). recompute 경로에서만 적용.
+        # ★ metric consistent with the initial clustering (persisted at init). Applies only on the recompute path.
         sc_metric=st.get("sc_metric","euclidean")
         if backend=="rapids":
             mod.get.anndata_to_GPU(sub)
@@ -2274,25 +2322,25 @@ def _hcmd_subcluster(a):
         for nl in nh: st["parent_of"][nl]=path
         parent_prof[path]=(mask.copy(),new)
     if repool:
-        # repool이 실제 분리(new_all)했으면 원래 Unknown leaf들을 U-subleaf로 대체; 분리 안 됐으면(단일 blob) 그대로 둠.
+        # if the repool actually separated anything (new_all), replace the original Unknown leaves with the U sub-leaves; if it did not (a single blob), leave them as they were.
         leaves=([p for p in st["leaves"] if p not in unk_leaves]+new_all) if new_all else st["leaves"]
         if not new_all: print("[repool] pooled Unknown did not split (single blob) — Unknown leaves unchanged.", flush=True)
     else:
         leaves=[p for p in st["leaves"] if p not in parent_prof]+new_all
     st["leaves"]=leaves; st["cluster_paths"]=cps.tolist(); st["round"]+=1; _save_state(a.out,st)
     idx=_load_ontology_index(a.out); ogs=_ontology_gene_set(idx); prot=_ontology_protected(idx); octx=_onto_ctx(idx)
-    dz_terms=_disease_terms(idx, st.get("disease")); st_terms=_state_terms(idx); mt_terms=_mimicry_terms(idx)   # state는 항상 surface(disease=힌트), sub-leaf도 동일; mt=transition anchor-tiebreaker
+    dz_terms=_disease_terms(idx, st.get("disease")); st_terms=_state_terms(idx); mt_terms=_mimicry_terms(idx)   # states are always surfaced (disease is a hint), for sub-leaves too; mt = the transition anchor tiebreaker
     X=np.asarray(adata.X.todense() if hasattr(adata.X,"todense") else adata.X)
     vf,low=_vf_setup(adata)
-    # ★ F-B: init에서 persist한 부재 region-group 로드(부분집합에선 직접계산 불가하므로 재사용)
+    # ★ F-B: load the absent region-groups persisted at init (a subset cannot compute them itself, so they are reused)
     _arp=os.path.join(a.out,"_region_presence.json")
     absent_rg=set(json.load(open(_arp)).get("absent_region_groups",[])) if os.path.exists(_arp) else set()
-    # ★ init에서 persist한 전역 통계 로드 → absolute identity 기준(전체 데이터)을 이 round에도 그대로 사용.
+    # ★ load the global statistics persisted at init -> this round uses the same absolute-identity reference (from the full data).
     gmu=gsd=None
     _gsp=os.path.join(a.out,"_global_stats.npz")
     if os.path.exists(_gsp):
         _z=np.load(_gsp, allow_pickle=True); gmu=_z["mean"]; gsd=_z["std"]
-    # 이전 라운드 부모 프로파일 미리 로드(candidate_subtypes 부모 풀링 + parent_ctx 주입에 사용)
+    # preload the previous round's parent profiles (used for candidate_subtypes parent pooling and for injecting parent_ctx)
     prior={}
     for r in range(1,st["round"]):
         pf=os.path.join(a.out,f"cluster_gene_profiles_round{r}.json")
@@ -2307,23 +2355,23 @@ def _hcmd_subcluster(a):
     def _restrict_for(parent):
         ge=(prior.get(parent,{}) or {}).get("graph_evidence") or {}
         dr=ge.get("dominant_region") or []
-        # ★ 부모가 단일 region일 때만 그 region으로 제약(2026-06-18, 사용자 지침 + 기존 주석 의도 일치). 부모가
-        #   **상위 region 2개 이상 혼합**(dominant_region≥2)이면 단일 region으로 고정하지 말고 **lineage class로만**
-        #   제약 → 자식이 두 region 어디로든 resolve 가능(피질 arc + BLA 덩어리가 한 부모에 섞인 stomics cl6 같은
-        #   경우, 자식이 amygdalar로 탈출 가능). dr[0] 단일 고정은 소수 region(BLA)을 다수 region(neocortical)에
-        #   가두는 버그였음. (siblings within one region stay findable: CA1 inside CA3, both hippocampal pyramidal.)
+        # ★ Constrain to a single region only when the parent HAS a single region. If the parent mixes **two or
+        #   more upper regions** (dominant_region >= 2), do not pin a single region — constrain to the **lineage
+        #   class only** so a child can resolve into either region (as in stomics cl6, where a cortical arc and a
+        #   BLA blob share one parent and the child must be able to escape to amygdalar). Pinning dr[0] trapped a
+        #   minority region (BLA) inside the majority region (neocortical).
+        #   (Siblings within one region stay findable: CA1 inside CA3, both hippocampal pyramidal.)
         if len(dr)==1 and dr[0] in _lab2tid: return _lab2tid[dr[0]]
         lin=ge.get("lineage")
-        return _lab2tid.get(lin)                                  # 0개 or ≥2개(혼합) → lineage class (cross-lineage만 차단)
+        return _lab2tid.get(lin)
     profiles={}
     for parent,(mask,sub_paths) in parent_prof.items():
         sl=sorted(set(sub_paths.tolist()))
-        p_up={r[0]:r[1] for r in (prior.get(parent,{}).get("up") or [])}   # 부모 up(=뇌 전체 대비 AUC)
+        p_up={r[0]:r[1] for r in (prior.get(parent,{}).get("up") or [])}
         rr=_restrict_for(parent)
         pr=_profile_leaves(X[mask], genes, sub_paths, sl, ogs, prot, octx,
                            vf[mask] if vf is not None else None, low, parent_up_auc=p_up, gmu=gmu, gsd=gsd, restrict_root=rr, dz_terms=dz_terms, st_terms=st_terms, mt_terms=mt_terms, profile_cap=getattr(a,"profile_cap",0), auc_pos=getattr(a,"auc_pos",0.65), absent_rg=absent_rg, adaptive_floor=(bool(st.get("adaptive_floor",False)) or getattr(a,"adaptive_floor",False)), af_F=float(st.get("af_F",getattr(a,"af_F",3.0))), af_Nmin=int(st.get("af_Nmin",getattr(a,"af_Nmin",10))))
         profiles.update(pr)
-    # parent_ctx 주입
     for leaf in list(profiles):
         par=st["parent_of"].get(leaf)
         if par and par in prior:
@@ -2332,8 +2380,9 @@ def _hcmd_subcluster(a):
     _write_overview(a.out, st["round"], profiles)
     print(f"[round {st['round']}] {len(profiles)} new leaves. No h5ad write.", flush=True)
 
-# ===================================================================== validate (보고 전용)
-# 원칙: helper는 결정을 절대 바꾸지 않는다. 위반을 '검출해 보고'만 하고, 재결정은 agent가 한다.
+# ===================================================================== validate (reporting only)
+# Principle: the helper never changes a decision. It only detects and reports violations; re-deciding is
+# the agent's job.
 def _validate(decisions, st, out):
     import glob
     prof={}
@@ -2354,7 +2403,7 @@ def _validate(decisions, st, out):
         return g
     _NONP=('endothel','pericyte','smooth muscle','leptomening','mural','perivascular','fibroblast',
            'macrophage','microg','choroid','ependym','arachnoid','vascular','erythro','neutrophil',
-           'lymphocyte','monocyte','mast','tanycyte')   # non-parenchymal(embedded) 라벨 키워드
+           'lymphocyte','monocyte','mast','tanycyte')
     def _isnonpar(s): return any(k in (s or '').lower() for k in _NONP)
     V=[]
     def add(lf,check,sev,msg,sugg):
@@ -2364,41 +2413,42 @@ def _validate(decisions, st, out):
     for lf in st["leaves"]:
         d=decisions.get(lf); p=prof.get(lf)
         if d is None:
-            add(lf,"MISSING_DECISION","error","이 leaf에 대한 결정이 없음.",
-                "이 클러스터에 4지선다 결정을 작성하세요."); continue
+            add(lf,"MISSING_DECISION","error","No decision was written for this leaf.",
+                "Write one of the four decisions for this cluster."); continue
         dec=d.get("decision")
         if dec=="needs_subclustering":
             add(lf,"NEEDS_SUB_REMAINING","error",
-                "finalize 시점에 needs_subclustering로 남아 있음(더 분할되지 않음).",
-                "Step6 unsplittable 규칙으로 종착 결정으로 바꾸세요: 공통 class 있으면 class-final celltype, 없으면 Unknown. Background로 강등 금지.")
+                "Still marked needs_subclustering at finalize time (it was never split further).",
+                "Turn it into a terminal decision per the Step 6 unsplittable rule: a class-final celltype when a common class exists, otherwise Unknown. Do not downgrade it to Background.")
             continue
         if p is None: continue
         us=upstrong(p)
-        # ★ advisory 2종 (2026-06-28) — 강제 아님: 근거 제시 + agent 재판단 유도(helper는 결정 불변).
+        # ★ Two advisory checks — not enforced: they present evidence and prompt the agent to re-judge (the helper leaves decisions untouched).
         _ge=p.get("graph_evidence") or {}
-        # A) RESCUE_IGNORED: 엔진이 embedded vascular/immune anchor를 rescue했는데 라벨이 parenchymal이면
-        #    절대-우세 glia(KDE smear)에 휩쓸렸을 수 있음 → §4.1b로 재판단.
+        # A) RESCUE_IGNORED: the engine rescued an embedded vascular/immune anchor but the label is parenchymal,
+        #    so the call may have been swept along by absolutely-dominant glia (KDE smear) -> re-judge per §4.1b.
         _resc=[an for an in (_ge.get("anchors") or []) if an.get("rescued")]
         if dec=="celltype" and _resc and not _isnonpar(d.get("label","")):
             _r=_resc[0]
             add(lf,"RESCUE_IGNORED","warn",
-                f"엔진이 embedded vascular/immune anchor '{_r.get('label')}'을 rescue함(특이마커 {_r.get('rescue_markers')} 강하게 enriched) — 그런데 라벨은 parenchymal '{d.get('label')}'. glia/neuron 신호는 KDE smear일 수 있음.",
-                "§4.1b: rescued 특이 vascular/immune 마커가 강하면 절대-우세 glia 대신 그 type으로 재판단(진짜 근거 있으면 유지).")
-        # B) NO_ANCHOR_SPECIFIC: 엔진이 positive anchor 0(class_or_unknown)인데 specific으로 라벨하면
-        #    마커 근거 없는 region/subtype force-fit 가능(allocortex/subiculum 등) → class/Unknown 재고.
+                f"The engine rescued the embedded vascular/immune anchor '{_r.get('label')}' (its specific markers {_r.get('rescue_markers')} are strongly enriched), yet the label is the parenchymal '{d.get('label')}'. The glia/neuron signal may be KDE smear.",
+                "§4.1b: when rescued specific vascular/immune markers are strong, re-judge as that type instead of the absolutely-dominant glia (keep the label if you have real evidence).")
+        # B) NO_ANCHOR_SPECIFIC: the engine found 0 positive anchors (class_or_unknown) yet the label is a
+        #    specific term, which may be a region/subtype force-fit with no marker evidence (allocortex,
+        #    subiculum, ...) -> reconsider class / Unknown.
         if dec=="celltype":
             _verd=_ge.get("verdict"); _linc=str(_ge.get("lineage") or "").strip().lower()
             _ll=str(d.get("label","")).strip().lower()
             _is_proc_term=((idx.get((d.get("term_id") or "").strip(),{}) or {}).get("T") in _PROC_TIERS)
             if (_verd=="class_or_unknown" and _ll and _ll!=_linc and _ll not in ("unknown","background")
-                    and not _is_proc_term):   # scoring-based process 라벨은 force-fit 검사 면제
-                # ★ 라벨 고유 마커(R∪DF)가 클러스터 강한 up에 하나도 없을 때만 flag (astrocyte Aqp4 등 마커 ON이면 정당 → 면제).
+                    and not _is_proc_term):
+                # ★ Flagged only when none of the label's own markers (R u DF) appears in the cluster's strong up (if a marker such as astrocyte Aqp4 is ON the call is legitimate -> exempt).
                 _tid=(d.get("term_id") or "").strip(); _term=idx.get(_tid) or {}
                 _mk={_U(g) for g in ((_term.get("R") or [])+(_term.get("DF") or []))}
-                if _mk and not (_mk & us):   # 고유 마커 전무 = force-fit 의심
+                if _mk and not (_mk & us):
                     add(lf,"NO_ANCHOR_SPECIFIC","warn",
-                        f"엔진 positive anchor 0(class_or_unknown) + specific '{d.get('label')}'의 고유 마커가 클러스터에 하나도 강하게 ON 아님 — region/subtype force-fit 의심.",
-                        f"고유 마커 ON이면 유지; 아니면 lineage class('{_ge.get('lineage')}') 또는 Unknown으로 재판단(§3 positive-evidence).")
+                        f"The engine found 0 positive anchors (class_or_unknown) and none of the own markers of the specific term '{d.get('label')}' is strongly ON in this cluster — a region/subtype force-fit is suspected.",
+                        f"Keep it if its own markers are ON; otherwise re-judge as the lineage class ('{_ge.get('lineage')}') or Unknown (§3 positive evidence).")
         # ambient/neuropil(KDE) bleed makes raw `up` list many lineages → only warn on a REAL co-dominant
         # mixture (identity_scores.mixed = ≥2 codominant lineage-roots). ambient-only bleed is NOT flagged.
         ismixed=bool((p.get("identity_scores") or {}).get("mixed"))
@@ -2409,31 +2459,38 @@ def _validate(decisions, st, out):
         if dec=="celltype":
             tid=(d.get("term_id") or "").strip()
             _lab_l=str(d.get("label","")).strip().lower()
-            # ★ CONTEXT-AXIS enforcement (§4.3, 2026-06-21): 엔진이 context_axis(zonation/layer)를 계산했는데
-            #   bare lineage class로 종결했으면 — pole subtype을 놓친 것. dominant_pole 있으면 그 subtype으로
-            #   relabel, 없고 mixed(≥2 pole)면 subcluster 요구. (helper는 결정 불변 — check로 보고만; suggested_subtype을
-            #   엔진이 이미 계산해줘 agent의 재결정은 기계적.) lineage class 라벨로 종결한 경우만 발동(진짜 subtype 라벨은 면제).
+            # ★ CONTEXT-AXIS enforcement (§4.3): the engine computed a context_axis (zonation/layer) but the leaf was
+            #   terminated at the bare lineage class — a pole subtype was missed. With a dominant_pole, relabel to that
+            #   subtype; without one but mixed (>=2 poles), require a subcluster. (The helper leaves decisions
+            #   untouched — check only reports; because the engine already computed suggested_subtype, the agent's
+            #   re-decision is mechanical.) Fires only when the leaf was terminated at a lineage class label (a real
+            #   subtype label is exempt).
             _cax=p.get("context_axis") or []
             _calin=str((p.get("graph_evidence") or {}).get("lineage") or "").strip().lower()
-            _is_top=("." not in lf)                          # top-level parent (subcluster 안 된 원클러스터)
+            _is_top=("." not in lf)
             _nleaf=int(p.get("n",0) or 0)
             for _ax in _cax:
-                # 1) ★ 큰 top-level 부모에 양극이 *실질* 공존(mixed) → 한 극으로 라벨했든 class로 뒀든, 먼저 분할해
-                #    양 zone을 분리해야(소수 극 매몰 방지). sub-leaf(이미 분할됨)는 면제 — lean-label이 맞다.
+                # 1) ★ Both poles are *substantially* present (mixed) in a large top-level parent -> whether it was
+                #    labelled by one pole or left at the class, split first to separate both zones (so the minority pole
+                #    is not buried). A sub-leaf (already split) is exempt — the lean label is correct there.
                 if _ax.get("mixed") and _is_top and _nleaf>=1500:
                     add(lf,"CONTEXT_AXIS_SPLIT","warn",
-                        f"context axis '{_ax['axis']}' 양극 실질 공존(poles_present={_ax['poles_present']}) + 큰 top-level 클러스터(n={_nleaf})인데 '{d.get('label')}'로 미분할 종결 — 한 극 라벨은 소수 극을 묻는다. §4.3: subcluster해 양 zone 분리.",
-                        "needs_subclustering(reason_code=context_axis)로 분할 → 각 sub-leaf를 dominant_pole subtype으로 라벨(양극 회수).")
-                # 2) bare lineage class로 종결했는데 dominant_pole 있음 → 그 pole subtype으로 relabel
+                        f"Both poles of context axis '{_ax['axis']}' are substantially present (poles_present={_ax['poles_present']}) in a large top-level cluster (n={_nleaf}), yet it was terminated undivided as '{d.get('label')}' — labelling by one pole buries the minority pole. §4.3: subcluster to separate the two zones.",
+                        "Split it (needs_subclustering, reason_code=context_axis) and label each sub-leaf by its dominant_pole subtype, recovering both poles.")
+                # 2) terminated at a bare lineage class while a dominant_pole exists -> relabel to that pole subtype
                 elif _lab_l==_calin and _ax.get("dominant_pole") and _ax.get("suggested_subtype"):
                     add(lf,"CONTEXT_AXIS_SUBTYPE","warn",
-                        f"context axis '{_ax['axis']}'의 dominant_pole={_ax['dominant_pole']}(context 우세)인데 bare class '{d.get('label')}'로 종결 — §4.3: '{_ax['suggested_subtype']}'로 라벨해야.",
-                        f"label을 '{_ax['suggested_subtype']}'로 변경(reason_code=context_axis, confidence={_ax.get('pole_confidence') or 'low'}). 내재 off-panel 마커가 아니라 pole context로 판정.")
-            # ★ over-split 일반 규칙 (2026-06-23): "magnitude-only subtype" = subtype 라벨인데 부모 class를 구별하는
-            #   *고유* 변별마커가 ON이 아님 → 공유마커의 발현 *크기*만으로의 분할 → 부모 class로 collapse. 하드코딩 0
-            #   (KG 계층+데이터로만 분기), 모든 module 적용. 진짜 subtype(L4=Rorb·CA3=Grik4·Opalin+ oligo)은 고유마커 ON이라 유지.
-            #   #1=일반 subtype(term-마커 differential), #2=context-axis pole(cross-leaf 반대극 존재). 둘로 나눈 이유:
-            #   liver zonation pole(ambient context로 분리)은 per-leaf differential로 판정 불가 → 반대극 공존으로만 진짜/noise 구분.
+                        f"Context axis '{_ax['axis']}' has dominant_pole={_ax['dominant_pole']} (context lead), yet the leaf was terminated at the bare class '{d.get('label')}' — §4.3 requires labelling it '{_ax['suggested_subtype']}'.",
+                        f"Change the label to '{_ax['suggested_subtype']}' (reason_code=context_axis, confidence={_ax.get('pole_confidence') or 'low'}). The call comes from the pole context, not from the (off-panel) intrinsic markers.")
+            # ★ General over-split rule: a "magnitude-only subtype" is a subtype label whose *own* markers
+            #   distinguishing it from the parent class are not ON -> the split rests only on the *magnitude* of
+            #   shared markers -> collapse to the parent class. Zero hardcoding (it branches only on the KG hierarchy
+            #   and the data) and applies to every module. Genuine subtypes (L4 = Rorb, CA3 = Grik4, Opalin+ oligo)
+            #   keep their labels because their own markers are ON.
+            #   #1 = ordinary subtypes (term-marker differential); #2 = context-axis poles (the opposite pole exists
+            #   across leaves). They are separated because a liver zonation pole (separated by ambient context) cannot
+            #   be judged by a per-leaf differential — only the coexistence of the opposite pole distinguishes signal
+            #   from noise.
             _ca_pole_subs=set()
             for _ax in (p.get("context_axis") or []):
                 for _po in (_ax.get("poles") or []):
@@ -2445,14 +2502,14 @@ def _validate(decisions, st, out):
                     _Smk={_U(g) for g in (_S.get("R") or [])+(_S.get("S") or [])+(_S.get("DF") or [])}
                     _Pmk=set()
                     for _pp in _Pids: _Pmk|={_U(g) for g in (idx[_pp].get("R") or [])+(idx[_pp].get("S") or [])+(idx[_pp].get("DF") or [])}
-                    _diff=_Smk-_Pmk                                       # 부모와 공유 안 되는 고유 변별마커
+                    _diff=_Smk-_Pmk
                     _ogtv={_U(g):v for g,v in (p.get("ontology_gene_table") or {}).items()}
-                    _diff_op={g for g in _diff if not ((_ogtv.get(g) or {}).get("panel") is False)}  # on-panel만(off-panel은 미지)
-                    if _diff_op and not (_diff_op & us):                 # 고유마커 있는데 enriched(up auc≥0.6)인 게 0
+                    _diff_op={g for g in _diff if not ((_ogtv.get(g) or {}).get("panel") is False)}
+                    if _diff_op and not (_diff_op & us):                 # the term has own markers but 0 of them are enriched (up auc>=0.6)
                         _Cl=idx[_Pids[0]].get("L") or _Pids[0]
                         add(lf,"DIFFERENTIAL_UNSUPPORTED","warn",
-                            f"'{_S.get('L')}'(subtype)의 부모 '{_Cl}' 대비 고유 변별마커 {sorted(_diff_op)} 중 enriched(up)인 게 없음 — 공유마커의 레벨 차이만으로의 분할(magnitude-only subtype, over-split 의심).",
-                            f"부모 class '{_Cl}'로 라벨 변경. 진짜 subtype이면 고유마커가 ON이어야 하며, 같은 정체의 형제는 부모로 병합된다.")
+                            f"None of the discriminative markers {sorted(_diff_op)} that distinguish the subtype '{_S.get('L')}' from its parent '{_Cl}' is enriched (up) — this split rests only on a level difference in shared markers (magnitude-only subtype, over-split suspected).",
+                            f"Change the label to the parent class '{_Cl}'. A real subtype must have its own markers ON, and siblings of the same identity merge into the parent.")
             # ── #2 CONTEXT_AXIS_LONELY_POLE (context-axis pole) ──
             if _lab_l in _ca_pole_subs:
                 _all_lab={str((dd or {}).get("label","")).strip().lower() for dd in decisions.values()}
@@ -2460,36 +2517,39 @@ def _validate(decisions, st, out):
                     _psubs={str(po.get("subtype")).strip().lower() for po in (_ax.get("poles") or []) if po.get("subtype")}
                     if _lab_l not in _psubs: continue
                     _others=_psubs-{_lab_l}
-                    if _others and not (_others & _all_lab):             # 반대 극이 어떤 클러스터에도 없음 → 외톨이 pole
+                    if _others and not (_others & _all_lab):
                         _Pp=idx.get(tid,{}).get("P") or []
                         _Cl=idx.get(_Pp[0],{}).get("L") if _Pp else None
                         add(lf,"CONTEXT_AXIS_LONELY_POLE","warn",
-                            f"context axis '{_ax['axis']}'의 '{d.get('label')}' pole로 라벨됐으나 반대 극({sorted(_others)})이 어떤 클러스터에도 없음 — 축이 실제로 분리 못 한 단일-극 noise lean(진짜 zonation이면 양극이 모두 떠야).",
-                            f"부모 class '{_Cl or 'parent'}'로 라벨 변경(반대 극이 실제로 나타나면 그때 pole 분할). cross-leaf 판정 — liver(양극 공존)는 유지됨.")
-            # ★ PROCESS (tier='process' — neuropil / fiber tract 등)은 celltype이 아니라 scoring-based
-            #   annotation이 다루는 조직 process다. clustering-based 결정 JSON에는 원칙적으로 나오지 않지만,
-            #   혹시 process term_id가 실려 있으면 celltype 검사(REQUIRED_ABSENT_ONPANEL 등)를 건너뛴다(continue).
-            #   process 탐지는 score-profile/apply/finalize로 하라는 안내를 warn으로 남긴다.
+                            f"The leaf was labelled with the '{d.get('label')}' pole of context axis '{_ax['axis']}', but the opposite pole ({sorted(_others)}) appears in no cluster at all — a single-pole noise lean the axis did not actually separate (genuine zonation shows both poles).",
+                            f"Change the label to the parent class '{_Cl or 'parent'}' (split by pole later, once the opposite pole really appears). This is judged across leaves, so liver — where both poles coexist — is unaffected.")
+            # ★ PROCESS (tier='process' — neuropil, fiber tract, ...) is not a celltype but a tissue process.
+            #   It should never appear in a clustering-based decision JSON, but if a process term_id does show up,
+            #   the celltype checks (REQUIRED_ABSENT_ONPANEL etc.) are skipped (continue). Since this release has no
+            #   process-detection path, a warning is emitted telling the agent not to label it.
             _is_proc=((idx.get(tid,{}) or {}).get("T") in _PROC_TIERS)
             if _is_proc:
                 add(lf,"PROCESS_IN_CLUSTERING","warn",
-                    f"'{d.get('label')}'은 tier='process'(조직 process) — clustering-based annotation은 이를 라벨하지 않는다.",
-                    "process(neuropil/fiber tract 등)는 scoring-based annotation(score-profile→score-apply→score-finalize)으로 찾으세요.")
-                continue                                          # process → celltype 검사 skip
+                    f"'{d.get('label')}' is tier='process' (a tissue process) — clustering-based annotation does not label these.",
+                    "Detection of processes (neuropil, fiber tract, ...) is not supported in this version — use a celltype label instead.")
+                continue
             elif not tid or (idx and tid not in idx):
                 add(lf,"BAD_TERM_ID","error",
-                    f"celltype인데 term_id가 비었거나 온톨로지에 없음(term_id='{tid}').",
-                    "유효한 term_id로 고치거나 결정을 바꾸세요. helper가 임의로 Unknown 처리하지 않습니다. (조직 구획이면 label='neuropil' 사용 가능.)")
-            # ★ 고유 필수명찰 검사(REQUIRED_ABSENT_ONPANEL): 이 term의 비-pan required 중 on-panel인 게
-            # 있으면 적어도 하나는 present여야. UBC=Eomes(on-panel)인데 absent면 보조마커(Grm1) 오배정 →
-            # flag. CA1=required 전부 off-panel → 검사 제외(보조명찰 Fibcd1로 식별, §5 panel-blind).
+                    f"The decision is celltype but term_id is empty or absent from the ontology (term_id='{tid}').",
+                    "Fix it to a valid term_id or change the decision. The helper never silently turns this into Unknown. (For a tissue compartment you may use label='neuropil'.)")
+            # ★ Own required-badge check (REQUIRED_ABSENT_ONPANEL): if this term has any non-pan required marker that
+            # is on-panel, at least one must be present. UBC has Eomes (on-panel); when it is absent the call rests on
+            # a misassigned supporting marker (Grm1) -> flag. CA1 has all required markers off-panel -> excluded from
+            # the check (it is identified by the supporting badge Fibcd1, §5 panel-blind).
             if tid in idx:
                 t_=idx[tid]; ogt_l={_U(g):v for g,v in (p.get("ontology_gene_table") or {}).items()}
                 up_l={_U(r[0]):r[1] for r in (p.get("up") or [])}
-                # ★ GLIAL_MISLABEL 백스톱 (2026-06-16): up(vs-rest) top8이 glial 마커 우세(≥3)+뉴런/pan-neuronal 마커 0인데
-                #   뉴런 term으로 라벨 → fiber-tract/혈관/미세아교/뇌막 오염 조각을 부모-제약 때문에 뉴런 subtype으로
-                #   force-fit한 것(~19k cell 버그). 선택 term 자신이 glial이면 면제. up은 vs-rest라 ambient(non-enriched)
-                #   myelin엔 안 걸림(cl9 L6b: up=Cplx3/Nxph3이라 안 뜸). 진짜 뉴런은 up이 정체마커라 glial<3.
+                # ★ GLIAL_MISLABEL backstop: the top 8 of up (vs-rest) is dominated by glial markers (>=3) with 0
+                #   neuronal / pan-neuronal markers, yet the label is a neuronal term -> a fiber-tract / vascular /
+                #   microglial / meningeal contamination fragment was force-fit to a neuronal subtype because of the
+                #   parent constraint (a ~19k-cell bug). Exempt when the chosen term is itself glial. Because up is
+                #   vs-rest it does not trigger on ambient (non-enriched) myelin (cl9 L6b: up = Cplx3/Nxph3, so it does
+                #   not fire). For a real neuron, up consists of identity markers so glial < 3.
                 _GLIA_M={'PLP1','MBP','MOBP','MAG','MOG','CLDN11','SOX10','MAL','CNP','OPALIN','ASPA','ERMN','ENPP6','BCAS1',
                          'AQP4','GFAP','SLC1A2','SLC1A3','GJA1','AGT','MLC1','NTSR2','FGFR3','GJB6',
                          'C1QA','C1QB','C1QC','CSF1R','CX3CR1','P2RY12','HEXB','TMEM119','CTSS','SELPLG','LAPTM5',
@@ -2502,12 +2562,13 @@ def _validate(decisions, st, out):
                 _ut=[_U(r[0]) for r in (p.get('up') or [])[:8]]
                 _ng=[g for g in _ut if g in _GLIA_M]; _nm=[g for g in _ut if g in _NEUR_M]
                 _chosen_glial=len({_U(g) for g in (t_.get('R') or [])+(t_.get('S') or [])} & _GLIA_M)>=2
-                # 면제: 선택 term의 자기 마커가 up에 있으면(진짜 그 뉴런인데 glial bleed) skip.
+                # exempt: skip when the chosen term's own markers appear in up (a real neuron with glial bleed).
                 _own_in_up=len({_U(g) for g in (t_.get('R') or [])+(t_.get('S') or [])+(t_.get('DF') or [])} & set(_ut))>=1
                 if len(_ng)>=3 and len(_nm)==0 and not _own_in_up and not _chosen_glial:
-                    # ★ Fix B (2026-06-23): up의 glial 마커를 sub-family로 분류해 '어떤' glia인지 제안.
-                    #   agent가 vascular/oligo 우세인데 microglia로 과특정하던 문제(microglia 75 = Stab1/Sparc 등
-                    #   vascular-mixed인데 Cx3cr1 near-noise를 보고 microglia 확정) 방지. 순수 메시지(결정 불변).
+                    # ★ Fix B: classify the glial markers in up by sub-family and suggest *which* glia it is. This prevents
+                    #   the agent from over-specifying to microglia when vascular/oligo signal dominates (microglia 75 is
+                    #   vascular-mixed with Stab1/Sparc, yet near-noise Cx3cr1 led to a microglia call). Message only
+                    #   (decisions unchanged).
                     _SUBFAM={
                         "oligodendrocyte":{'PLP1','MBP','MOBP','MAG','MOG','CLDN11','SOX10','MAL','CNP','OPALIN','ASPA','ERMN','ENPP6','BCAS1','OLIG1','OLIG2'},
                         "astrocyte":{'AQP4','GFAP','SLC1A2','SLC1A3','GJA1','AGT','MLC1','NTSR2','FGFR3','GJB6'},
@@ -2519,53 +2580,58 @@ def _validate(decisions, st, out):
                     _fam_sorted=sorted(_fam_hit.items(), key=lambda kv:-len(kv[1]))
                     _dom=_fam_sorted[0][0] if _fam_sorted else "glia"
                     _fam_str="; ".join(f"{k}={v}" for k,v in _fam_sorted)
-                    _hint=(f"up이 가리키는 우세 glial sub-family = **{_dom}** ({_fam_str}). 이 sub-family의 celltype으로 재라벨하세요. "
-                           "다른 sub-family 마커가 near-noise(절대발현 ~0)면 그쪽으로 확정하지 마세요 — 예: vascular/oligo 마커가 up에 우세한데 "
-                           "Cx3cr1/Tmem119만 rank-ON(절대 ~0)이면 microglia로 과특정 금지, 우세 sub-family 또는 그 계통 class로.")
-                    add(lf,"GLIAL_MISLABEL","error",   # error=finalize 차단(robust: glial up은 풍부/뚜렷, own-marker·pan-neuronal 면제로 오발동≈0)
-                        f"up(vs-rest) top8이 glial 마커 우세({_ng}) + 뉴런/pan-neuronal/자기-정체 마커 0인데 '{t_.get('L')}'(뉴런)로 라벨 — fiber-tract/혈관/glia 오염 조각 가능성.",
-                        _hint+" (graph_evidence가 부모-제약으로 뉴런만 보였어도 up이 glial이면 glia. 진짜 뉴런이면 up의 뉴런 정체/transmitter 근거 제시.)")
-                # ★ INTERNEURON_MISLABEL 백스톱 (2026-06-16): up(vs-rest) top6에 GABA transmitter(Gad1/2/Slc32a1)가 ENRICHED
-                #   + interneuron subclass 마커(Pvalb/Sst/Vip/Erbb4/Pthlh…) ≥1인데 라벨 term이 glut(자기 마커에 GABA
-                #   transmitter 없음) → 피질 glut에 박힌 인터뉴런 조각이 ambient Slc17a7로 lineage=glut 오판돼 L2/3 IT 등
-                #   으로 force-fit된 것(B2). 진짜 glut 뉴런은 Gad가 vs-rest enriched될 수 없으므로 오발동≈0. GABAergic
-                #   term(자기 R에 Gad 보유)은 _is_glut_term=False라 면제.
+                    _hint=(f"The dominant glial sub-family indicated by up is **{_dom}** ({_fam_str}). Relabel to a celltype of that sub-family. "
+                           "If another sub-family's markers are near-noise (absolute expression ~0), do not settle on it — e.g. when vascular/oligo markers dominate up but "
+                           "only Cx3cr1/Tmem119 are rank-ON (absolute ~0), do not over-specify to microglia; use the dominant sub-family or its lineage class.")
+                    add(lf,"GLIAL_MISLABEL","error",   # error = blocks finalize (robust: glial up is abundant and unambiguous, and the own-marker / pan-neuronal exemptions make false firing ~0)
+                        f"The top 8 of up (vs-rest) is dominated by glial markers ({_ng}) with zero neuronal / pan-neuronal / own-identity markers, yet the label is '{t_.get('L')}' (a neuron) — this may be a fiber-tract / vascular / glial contamination fragment.",
+                        _hint+" (Even if graph_evidence showed only neurons because of the parent constraint, glial up means glia. If it really is a neuron, give the neuronal identity / transmitter evidence from up.)")
+                # ★ INTERNEURON_MISLABEL backstop: the top 6 of up (vs-rest) has an ENRICHED GABA transmitter
+                #   (Gad1/2/Slc32a1) plus >=1 interneuron subclass marker (Pvalb/Sst/Vip/Erbb4/Pthlh...), yet the labelled
+                #   term is glut (its own markers contain no GABA transmitter) -> an interneuron fragment embedded in
+                #   cortical glut whose lineage was misread as glut from ambient Slc17a7 and force-fit to L2/3 IT or
+                #   similar. A real glut neuron cannot have Gad enriched vs-rest, so false firing is ~0. A GABAergic term
+                #   (carrying Gad in its own R) has _is_glut_term=False and is exempt.
                 _IN_M={'PVALB','SST','VIP','NPY','ERBB4','PTHLH','RELN','CCK','SNCG','CALB2','CXCL14','HTR3A','ADARB2','LHX6','CNR1','KCNC1','KCNC2','KCNC3'}
                 _GABA_TX={'GAD1','GAD2','SLC32A1'}
                 _term_mk={_U(g) for g in (t_.get('R') or [])+(t_.get('S') or [])+(t_.get('DF') or [])}
                 _gaba_up=[g for g in _ut[:6] if g in _GABA_TX]; _in_up=[g for g in _ut[:6] if g in _IN_M]
-                # warn(error 아님): L4/L5는 실제 Pvalb 인터뉴런이 조밀해 ambient로 ≥2 뜰 수 있어 강제 재라벨은 위험 →
-                #   agent가 판단(명확한 Pvalb-FS/CGE 조각만 재라벨). GABA transmitter enriched + 인터뉴런 subclass ≥2.
+                # warn, not error: in L4/L5 real Pvalb interneurons are dense enough that >=2 can appear as ambient, so
+                # forcing a relabel is risky -> the agent decides (relabel only clear Pvalb-FS / CGE fragments). Requires
+                # an enriched GABA transmitter plus >=2 interneuron subclass markers.
                 _is_glut_term=not (_term_mk & (_GABA_TX|{'SLC6A5'}))
                 if _gaba_up and len(_in_up)>=2 and _is_glut_term and not _chosen_glial:
                     add(lf,"INTERNEURON_MISLABEL","warn",
-                        f"up(vs-rest) top6에 GABA transmitter({_gaba_up}) + 인터뉴런 마커({_in_up})가 enriched인데 '{t_.get('L')}'(glut)로 라벨 — ambient Slc17a7로 lineage 오판된 피질 GABA 인터뉴런 조각 가능성.",
-                        "up이 인터뉴런 우세하면 cortical GABAergic interneuron(Pvalb+/Sst+/Vip+ 등)으로 재라벨. L4/L5처럼 glut 정체가 분명하고 Gad가 ambient면 유지(진짜 glut 근거 제시).")
+                        f"The top 6 of up (vs-rest) has an enriched GABA transmitter ({_gaba_up}) plus interneuron markers ({_in_up}), yet the label is '{t_.get('L')}' (glut) — this may be a cortical GABAergic interneuron fragment whose lineage was misread from ambient Slc17a7.",
+                        "If up is interneuron-dominated, relabel as a cortical GABAergic interneuron (Pvalb+/Sst+/Vip+ etc.). Keep the label when the glut identity is clear (as in L4/L5) and Gad is ambient — but state the positive glut evidence.")
                 onp=[]
                 for g in (t_.get("R") or []):
                     gu=_U(g)
-                    if gu in PAN: continue                         # 흔한 pan 필수명찰 무시
+                    if gu in PAN: continue
                     e=ogt_l.get(gu)
-                    if e is None or e.get("panel") is False: continue   # off-panel/미측정 제외
+                    if e is None or e.get("panel") is False: continue
                     onp.append((gu, up_l.get(gu,0)>=0.6 or (e.get("auc") or 0)>=0.55))
                 if onp and not any(pr for _,pr in onp):
                     add(lf,"REQUIRED_ABSENT_ONPANEL","warn",
-                        f"'{t_.get('L')}'의 고유 on-panel 필수명찰 미발현({', '.join(g for g,pr in onp if not pr)}) — 보조마커 오배정 가능.",
-                        "필수명찰이 뜨는 다른 term으로 바꾸거나 상위 class/Unknown으로 내리세요(§5: on-panel required absent=fail).")
-            # ★ DEFINING_ABSENT (DF-absent 가드, 2026-06-15): 선택 term이 graph_evidence에서 df_absent=True면 — 그 term의
-            #   defining 마커(하나면 충분한 최강 명찰)가 측정됐는데 전부 OFF → 보조마커만으로 force-fit(예: cl37 mitral=Cdhr1
-            #   ON·Tbx21 OFF). graph_evidence가 이미 강등했으니, 그래도 골랐다면 강한 경고. 경쟁하는 비-force-fit anchor가
-            #   있으면 그쪽으로(verdict는 그걸 가리킴), 없으면 상위 class/Unknown.
+                        f"The own on-panel required badge of '{t_.get('L')}' is not expressed ({', '.join(g for g,pr in onp if not pr)}) — the call may rest on a misassigned supporting marker.",
+                        "Switch to a term whose required badge does fire, or drop to the parent class / Unknown (§5: an on-panel required marker that is absent = fail).")
+            # ★ DEFINING_ABSENT (the DF-absent guard): when the chosen term has df_absent=True in graph_evidence, its
+            #   defining marker — the strongest badge, where one is sufficient — was measured and is entirely OFF, so
+            #   the call rests on supporting markers alone (e.g. cl37 mitral with Cdhr1 ON and Tbx21 OFF). Since
+            #   graph_evidence already demoted it, choosing it anyway warrants a strong warning. If a competing
+            #   non-force-fit anchor exists, use it (the verdict points at it); otherwise fall back to the parent
+            #   class / Unknown.
             ge_=p.get("graph_evidence") or {}
             _amatch=next((a for a in (ge_.get("anchors") or []) if a.get("term_id")==tid or a.get("label")==t_.get("L")), None) if tid in idx else None
-            #   단, excl_on≥2(required 포함 강한 양성 근거)면 quiet-defining이라도 force-fit 아님(L4=Rorb/Whrn) → 경고 안 함.
+            #   However, excl_on>=2 (strong positive evidence including required markers) is not a force-fit even with a quiet defining marker (L4 = Rorb/Whrn) -> no warning.
             if _amatch and _amatch.get("df_absent") and _amatch.get("excl_on",0)<2:
                 add(lf,"DEFINING_ABSENT","warn",
-                    f"'{t_.get('L')}'의 on-panel defining 마커({', '.join(_amatch.get('df_onpanel') or [])}) OFF이고 exclusive 근거도 약함(excl_on<2) — 보조마커 force-fit 의심.",
-                    "다른 exclusive 마커가 더 강한 term이 있으면 그쪽을, 없으면 verify 후 유지하거나 상위 class로. (excl_on≥2면 이 경고는 안 뜸.)")
-            # ★ OFF_EVIDENCE (2026-06-15): 선택 specific term이 graph_evidence.anchors에 전혀 없는데 엔진이 clear_top(다른
-            #   region의 확신 후보)을 줬다면 — region-coherent 엔진이 배제한 term을 raw 마커로 고른 것(cl49 피질→immature
-            #   granule: 엔진은 L2/3 IT clear_top, immature granule(=DG region)은 anchors에 없음). 같은 region이면 면제.
+                    f"The on-panel defining markers of '{t_.get('L')}' ({', '.join(_amatch.get('df_onpanel') or [])}) are OFF and the exclusive evidence is weak too (excl_on<2) — a force-fit from supporting markers is suspected.",
+                    "If another term has stronger exclusive markers, use it; otherwise verify and keep, or fall back to the parent class. (This warning is not raised when excl_on>=2.)")
+            # ★ OFF_EVIDENCE: the chosen specific term is absent from graph_evidence.anchors while the engine gave a
+            #   clear_top (a confident candidate in a different region) — that means a term the region-coherent engine
+            #   excluded was picked from raw markers (cl49 cortex -> immature granule: the engine's clear_top is
+            #   L2/3 IT and immature granule, a DG-region term, is not in anchors). Exempt when the regions match.
             if tid in idx and _amatch is None and ge_.get("verdict")=="clear_top" and (ge_.get("anchors") or []):
                 def _rg(tt):
                     cur=tt; seen={tt}
@@ -2579,40 +2645,46 @@ def _validate(decisions, st, out):
                 if _dom and _crg not in _dom:
                     _topa=(ge_.get("anchors") or [{}])[0].get("label")
                     add(lf,"OFF_EVIDENCE","warn",
-                        f"'{t_.get('L')}'는 graph_evidence.anchors에 없음(region '{_crg}'). 엔진 clear_top은 '{_topa}'({'/'.join(sorted(_dom))}) — region-coherent 엔진이 배제한 term을 raw 마커로 골랐을 수 있음.",
-                        f"엔진이 surface한 anchor('{_topa}')를 쓰거나, 이 term의 OWN 고유마커가 명확히 우세함을 hp/supporting으로 입증하세요.")
-            # ★ SPEC_UNSUPPORTED(valid-evidence gate): 선택 term이 identity_scores에서 spec_pass==false
-            # (자기 고유 변별마커 share≤3 중 절반 미만만 ON — broad/leaky 마커로 force-fit된 정체성, 예:
-            # 비-해마 leaf를 Wfs1 공유로 CA1, 비-CA3 leaf를 한 마커로 CA3)면 specific celltype 종결 금지.
-            # 타당한 양성 근거 없음 → lineage 분명하면 class-floor, 불분명하면 Unknown.
-            # (spec_pass는 고유마커가 모두 off-panel(spec_n=0)일 땐 True → panel-blind 정상 종결은 통과.)
+                        f"'{t_.get('L')}' is not in graph_evidence.anchors (region '{_crg}'). The engine's clear_top is '{_topa}' ({'/'.join(sorted(_dom))}) — you may have picked a term from raw markers that the region-coherent engine had excluded.",
+                        f"Use the anchor the engine surfaced ('{_topa}'), or demonstrate from hp / supporting that this term's OWN markers clearly dominate.")
+            # ★ SPEC_UNSUPPORTED (the valid-evidence gate): when the chosen term has spec_pass==false in
+            # identity_scores (fewer than half of its own discriminative markers with share<=3 are ON — an identity
+            # force-fit through broad/leaky markers, e.g. calling a non-hippocampal leaf CA1 because Wfs1 is shared,
+            # or calling a non-CA3 leaf CA3 from one marker), terminating at a specific celltype is not allowed.
+            # There is no valid positive evidence -> use a class floor when the lineage is clear, Unknown when it is
+            # not.
+            # (spec_pass is True when a term's own markers are all off-panel (spec_n=0), so a legitimate panel-blind
+            # termination still passes.)
             isc=p.get("identity_scores") or {}
             _spass={}
             for c in ([isc.get("top")]+(isc.get("ranked") or [])):
                 if c and c.get("term_id"): _spass.setdefault(c["term_id"], c.get("spec_pass"))
             if bool(d.get("subclass_resolved",True)) and _spass.get(tid) is False:
                 add(lf,"SPEC_UNSUPPORTED","warn",
-                    f"'{idx.get(tid,{}).get('L',tid)}'의 고유 변별마커(share≤3) 중 절반 미만만 ON(spec_pass=false) — broad/leaky 마커로 force-fit된 정체성(타당한 양성 근거 부족).",
-                    "specific으로 확정하지 마세요 → lineage 분명하면 class-floor(subclass_resolved=false), 불분명하면 Unknown. hp/supporting에서 그 type 마커가 실제 우세하면 그때만 유지(§5 spec_pass).")
-            # ★ SHOULD_SPLIT_DEEPER(모든 tier): celltype으로 종결한 term의 1단계 자식 ≥2개가
-            # 이 클러스터에서 비-pan 마커로 해소 가능하면(=더 쪼개면 분리됨) → 더 split 권고.
-            # (class든 CA1이든 동일 규칙. profile의 candidate_subtypes scorecard를 그대로 사용.)
+                    f"Fewer than half of the discriminative own markers (share<=3) of '{idx.get(tid,{}).get('L',tid)}' are ON (spec_pass=false) — an identity force-fitted through broad/leaky markers (no valid positive evidence).",
+                    "Do not settle on the specific term -> when the lineage is clear, use a class floor (subclass_resolved=false); when it is not, use Unknown. Keep it only if hp/supporting genuinely show that type's markers dominating (§5 spec_pass).")
+            # ★ SHOULD_SPLIT_DEEPER (all tiers): when >=2 one-level children of a term terminated as a celltype are
+            # resolvable in this cluster through non-pan markers (= a further split would separate them), recommend
+            # splitting.
+            # (The same rule applies whether the term is a class or CA1. It uses the profile's candidate_subtypes
+            # scorecard directly.)
             if tid in idx:
                 cs={c["term_id"]:c for c in (p.get("candidate_subtypes") or [])}
                 kids=(cs.get(tid) or {}).get("children_resolvable") or []
                 strong_kids=[k for k in kids if k.get("n_nonpan_present",0)>=1]
                 if len(strong_kids)>=2:
                     add(lf,"SHOULD_SPLIT_DEEPER","warn",
-                        f"'{idx[tid].get('L')}'로 종결했는데 1단계 자식 {len(strong_kids)}개"
-                        f"({', '.join(k['label'] for k in strong_kids[:4])})의 변별 마커가 이 클러스터에 공존함.",
-                        "더 쪼개면 분리됩니다 → needs_subclustering. (자식 마커가 off-panel이거나 split해도 안 나뉘면 그대로 종결.)")
-            # ★ DF_MULTI_SUBTYPE (RC4, 2026-06-14): in-round split 감지가 children_resolvable의 strict-ON
-            # (n_nonpan_present)에 의존하면 2um 같은 희소 데이터에서 quiet 마커가 ON을 못 넘겨 미발화한다.
-            # df_present는 DEFINING 마커의 fold-ON(lf≥1.5 & 검출≥0.25)이라 quiet-but-enriched 마커도 잡는다 —
-            # finalize split-review가 쓰는 바로 그 신호를 round 중에도 노출해 cl11(CA1+CA2+CA3 혼합)을 finalize
-            # 전에 needs_subclustering으로 유도한다. top-level(depth-0)만, celltype 종결만, ≥2 distinct subtype.
-            # ★ CONFUSION_UNRESOLVED (2026-06-14): chosen a specific term whose ConfusionPair PARTNER also anchors
-            # (markers can't separate them — FC vs CA2 share Pcp4/Amigo2/Rgs14). Don't force-fit one → Unknown.
+                        f"The leaf was terminated as '{idx[tid].get('L')}', yet the discriminative markers of {len(strong_kids)} one-level children"
+                        f"({', '.join(k['label'] for k in strong_kids[:4])}) coexist in this cluster.",
+                        "Splitting further would separate them -> needs_subclustering. (If the children's markers are off-panel, or the split does not separate them, terminate as is.)")
+            # ★ DF_MULTI_SUBTYPE: if in-round split detection relied on children_resolvable's strict-ON
+            # (n_nonpan_present), quiet markers on sparse data such as 2 um would never clear ON and it would not
+            # fire. df_present uses fold-ON of DEFINING markers (lf>=1.5 and detection>=0.25) and therefore catches
+            # quiet-but-enriched markers — exposing, during the round, the very signal the finalize split-review
+            # uses, so cl11 (a CA1+CA2+CA3 mixture) is steered to needs_subclustering before finalize. Top-level
+            # (depth-0) only, celltype terminations only, >=2 distinct subtypes.
+            # ★ CONFUSION_UNRESOLVED: chosen a specific term whose ConfusionPair PARTNER also anchors
+            # (markers can't separate them — FC vs CA2 share Pcp4/Amigo2/Rgs14). Don't force-fit one -> Unknown.
             cu=(p.get("graph_evidence") or {}).get("confusion_unresolved")
             if cu and bool(d.get("subclass_resolved",True)):
                 chosen=idx.get(tid,{}).get("L","")
@@ -2620,45 +2692,49 @@ def _validate(decisions, st, out):
                     act=cu.get("action") or "unknown"; pair=cu.get("pair"); partners=', '.join((cu.get("terms") or [])[1:4])
                     if act=="split":
                         add(lf,"CONFUSION_UNRESOLVED","warn",
-                            f"'{chosen}'와 짝({partners})의 *고유* 마커가 BOTH ON(top:{cu.get('top_distinct_on')} / 짝:{cu.get('partner_distinct_on')}) "
-                            f"— 두 type 혼합({pair}).",
-                            "→ needs_subclustering (쪼개세요). 쪼갠 뒤 각 조각을 CA2/FC/Unknown/상위 class로 결정.")
+                            f"The *own* markers of '{chosen}' and of its partner(s) ({partners}) are BOTH ON (top: {cu.get('top_distinct_on')} / partner: {cu.get('partner_distinct_on')}) "
+                            f"— a mixture of the two types ({pair}).",
+                            "-> needs_subclustering (split it). After splitting, decide each fragment as CA2 / FC / Unknown / the parent class.")
                     elif act=="resolve":
                         add(lf,"CONFUSION_UNRESOLVED","warn",
-                            f"confusion-pair({pair})이나 한쪽 고유 마커만 ON → '{cu.get('resolves_to')}'를 지지.",
-                            f"→ '{cu.get('resolves_to')}'로 결정(반대쪽 고유 마커는 OFF). 현재 '{chosen}'가 그쪽이 아니면 교체.")
+                            f"This is a confusion pair ({pair}) but only one side's own markers are ON -> the evidence supports '{cu.get('resolves_to')}'.",
+                            f"-> decide '{cu.get('resolves_to')}' (the other side's own markers are OFF). If the current choice '{chosen}' is not that one, replace it.")
                     else:
-                        _cls=cu.get("resolves_to")   # 공통 조상 class (helper가 계산)
+                        _cls=cu.get("resolves_to")
                         add(lf,"CONFUSION_UNRESOLVED","warn",
-                            f"'{chosen}'와 짝({partners})이 공유 마커로만 anchor, 양쪽 고유 마커 모두 OFF/off-panel — 마커로 분리 불가({pair}).",
-                            (f"→ 둘 중 하나로 단정 말고 공통 상위 class '{_cls}'로 결정하세요(예: FC 변별마커 off-panel → CA2 단정 대신 '{_cls}'). "
-                             f"discriminator(위치 등)가 분명하면 그 type 유지." if _cls else
-                             "→ Unknown으로 결정하세요(둘 중 하나로 단정 금지)."))
+                            f"'{chosen}' and its partner(s) ({partners}) are anchored only by shared markers, and the own markers of both are OFF or off-panel — they cannot be separated by markers ({pair}).",
+                            (f"-> do not commit to either; decide the common parent class '{_cls}' (e.g. when the FC discriminator is off-panel, use '{_cls}' instead of committing to CA2). "
+                             f"If a discriminator (position etc.) is clear, keep that type." if _cls else
+                             "-> decide Unknown (do not commit to either one)."))
             if dec=="celltype" and lf.count(".")==0:
                 dfp=sorted({x for x in (p.get("df_present") or []) if x})
                 if len(dfp)>=2:
                     add(lf,"DF_MULTI_SUBTYPE","warn",
-                        f"이 클러스터에 ≥2개 subtype의 DEFINING 마커가 fold-ON으로 공존함({', '.join(dfp[:4])}) — "
-                        f"단일 celltype('{idx.get(tid,{}).get('L',tid)}')으로 종결했으나 다중 정체성 혼합 가능.",
-                        "→ needs_subclustering (round 중 분할). 희소 데이터라 strict-ON은 약해도 fold 신호는 실재. "
-                        "split해도 안 나뉘거나 한 type이 분명히 우세하면 그대로 종결.")
-            # ★ SHOULD_SPLIT_MIXTURE (2026-06-14): graph_evidence.mixture_subtypes = dominant region의 ≥2 자식
-            # subtype 고유마커가 WEAK 공존(희석된 혼합). df fold-ON(DF_MULTI_SUBTYPE)보다 약한 신호라 2µm 같은
-            # 희소 데이터의 under-clustered 혼합을 잡는다(cl2 Drd1+Drd2 / cl15 Cux2+Rorb / cl7.1 L5+L6). 고유마커
-            # 전무(cl4)는 mixture_subtypes 비어 안 뜸. depth≤1만(과분할·루프 방지; max_split_depth + split_no_gain 보조).
+                        f"The DEFINING markers of >=2 subtypes coexist fold-ON in this cluster ({', '.join(dfp[:4])}) — "
+                        f"it was terminated as the single celltype '{idx.get(tid,{}).get('L',tid)}', but it may be a mixture of identities.",
+                        "-> needs_subclustering (split within the round). On sparse data strict-ON is weak, but the fold signal is real. "
+                        "If a split does not separate them, or one type clearly dominates, terminate as is.")
+            # ★ SHOULD_SPLIT_MIXTURE: graph_evidence.mixture_subtypes = the own markers of >=2 child subtypes of the
+            # dominant region coexisting WEAKLY (a diluted mixture). It is a weaker signal than df fold-ON
+            # (DF_MULTI_SUBTYPE) and therefore catches under-clustered mixtures on sparse data such as 2 um
+            # (cl2 Drd1+Drd2 / cl15 Cux2+Rorb / cl7.1 L5+L6). A leaf with no own markers at all (cl4) has an empty
+            # mixture_subtypes and does not fire. depth<=1 only (prevents over-splitting and loops; complemented by
+            # max_split_depth and split_no_gain).
             if dec=="celltype" and lf.count(".")<=1:
                 ms=(p.get("graph_evidence") or {}).get("mixture_subtypes") or []
                 if len(ms)>=2:
                     labs=", ".join("%s(%s)"%(m.get("label",""), "/".join(m.get("markers_present") or [])) for m in ms[:4])
                     add(lf,"SHOULD_SPLIT_MIXTURE","warn",
-                        f"종결('{idx.get(tid,{}).get('L',tid)}')했으나 같은 region의 ≥2 형제 subtype 고유마커가 (희석돼도) 공존함: {labs}.",
-                        "→ needs_subclustering, 충분히 높은 resolution으로 분할(혼합이라 각 anchor가 약함; over-split해도 같은 라벨끼리 병합됨). "
-                        "split해도 한 type만 나오면 split_no_gain으로 종결.")
-            # ★ SIBLING_RESOLVABLE: 자식뿐 아니라 *형제* subtype도 본다. 고른 term이 subtype_groups의
-            # 한 그룹에서 ≥1개의 다른 normal 형제 subtype과 공존하면(같은 부모의 변별마커 보유) → 이 leaf는
-            # 형제 type(소수 섞인)을 함께 담고 있을 수 있음 → 더 split 권고. CA3로 종결했지만 23% CA1이
-            # 섞여 있던 사례를 agent가 후처리 없이 잡게 하는 신호(절대 identity는 소수 희석으로 못 봄).
-            # depth-0(최상위)만: depth-1+는 이미 분할 산물(Step5 split_no_gain) → 형제 교차상장 노이즈 억제.
+                        f"Terminated as '{idx.get(tid,{}).get('L',tid)}', yet the own markers of >=2 sibling subtypes from the same region coexist (even if diluted): {labs}.",
+                        "-> needs_subclustering; split at a high enough resolution (each anchor is weak because it is a mixture; over-splitting is fine because same-label pieces merge). "
+                        "If the split yields only one type, terminate with split_no_gain.")
+            # ★ SIBLING_RESOLVABLE: looks at *siblings*, not only children. If the chosen term coexists with >=1
+            # other normal sibling subtype within a subtype_groups group (carrying the discriminative markers of the
+            # same parent), this leaf may also contain that sibling type as a minority -> recommend splitting. This
+            # is the signal that lets the agent catch, with no post-processing, a case terminated as CA3 that
+            # actually contained 23% CA1 (absolute identity cannot see a diluted minority).
+            # depth-0 (top level) only: at depth>=1 the leaf is already a split product (handled by Step 5
+            # split_no_gain), so sibling cross-listing there is mostly noise.
             if tid in idx and lf.count(".")==0:
                 sibs=[]
                 for grp in (p.get("subtype_groups") or []):
@@ -2672,9 +2748,9 @@ def _validate(decisions, st, out):
                         sibs.append(lab)
                 if sibs:
                     add(lf,"SIBLING_RESOLVABLE","warn",
-                        f"'{idx[tid].get('L')}'로 종결했는데 같은 부모의 형제 subtype "
-                        f"({', '.join(sibs[:4])})의 변별 마커가 이 클러스터에 공존함.",
-                        "소수 섞인 형제 type일 수 있습니다 → needs_subclustering. (split해도 안 나뉘면 그대로 종결.)")
+                        f"Terminated as '{idx[tid].get('L')}', yet the discriminative markers of sibling subtypes under the same parent "
+                        f"({', '.join(sibs[:4])}) coexist in this cluster.",
+                        "A minority sibling type may be mixed in -> needs_subclustering. (If the split does not separate them, terminate as is.)")
             hit=oh.get(tid)
             if hit and bool(d.get("subclass_resolved",True)):
                 up_auc={_U(r[0]):r[1] for r in (p.get("up") or [])}
@@ -2684,13 +2760,13 @@ def _validate(decisions, st, out):
                 resc=any(g in SPEC and up_auc.get(g,0)>=0.6 for g in set(map(_U,hit.get("R_on",[]))))
                 if len(rson&pl)<2 and not resc:
                     add(lf,"RS_LT2_BUT_RESOLVED","warn",
-                        "subclass_resolved=true인데 on-panel R/S가 2개 미만.",
-                        "class-final(subclass_resolved=false)로 낮추거나 다른 term을 검토하세요.")
-                N_on=set(map(_U,hit.get("N_on",[])))-PAN   # 비변별 pan/class 마커는 leak에서 제외(organ 무관)
+                        "subclass_resolved=true but fewer than 2 on-panel R/S markers.",
+                        "Lower it to class-final (subclass_resolved=false) or consider a different term.")
+                N_on=set(map(_U,hit.get("N_on",[])))-PAN
                 if any(up_auc.get(g,0)>=0.6 or hp_pct.get(g,0)>=0.9 for g in N_on):
                     add(lf,"NEGATIVE_LEAK","warn",
-                        "선택 term의 negative 마커가 강하게 발현(누출).",
-                        "close-sibling 가능 — needs_subclustering 또는 다른 term을 검토하세요.")
+                        "A negative marker of the chosen term is strongly expressed (a leak).",
+                        "A close sibling is possible — use needs_subclustering or consider a different term.")
     return V
 
 def cmd_check(a):
@@ -2703,28 +2779,34 @@ def cmd_check(a):
     print(json.dumps({"clean":len(V)==0,"violations":len(V),"errors":ne,"warnings":nw,"file":vp}, ensure_ascii=False))
 
 def _res_for(k):
-    """expected #type(k)별 Leiden start resolution. heterogeneity로 스케일(0.25/type), 하한 0.1·상한 2.0.
-    낮게 시작해 과분할 노이즈를 피하고, 잔여 혼합(SHOULD_SPLIT_MIXTURE)이면 round loop가 γ×1.5로 올린다.
-    γ↔#클러스터는 데이터 의존이라 *예측*이 아닌 수렴의 시작값. (k=2→0.5, 4→1.0, 6→1.5; 하한 0.1은 over-fragment
-    시 낮추는 하한)."""
+    """Leiden start resolution per expected #types (k). Scaled by heterogeneity (0.25 per type), floored at
+    0.1 and capped at 2.0. Start low to avoid over-split noise; when a residual mixture remains
+    (SHOULD_SPLIT_MIXTURE) the round loop raises it by gamma x1.5. gamma <-> #clusters is data dependent,
+    so this is a starting point for convergence, not a *prediction*. (k=2 -> 0.5, 4 -> 1.0, 6 -> 1.5; the
+    floor of 0.1 is the lower bound used when over-fragmenting.)"""
     return round(min(2.0, max(0.1, 0.25*k)), 2)
 def _finalize_review(decisions, st, out, max_depth=1, large_min_n=1500):
-    """finalize 게이트용: '한 번 더 쪼갤 가치가 있는' 대형 leaf를 정밀하게 추린다. 두 종류:
-    ① bare-class(subclass 미해소): 분할로 분리될 1단계 *자식* ≥2개(children_resolvable, 비-pan 마커).
-    ② resolved subclass: 같은 부모의 *형제* subtype ≥1개가 공존(subtype_groups) → 소수 섞인 형제 type
-       (CA3 안의 23% CA1). 절대 identity는 소수 희석으로 못 보므로 이 게이트가 후처리 없는 backstop.
-    공통 조건: celltype 결정 · 큼(n>=large_min_n) · 고밀도(neuropil 아님; low_frac<0.6)
-    · reason_code != panel_limited(자식/형제 마커 off-panel이면 분할해도 무의미)
-    · 분할 깊이 <= max_depth(이미 여러 번 쪼갠 leaf는 제외 → 무한루프 방지).
-    detection(SHOULD_SPLIT_DEEPER/SIBLING_RESOLVABLE)과 달리, 여기서 잡힌 것은 caller가 user에게 물어볼 '행동 후보'다."""
+    """For the finalize gate: precisely select the large leaves that are 'worth splitting once more'.
+    Two kinds:
+    (1) bare class (subclass unresolved): >=2 one-level *children* that a split would separate
+        (children_resolvable, non-pan markers).
+    (2) resolved subclass: >=1 *sibling* subtype under the same parent coexists (subtype_groups) -> a
+        minority sibling mixed in (23% CA1 inside CA3). Absolute identity cannot see a diluted minority,
+        so this gate is the backstop that needs no post-processing.
+    Common conditions: decision is celltype; large (n >= large_min_n); dense (not neuropil; low_frac<0.6);
+    reason_code != panel_limited (if the child/sibling markers are off-panel, splitting is pointless);
+    split depth <= max_depth (leaves already split several times are excluded -> no infinite loop).
+    Unlike detection (SHOULD_SPLIT_DEEPER / SIBLING_RESOLVABLE), what is caught here is an *action*
+    candidate the caller can put to the user."""
     import glob
     from collections import Counter
     prof={}
     for pf in sorted(glob.glob(os.path.join(out,"cluster_gene_profiles_round*.json"))): prof.update(json.load(open(pf)))
     _full_idx=_load_ontology_index(out) or {}
     idx=_full_idx.get("terms",{})
-    # ★ ContextAxis 탈출구(2026-06-22): 안 갈라지는 mixture가 선언된 공간축(zonation/layer) 연속체면 무한 재분할
-    #   대신 축 pole로 라벨하고 종료. ca축의 pole subtype 라벨 집합을 미리 만든다(소문자).
+    # ★ ContextAxis escape hatch: when a mixture that will not separate is a declared spatial-axis
+    #   (zonation/layer) continuum, label it by the axis pole and stop instead of re-splitting forever. The
+    #   set of pole subtype labels of the ca axis is prepared here (lower-cased).
     _CA=_full_idx.get("ca") or []
     def _axis_pole_labels(ax):
         out_s=set()
@@ -2733,41 +2815,45 @@ def _finalize_review(decisions, st, out, max_depth=1, large_min_n=1500):
                 if v: out_s.add(str(v).strip().lower())
         return out_s
     def _axis_match(lineage, match_labels):
-        """lineage/region/anchor 라벨이 어떤 ca축의 applies_to에 맞으면 그 축 반환(region/anchor-aware, _context_axis_eval과 동일 원리)."""
+        """If the lineage / region / anchor label matches the applies_to of some ca axis, return that axis
+    (region- and anchor-aware, the same principle as _context_axis_eval)."""
         cl={str(lineage).strip().lower()} | {str(x).strip().lower() for x in match_labels if x}
         for ax in _CA:
             if ax.get("lineage") and str(ax["lineage"]).strip().lower()!=str(lineage).strip().lower(): continue
             if any(str(a).strip().lower() in cl for a in (ax.get("applies_to") or [])): return ax
         return None
-    lab2D={}                                                            # label→disease_context(첫 매칭)
+    lab2D={}
     for t in idx.values(): lab2D.setdefault(t.get("L"),t.get("D"))
     ncnt=Counter(st.get("cluster_paths") or [])
     cands=[]; axis_cont=[]; converged=[]
     for lf in st["leaves"]:
         d=decisions.get(lf)
         if not d or d.get("decision")!="celltype": continue
-        if (d.get("reason_code") or "")=="panel_limited": continue      # 자식/형제 마커 off-panel → 분할 무의미
-        if lf.count(".")>max_depth: continue                            # 분할 깊이 상한(무한루프 방지)
+        if (d.get("reason_code") or "")=="panel_limited": continue
+        if lf.count(".")>max_depth: continue                            # split-depth cap (prevents infinite loops)
         n=int(ncnt.get(lf,0))
-        if n<large_min_n: continue                                      # 대형만
+        if n<large_min_n: continue
         p=prof.get(lf) or {}
         dfp=set(p.get("df_present") or [])        # terms whose DEFINING marker is fold-ON in this leaf
         dens=((p.get("identity_evidence") or {}).get("density") or {})
         lfrac=dens.get("low_frac")
-        if lfrac is not None and lfrac>=0.6: continue                   # 저밀도(neuropil) → 분할해도 무의미
+        if lfrac is not None and lfrac>=0.6: continue                   # low density (neuropil) -> splitting is pointless
         tid=(d.get("term_id") or "").strip()
         resolved=bool(d.get("subclass_resolved",True))
         _ge=p.get("graph_evidence") or {}
         _mix=_ge.get("mixture_subtypes") or []
         _cu=_ge.get("confusion_unresolved") or {}
-        # ★ MIXTURE backstop (2026-06-15): df_present(정의마커 fold-ON) ≥2 경로는 DEFINING이 없는 type과의 혼합을
-        #   놓친다(cl64 FC=DF없음, cl66 immature granule=DF없음 → strong<2 탈락). graph_evidence가 직접 잡은
-        #   confusion action=split 또는 mixture_subtypes(dominant region의 ≥2 자식 고유마커 공존)는 agent가 종결했어도
-        #   finalize에서 split 후보로 surface — agent 미결정에 의존하지 않는 백스톱. 단 2중 가드로 오발동 차단:
-        #   (a) lineage 일치 — agent 라벨의 root lineage == graph_evidence.lineage (glia/혈관은 agent가 ambient glut
-        #       graph_evidence를 무시하고 라벨하므로 불일치 → 제외; oligo가 'L5 IT로 split' 같은 거짓 후보 차단)
-        #   (b) mixture subtype이 dominant_region 안 — cross-region ambient bleed(CA1 안의 L2/3) 제외, 같은 region의
-        #       진짜 공동집단(DG 안의 immature granule)만.
+        # ★ MIXTURE backstop: the df_present (defining marker fold-ON) >= 2 path misses a mixture involving a type
+        #   that has no DEFINING marker (cl64 FC has none, cl66 immature granule has none -> strong<2 and they
+        #   drop out). A confusion action=split, or mixture_subtypes (the own markers of >=2 children of the
+        #   dominant region coexisting), detected directly by graph_evidence is surfaced as a split candidate at
+        #   finalize even when the agent terminated the leaf — a backstop that does not depend on the agent's
+        #   decision. Two guards prevent false firing:
+        #   (a) lineage agreement — the root lineage of the agent's label == graph_evidence.lineage (for glia and
+        #       vascular cells the agent labels against the ambient glut graph_evidence, so they disagree and are
+        #       excluded; this blocks bogus candidates such as 'split an oligodendrocyte into L5 IT')
+        #   (b) the mixture subtypes lie inside dominant_region — excludes cross-region ambient bleed (L2/3 inside
+        #       CA1) and keeps only genuine co-populations of the same region (immature granule inside DG).
         def _root_lab(tt):
             x=tt; seen=set()
             while x and x not in seen:
@@ -2786,17 +2872,18 @@ def _finalize_review(decisions, st, out, max_depth=1, large_min_n=1500):
         _lin_ok=bool(_ge.get("lineage") and tid in idx and _root_lab(tid)==_ge.get("lineage"))
         _dom=set(_ge.get("dominant_region") or [])
         _lab2tid={t.get("L"):k for k,t in idx.items()}
-        # mixture subtype별 region-group
         _mix_regs=[(m, idx.get(_reg_of(_lab2tid[m["label"]]),{}).get("L")) for m in _mix if _lab2tid.get(m.get("label"))]
         if _dom:
             _mix_inreg=[m for m,r in _mix_regs if r in _dom]
         else:
-            # ★ dominant_region 비었을 때(2026-06-17): 피질 laminar 혼합 클러스터는 layer가 여러 region-exclusive
-            #   마커를 약하게 공유해 region-scoring이 dominant_region을 못 정하는 경우가 많다(L2/3·L4·L5가 다
-            #   neocortical인데 _dom=[]). 그러면 옛 'mixture가 dominant_region 안' 조건이 전부 탈락 → 피질이 split
-            #   후보로 안 올라와 레이어가 generic으로 붕괴. 대신 mixture subtype들이 **같은 region-group ≥2개**로
-            #   모이면(예: 모두 neocortical) 그 region의 진짜 혼합으로 보고 surface. cross-region ambient(CA1 안의
-            #   L2/3 단발)는 같은 region 2개를 못 채워 제외 → 오발동 가드 유지.
+            # ★ When dominant_region is empty: a laminar cortical mixture often shares several region-exclusive
+            #   markers weakly across layers, so region scoring cannot fix a dominant_region (L2/3, L4 and L5 are all
+            #   neocortical yet _dom=[]). The old condition 'the mixture lies inside dominant_region' then rejected
+            #   everything -> the cortex never became a split candidate and its layers collapsed to the generic node.
+            #   Instead, when the mixture subtypes gather into **the same region-group with >=2 members** (e.g. all
+            #   neocortical), treat it as a genuine mixture of that region and surface it. Cross-region ambient (a
+            #   lone L2/3 inside CA1) cannot reach two members of one region and is still excluded, so the
+            #   false-firing guard is preserved.
             _rc=Counter(r for m,r in _mix_regs if r)
             _common={r for r,c in _rc.items() if c>=2}
             _mix_inreg=[m for m,r in _mix_regs if r in _common]
@@ -2807,15 +2894,14 @@ def _finalize_review(decisions, st, out, max_depth=1, large_min_n=1500):
         _bim=p.get("bimodal_subtypes") or []
         bimodal_trigger=_lin_ok and len(_bim)>=2
         if not resolved:
-            # bare-class(subtype 미해소): 분할로 분리될 1단계 *자식* ≥2개
             cs={c["term_id"]:c for c in (p.get("candidate_subtypes") or [])}
             kids=(cs.get(tid) or {}).get("children_resolvable") or []
             strong=[]
             for k in kids:
                 lab=k.get("label","")
                 if k.get("n_nonpan_present",0)<1 or lab in strong or "DEPRECATED" in lab: continue
-                if (lab2D.get(lab) or "normal")!="normal": continue     # 질병/상태/발생 자식은 subtype 분할로 보지 않음
-                strong.append(lab)                                      # 라벨 dedup + deprecated/비-normal 제외
+                if (lab2D.get(lab) or "normal")!="normal": continue
+                strong.append(lab)
             # ★ REGION-FLOOR descend backstop (2026-07-15): when the leaf is REGION-ESTABLISHED (dominant_region
             #   set), its children_resolvable are that region's OWN subtypes — cross-region ambient false children
             #   are already excluded by region-gating — so a bare-region floor with ≥2 resolvable region-children
@@ -2827,14 +2913,16 @@ def _finalize_review(decisions, st, out, max_depth=1, large_min_n=1500):
             _region_gated=bool(_ge.get("dominant_region"))
             if not (_region_gated and len(strong)>=2):
                 strong=[lab for lab in strong if lab in dfp]            # non-region floor: only DF-CONFIRMED children
-            if len(strong)<2 and not mixture_trigger and not bimodal_trigger: continue   # ≥2 자식(region-floor: 그 region 고유 subtype) OR graph_evidence 혼합 OR per-cell bimodal
+            if len(strong)<2 and not mixture_trigger and not bimodal_trigger: continue   #   >=2 children (region floor: subtypes unique to that region) OR a graph_evidence mixture OR per-cell bimodality
             split_kind="children"
         else:
-            # ★ resolved subclass: 자식이 아니라 *형제*를 본다. 고른 subtype이 subtype_groups에서 ≥1개의
-            # 다른 normal 형제 subtype과 공존하면(같은 부모) → 이 leaf에 형제 type이 소수 섞여 있음
-            # (CA3 안의 CA1). 절대 identity는 소수 희석으로 못 보므로, 이 게이트가 후처리 없는 backstop.
-            # ★ depth-0(최상위)만: 형제 교차상장은 노이즈가 많고, depth-1+는 이미 분할 산물(Step5
-            # split_no_gain이 담당)이라 재분할하면 루프. CA1/CA3 교훈의 본질은 top-level under-clustering.
+            # ★ resolved subclass: looks at *siblings* rather than children. If the chosen subtype coexists with >=1
+            # other normal sibling subtype in subtype_groups (same parent), a sibling type is present in this leaf as
+            # a minority (CA1 inside CA3). Absolute identity cannot see a diluted minority, so this gate is the
+            # backstop that needs no post-processing.
+            # ★ depth-0 (top level) only: sibling cross-listing is noisy, and at depth>=1 the leaf is already a split
+            # product (handled by Step 5 split_no_gain), so re-splitting would loop. The lesson of CA1/CA3 is
+            # fundamentally about top-level under-clustering.
             if lf.count("."): continue
             strong=[]
             for grp in (p.get("subtype_groups") or []):
@@ -2847,35 +2935,37 @@ def _finalize_review(decisions, st, out, max_depth=1, large_min_n=1500):
                     if (lab2D.get(lab) or "normal")!="normal": continue
                     strong.append(lab)
             strong=[lab for lab in strong if lab in dfp]                # ★ only DF-CONFIRMED siblings — kills ambient false siblings (BLA/PAG/thalamic in a cortical leaf)
-            if len(strong)<1 and not mixture_trigger and not bimodal_trigger: continue   # 형제 ≥1개 OR graph_evidence 혼합 OR per-cell bimodal
+            if len(strong)<1 and not mixture_trigger and not bimodal_trigger: continue
             split_kind="siblings"
-        # k = 분리될 distinct type 추정: DF-confirmed 형제(strong) ∪ graph_evidence.mixture_subtypes(희석 공존) ∪ bimodal.
-        if not strong and _mix_inreg: strong=[m.get("label","") for m in _mix_inreg if m.get("label")]  # 혼합 trigger인데 DF-자식 없으면 in-region mixture 라벨
-        if not strong and _bim: strong=[m.get("label","") for m in _bim if m.get("label")]   # bimodal-only trigger → per-cell 분리된 sibling 라벨
-        nexp=max(len(strong), len(_mix), len(_bim), 2)              # split 후보면 최소 2-way
-        depth=lf.count(".")                                          # 분할 깊이 = 이미 시도한 retry 수
+        # k = an estimate of how many distinct types would separate: DF-confirmed siblings (strong) u graph_evidence.mixture_subtypes (diluted coexistence) u bimodal.
+        if not strong and _mix_inreg: strong=[m.get("label","") for m in _mix_inreg if m.get("label")]
+        if not strong and _bim: strong=[m.get("label","") for m in _bim if m.get("label")]
+        nexp=max(len(strong), len(_mix), len(_bim), 2)
+        depth=lf.count(".")
         mix_labs={str(x).strip().lower() for x in strong} | {str((m.get("label") or "")).strip().lower() for m in _mix}
         mix_labs.discard("")
-        # ★① ContextAxis 탈출구: 이미 1번+ 쪼갰는데(depth≥1) 여전히 같은 mixture고, 그게 선언된 공간축의 pole들이면
-        #   = 연속체라 더 쪼개도 안 갈라짐 → 재분할 후보에서 빼고 axis_continuum으로 종료(caller가 context_axis pole로 라벨).
+        # ★ (1) ContextAxis escape hatch: the leaf has already been split at least once (depth>=1) and still shows
+        #   the same mixture, and that mixture consists of the poles of a declared spatial axis = a continuum that
+        #   further splitting will not separate -> drop it from the re-split candidates and terminate as
+        #   axis_continuum (the caller labels it by the context_axis pole).
         _anchor_labs=[a.get("label") for a in (_ge.get("anchors") or []) if a.get("label")]
         _ax=_axis_match(_ge.get("lineage"), list(_dom)+_anchor_labs+[d.get("label","")])
         if depth>=1 and _ax is not None:
             _poles=_axis_pole_labels(_ax)
-            if mix_labs and mix_labs<=_poles:                        # mixture가 전부 그 축의 pole subtype → 연속체
+            if mix_labs and mix_labs<=_poles:                        # the mixture consists entirely of that axis's pole subtypes -> a continuum
                 axis_cont.append({"cluster_path":lf,"n_cells":n,"label":d.get("label",""),
                                   "axis":_ax.get("name"),"poles":sorted(_poles),
                                   "action":"label by context_axis pole (stop re-splitting — spatial continuum won't separate)"})
                 continue
-        # ★② Δ-separation 종료: 이미 쪼갠 leaf(depth≥1)인데 mixture가 부모와 동일(분리 개선 Δ≈0)이면 수렴 → 재분할 무익 → 종료(class_floor).
+        # ★ (2) Delta-separation stop: an already-split leaf (depth>=1) whose mixture is identical to its parent's (separation gain ~ 0) has converged -> re-splitting is futile -> stop (class_floor).
         if depth>=1:
             _par=lf.rsplit(".",1)[0]
             _pmix={str((m.get("label") or "")).strip().lower() for m in ((prof.get(_par,{}).get("graph_evidence") or {}).get("mixture_subtypes") or [])}
             _pmix.discard("")
-            if _pmix and mix_labs and mix_labs==_pmix:               # 부모와 똑같은 혼합 → split이 분리 못 함 → 종료
+            if _pmix and mix_labs and mix_labs==_pmix:               # the same mixture as the parent -> the split cannot separate it -> stop
                 converged.append({"cluster_path":lf,"reason":"mixture unchanged vs parent (Δ separation ≈ 0)"})
                 continue
-        # ★③ γ-escalation: 재시도(depth)마다 Leiden resolution을 ×1.5 상향(상한 2.0) — 첫 시도 낮게, 안 갈라지면 올려 수렴.
+        # ★ (3) gamma escalation: each retry (depth) raises the Leiden resolution by x1.5 (capped at 2.0) — start low, raise when it does not separate, and converge.
         start_res=round(min(2.0, _res_for(nexp) * (1.5 ** depth)), 2)
         cands.append({"cluster_path":lf,"n_cells":n,"label":d.get("label",""),"term_id":tid,
                       "subclass_resolved":resolved,"split_kind":split_kind,
@@ -3038,73 +3128,79 @@ def _finalize_review(decisions, st, out, max_depth=1, large_min_n=1500):
     #   (split_no_gain) ⇒ over-fragmented → already merge by identity, stop. Per-cluster (each cand carries
     #   start_resolution); the global value = max so a single --resolution covers the most heterogeneous path.
     _rec=round(max((c["start_resolution"] for c in cands), default=0.5), 2) if cands else None
-    _resmap={c["cluster_path"]: c["start_resolution"] for c in cands}     # ★ 클러스터별 맞춤 res
+    _resmap={c["cluster_path"]: c["start_resolution"] for c in cands}     # ★ per-cluster resolution
     return {"split_candidates":cands,"paths":[c["cluster_path"] for c in cands],
             "recommended_resolution":_rec,"resolution_map":_resmap,
-            "floored_over_anchor":floored_over,                     # ★ RELABEL(분할 아님): clear_top+excl_on≥2 subtype anchor를 조상으로 floor한 leaf
-            "df_present_subtype":df_present_sub,                    # ★ RELABEL: df_present(특이 defining fold-ON) same-lineage subtype이 ambient에 묻혀 floor된 leaf
-            "must_descend":must_descend,                            # ★ UN-BYPASSABLE: never-descended 대형 class/region floor → descend 강제(--accept-large 무효, --force만)
-            "axis_continuum":axis_cont,                              # ★① 연속체: 재분할 말고 context_axis pole로 라벨·종료
-            "converged_stop":converged,                             # ★② Δ-separation 종료: 부모와 동일 혼합 → 재분할 무익
+            "floored_over_anchor":floored_over,                     # ★ RELABEL (not a split): leaves floored to an ancestor despite a clear_top + excl_on>=2 subtype anchor
+            "df_present_subtype":df_present_sub,                    # ★ RELABEL: leaves floored because a df_present (specific defining fold-ON) same-lineage subtype was buried by ambient signal
+            "must_descend":must_descend,                            # ★ UN-BYPASSABLE: a never-descended large class/region floor -> a descend is mandatory (--accept-large has no effect; only --force)
+            "axis_continuum":axis_cont,                              # ★ (1) continuum: label by the context_axis pole and stop rather than re-splitting
+            "converged_stop":converged,                             # ★ (2) Delta-separation stop: the same mixture as the parent -> re-splitting is futile
             "max_split_depth":max_depth,"large_min_n":large_min_n,
-            "note":"resolution은 *예측*이 아니라 *수렴*이다(γ↔#클러스터는 데이터 의존, 닫힌 공식 없음 — Traag/CPM). "
-                   "start_resolution=expected #type로 스케일(0.25·k, 하한 0.1·상한 2.0; k=2→0.5,4→1.0,6→1.5; 옛 0.12·n·상한0.5 폐기). "
-                   "낮게 시작(과분할 노이즈 회피), 잔여 혼합(SHOULD_SPLIT_MIXTURE/DF_MULTI_SUBTYPE)이면 γ×1.5 재분할로 수렴↑; "
-                   "구별 안 되는 자식(split_no_gain)은 같은 라벨끼리 병합·종결. per-cluster는 cand.start_resolution. "
-                   "★종료/탈출(무한루프 방지): start_resolution은 split_depth로 γ×1.5^depth 자동 상향(재시도=depth, 상한 depth≤max_split_depth + γ≤2.0); "
-                   "depth≥1 leaf가 부모와 동일 혼합이면 converged_stop(분리 Δ≈0→종료); 안 갈라지는 혼합이 선언된 ContextAxis 연속체면 "
-                   "axis_continuum(재분할 대신 §4.3 pole로 라벨·종료). 이 둘은 split_candidates에서 빠져 HOLD 안 일으킴(현 라벨로 확정)."}
+            "note":"Resolution is *converged*, not *predicted* (gamma <-> #clusters is data dependent; there is no closed form — Traag/CPM). "
+                   "start_resolution scales with the expected #types (0.25 x k, floor 0.1, cap 2.0; k=2 -> 0.5, 4 -> 1.0, 6 -> 1.5; the old 0.12 x n with a 0.5 cap is retired). "
+                   "Start low (to avoid over-split noise); when a residual mixture remains (SHOULD_SPLIT_MIXTURE / DF_MULTI_SUBTYPE), re-split at gamma x1.5 to converge further; "
+                   "children that cannot be told apart (split_no_gain) merge by label and terminate. Per cluster this is cand.start_resolution. "
+                   "★ Termination / escape (no infinite loop): start_resolution is raised automatically by split_depth as gamma x 1.5^depth (retries = depth, bounded by depth <= max_split_depth and gamma <= 2.0); "
+                   "a leaf at depth>=1 whose mixture is identical to its parent is converged_stop (separation delta ~ 0 -> stop); a mixture that will not separate but is a declared ContextAxis continuum becomes "
+                   "axis_continuum (label by the §4.3 pole and stop instead of re-splitting). Both are dropped from split_candidates so they raise no HOLD (the current label is final)."}
 
 def cmd_finalize(a):
     import pandas as pd, glob, tarfile
     st=_load_state(a.out); decisions=json.load(open(a.decisions))
-    # 검증: helper는 결정을 바꾸지 않는다. error만 차단(agent에 되돌림)하고, warn은 자문(기록만, 비차단).
+    # Validation: the helper does not change decisions. Only errors block (returning the case to the agent);
+    # warnings are advisory (recorded, non-blocking).
     V=_validate(decisions, st, a.out)
     vp=os.path.join(a.out,"_annotate_violations.json")
     json.dump(V, open(vp,"w"), ensure_ascii=False, indent=1)
     errs=[v for v in V if v["severity"]=="error"]
     if errs and not a.force:
-        print(f"[finalize][ABORT] 검증 error {len(errs)}건. h5ad 미작성. "
-              f"caller는 {vp} 를 agent에게 주어 해당 클러스터만 재결정하게 한 뒤 다시 finalize 하세요. "
-              f"(helper는 결정을 임의로 바꾸지 않습니다. 정말 그대로 쓰려면 --force.)", flush=True)
+        print(f"[finalize][ABORT] {len(errs)} validation error(s). The h5ad was not written. "
+              f"The caller should hand {vp} to the agent, have only those clusters re-decided, and run finalize again. "
+              f"(The helper never changes a decision on its own. Pass --force to write it as is.)", flush=True)
         for v in errs: print(f"  [error] {v['cluster_path']} {v['check']}: {v['suggestion']}", flush=True)
         sys.exit(2)
-    # ★ 대형 bare-class leaf 분할 리뷰(finalize 게이트): 더 쪼개면 subtype이 분리될 대형·고밀도
-    #   leaf가 남아 있으면 바로 쓰지 않고 멈춘다. caller가 user에게 "한 번 더 쪼갤지" 물어,
-    #   YES면 paths를 subcluster→재판정→finalize, NO면 finalize --accept-large로 그대로 기록.
+    # ★ Split review for large bare-class leaves (the finalize gate): if a large, dense leaf remains whose
+    #   subtypes would separate under a further split, stop instead of writing. The caller asks the user
+    #   "split once more?"; on YES the paths go through subcluster -> re-judgment -> finalize, on NO
+    #   finalize --accept-large records them as they are.
     review=_finalize_review(decisions, st, a.out, max_depth=a.max_split_depth, large_min_n=a.large_min_n)
     rp=os.path.join(a.out,"_annotate_finalize_review.json")
     json.dump(review, open(rp,"w"), ensure_ascii=False, indent=1)
     cands=review["split_candidates"]
-    # ★ 무한루프 방지 종료(재분할 안 함, 현 라벨로 확정): ContextAxis 연속체 / Δ-separation 수렴
+    # ★ Loop-safe terminations (no re-split; the current labels are final): a ContextAxis continuum, or Delta-separation convergence
     for c in (review.get("axis_continuum") or []):
-        print(f"[finalize] axis-exit: {c['cluster_path']} '{c['label']}' = '{c['axis']}' 연속체 → 재분할 중단, context_axis pole로 종결.", flush=True)
+        print(f"[finalize] axis-exit: {c['cluster_path']} '{c['label']}' = '{c['axis']}' continuum -> stop re-splitting, terminate at the context_axis pole.", flush=True)
     for c in (review.get("converged_stop") or []):
-        print(f"[finalize] converged: {c['cluster_path']} {c['reason']} → 재분할 중단.", flush=True)
-    # ★ MUST-DESCEND HARD BLOCK (2026-07-15): never-descended 대형 class/region floor는 `--accept-large`로 우회
-    #   못 한다 — descend를 실제로 시도해야만 finalize 가능(정말 안 갈라지면 그때 sub-leaf가 depth≥1이라 이 블록에서
-    #   빠짐). "init→judge→floor→finalize(round 1, descend 0회)" 실패를 원천 차단. 정말 강행하려면 --force + rationale.
+        print(f"[finalize] converged: {c['cluster_path']} {c['reason']} -> stop re-splitting.", flush=True)
+    # ★ MUST-DESCEND HARD BLOCK: a never-descended large class/region floor cannot be bypassed with
+    #   `--accept-large` — finalize is possible only after a descend has actually been attempted (if it
+    #   genuinely does not separate, the resulting sub-leaves are at depth>=1 and fall outside this block).
+    #   This makes the failure mode "init -> judge -> floor -> finalize (round 1, zero descends)" impossible.
+    #   To force it anyway: --force plus a rationale.
     md=review.get("must_descend") or []
     if md and not a.force:
-        print(f"[finalize][BLOCK] descend를 한 번도 안 한 대형 class/region floor {len(md)}개(합 {sum(c['n_cells'] for c in md)} cell). "
-              f"h5ad 미작성 — **--accept-large로 우회 불가**(descend 필수).\n"
-              f"  floor는 'descend해서 안 갈라졌을 때만' 획득합니다(SKILL R8). 이들은 aggregate에서 subtype이 희석돼 안 보일 뿐,\n"
-              f"  descend하면 나옵니다(예: astrocyte→Fibrous는 whole-cluster Gfap auc0.53이나 split 후 0.99).\n"
-              f"   • 각 leaf를 `descend --node '<그 leaf의 class/region 라벨>'` → 재판정 → finalize. 정말 안 갈라지면 그때 자동 floor.\n"
-              f"   • 정당한 이유로 강행: --force (+ rationale에 근거). 상세: {rp}", flush=True)
+        print(f"[finalize][BLOCK] {len(md)} large class/region floor(s) that were never descended ({sum(c['n_cells'] for c in md)} cells in total). "
+              f"The h5ad was not written — **--accept-large cannot bypass this** (a descend is mandatory).\n"
+              f"  A floor is earned only when a descend fails to separate (SKILL R8). These are not featureless; their subtypes are merely diluted in the aggregate,\n"
+              f"  and a descend surfaces them (e.g. astrocyte -> Fibrous: whole-cluster Gfap auc 0.53, but 0.99 after the split).\n"
+              f"   - For each leaf: `descend --node '<that leaf's class/region label>'` -> re-judge -> finalize. If it genuinely does not separate, the floor is then earned automatically.\n"
+              f"   - To proceed with a legitimate reason: --force (and record the reason in rationale). Details: {rp}", flush=True)
         for c in md[:40]:
-            print(f"  [descend!] {c['cluster_path']} n={c['n_cells']} '{c['label']}' — 이 노드의 KG 자식으로 descend 필요", flush=True)
+            print(f"  [descend!] {c['cluster_path']} n={c['n_cells']} '{c['label']}' — must be descended into this node's KG children", flush=True)
         sys.exit(3)
-    # ★ FLOORED-OVER-ANCHOR HOLD (2026-07-15): RELABEL, 분할 아님. 엔진이 clear_top + excl_on≥2(자기 고유
-    #   exclusive 마커 ON, 강한 neg 누출 없음)로 특이 subtype을 지목했는데 agent가 그 조상(class/region-group)으로
-    #   floor한 leaf. 재클러스터링 없이 라벨만 anchor로 바꾸면 되므로 과분할 위험 0. dense Stereo-seq에서 agent가
-    #   descend 과분할을 겁내 L5/L6/subiculum 등을 generic으로 덮는 회귀를 막는다.
+    # ★ FLOORED-OVER-ANCHOR HOLD: a RELABEL, not a split. The engine pointed at a specific subtype with
+    #   clear_top + excl_on>=2 (its own exclusive markers ON, no strong negative leak) and the agent floored
+    #   the leaf to its ancestor (class / region-group). Only the label needs to change to the anchor — no
+    #   re-clustering — so there is zero over-split risk. On dense Stereo-seq this prevents the regression
+    #   where the agent, wary of over-splitting during descend, covers L5 / L6 / subiculum with a generic
+    #   label.
     fova=review.get("floored_over_anchor") or []
     if fova and not a.accept_large and not a.force:
-        print(f"[finalize][HOLD] clear_top+excl_on≥2 특이 anchor를 조상으로 floor한 leaf {len(fova)}개 감지(합 {sum(c['n_cells'] for c in fova)} cell). h5ad 미작성.\n"
-              f"  이건 분할이 아니라 RELABEL 문제입니다 — 엔진이 이미 특이 subtype(자기 고유 exclusive 마커 ≥2 ON)을 clear_top으로 지목했는데 상위 class/region으로 덮였습니다.\n"
-              f"   • 각 leaf의 결정을 anchor subtype으로 교체(label+term_id)하거나, floor할 정당한 이유(negative 누출/confusion 등)를 rationale에 남기고 finalize ... --accept-large.\n"
-              f"  (재클러스터 불필요 — 결정 JSON의 label/term_id만 수정 후 finalize 재실행.) 상세: {rp}", flush=True)
+        print(f"[finalize][HOLD] {len(fova)} leaf/leaves floored to an ancestor despite a clear_top anchor with excl_on>=2 ({sum(c['n_cells'] for c in fova)} cells in total). The h5ad was not written.\n"
+              f"  This is a RELABEL problem, not a split problem — the engine already pointed at a specific subtype (>=2 of its own exclusive markers ON) as clear_top, and it was overwritten by the parent class/region.\n"
+              f"   - Either replace each leaf's decision with the anchor subtype (label + term_id), or record a legitimate reason for flooring (a negative leak, a confusion pair, ...) in rationale and run finalize ... --accept-large.\n"
+              f"  (No re-clustering is needed — edit only label/term_id in the decisions JSON and rerun finalize.) Details: {rp}", flush=True)
         for c in fova[:40]:
             print(f"  [relabel?] {c['cluster_path']} n={c['n_cells']} '{c['floored_label']}' → '{c['anchor_label']}' "
                   f"(excl_on={c['excl_on']}: {', '.join(c['excl_markers'][:4])})", flush=True)
@@ -3113,34 +3209,35 @@ def cmd_finalize(a):
     #   (df_present) but was buried under a cross-lineage ambient anchor → RELABEL, not split.
     dfs=review.get("df_present_subtype") or []
     if dfs and not a.accept_large and not a.force:
-        print(f"[finalize][HOLD] df_present에 특이 defining marker가 fold-ON인 same-lineage subtype이 있는데 상위 class/group으로 floor된 leaf {len(dfs)}개 감지(합 {sum(c['n_cells'] for c in dfs)} cell). h5ad 미작성.\n"
-              f"  RELABEL 문제 — subtype의 고유 정체(특이 defining 마커 ≥3× 발현)는 감지됐으나, tiny 파편서 cross-lineage ambient(혈관/면역)가 top anchor를 가로채 라벨이 안 됐습니다.\n"
-              f"   • 그 subtype으로 라벨 교체하거나(defining 마커 실측 확인 후), 오염이 진짜 지배적이면 rationale에 남기고 finalize ... --accept-large.\n"
-              f"  (재클러스터 불필요 — label/term_id만 수정.) 상세: {rp}", flush=True)
+        print(f"[finalize][HOLD] {len(dfs)} leaf/leaves floored to a parent class/group even though df_present holds a same-lineage subtype whose specific defining marker is fold-ON ({sum(c['n_cells'] for c in dfs)} cells in total). The h5ad was not written.\n"
+              f"  A RELABEL problem — the subtype's own identity was detected (its specific defining marker is >=3x expressed), but in a tiny fragment cross-lineage ambient signal (vascular/immune) hijacked the top anchor and the label was never applied.\n"
+              f"   - Either relabel to that subtype (after checking the defining marker in the data), or, if the contamination really dominates, record it in rationale and run finalize ... --accept-large.\n"
+              f"  (No re-clustering is needed — edit only label/term_id.) Details: {rp}", flush=True)
         for c in dfs[:40]:
             print(f"  [relabel?] {c['cluster_path']} n={c['n_cells']} '{c['floored_label']}' → '{c['subtype_label']}' "
                   f"(specific defining fold-ON: {', '.join(c['specific_df'][:4])})", flush=True)
         sys.exit(3)
     if cands and not a.accept_large and not a.force:
-        print(f"[finalize][HOLD] 더 분할 가능한 대형 bare-class leaf {len(cands)}개 감지. h5ad 미작성.\n"
-              f"  caller는 user에게 '이들을 한 번 더 쪼갤까요?(y/n)'를 물으세요.\n"
-              f"   • YES → subcluster --paths '{json.dumps(review['paths'])}' --resolution '{json.dumps(review.get('resolution_map') or {})}' (클러스터별 맞춤; 단일값도 가능) → 재판정 → finalize\n"
-              f"   • NO  → finalize ... --accept-large (현재 라벨 그대로 확정)\n"
-              f"  상세: {rp}", flush=True)
+        print(f"[finalize][HOLD] {len(cands)} large bare-class leaf/leaves can still be split. The h5ad was not written.\n"
+              f"  The caller should ask the user: 'Shall we split these once more? (y/n)'.\n"
+              f"   - YES -> subcluster --paths '{json.dumps(review['paths'])}' --resolution '{json.dumps(review.get('resolution_map') or {})}' (per cluster; a single value also works) -> re-judge -> finalize\n"
+              f"   - NO  -> finalize ... --accept-large (keep the current labels as final)\n"
+              f"  Details: {rp}", flush=True)
         for c in cands:
             print(f"  [split?] {c['cluster_path']} n={c['n_cells']} '{c['label']}'(density_pct={c['density_pct']}) "
-                  f"→ 자식: {', '.join(c['resolvable_children'][:4])}", flush=True)
+                  f"-> children: {', '.join(c['resolvable_children'][:4])}", flush=True)
         sys.exit(3)
     nw=len(V)-len(errs)
-    if nw: print(f"[finalize] 자문 warn {nw}건은 기록만 하고 진행(차단 아님). 상세: {vp}", flush=True)
-    if cands: print(f"[finalize] 대형 leaf {len(cands)}개를 분할 없이 현재 라벨로 확정(--accept-large/--force).", flush=True)
-    # 통과(또는 --force): agent 결정을 그대로 신뢰해 기록(변경 없음)
-    # ★ 컬럼명(2026-06-25): 표준 annotation = `cellman_annotation`; 사용자 상호작용(post-standard, SKILL §3.5
-    #   interactive phase) 결과 = `cellman_free_annotation` (--column으로 caller가 지정). free finalize는 이미
-    #   쓰인 annotated h5ad를 읽어 표준 컬럼을 보존한 채 free 컬럼만 추가한다.
+    if nw: print(f"[finalize] {nw} advisory warning(s) recorded only; proceeding (not blocking). Details: {vp}", flush=True)
+    if cands: print(f"[finalize] {len(cands)} large leaf/leaves finalized with their current labels, without splitting (--accept-large/--force).", flush=True)
+    # passed (or --force): the agent's decisions are trusted and recorded as they are (no changes)
+    # ★ Column names: standard annotation = `cellman_annotation`; the result of user interaction
+    #   (post-standard, the SKILL §3.5 interactive phase) = `cellman_free_annotation` (chosen by the caller
+    #   via --column). A free finalize reads the already-written annotated h5ad and adds only the free
+    #   column, preserving the standard one.
     col=getattr(a,"column",None) or "cellman_annotation"
     out_h5ad=a.output or st.get("output") or os.path.join(a.out, re.sub(r"\.h5ad$","",os.path.basename(st["h5ad_path"]))+"_annotated.h5ad")
-    src=out_h5ad if os.path.exists(out_h5ad) else st["h5ad_path"]   # 기존 annotated가 있으면 이전 컬럼 보존
+    src=out_h5ad if os.path.exists(out_h5ad) else st["h5ad_path"]
     adata=ad.read_h5ad(src)
     cps=np.array(st["cluster_paths"], dtype=object)
     ann=np.full(adata.n_obs,"",dtype=object)
@@ -3149,7 +3246,7 @@ def cmd_finalize(a):
     #   dec["states"] override if set, else the engine's `state_axis` (ENRICHED program markers) from the
     #   latest profile. Only for `celltype` decisions; states already named in the base label are dropped.
     #   Modules without a state axis (sa empty) get nothing → fully additive.
-    _state_of={}
+    _state_of={}; _state_means={}
     for _r in range(1, int(st.get("round",1))+1):
         _pf=os.path.join(a.out, f"cluster_gene_profiles_round{_r}.json")
         if os.path.exists(_pf):
@@ -3157,6 +3254,8 @@ def cmd_finalize(a):
                 for _p,_e in json.load(open(_pf)).items():
                     _sx=[s.get("name") for s in (_e.get("state_axis") or []) if s.get("name")]
                     if _sx: _state_of[_p]=_sx
+                    _mm=_e.get("state_marker_means")
+                    if _mm: _state_means[_p]=_mm
             except Exception: pass
     # ★ STATE LINEAGE GATE (2026-07-09): a lineage-restricted state (M2=myeloid, EMT/mesenchymal=epithelial,
     #   estrogen-response=luminal — declared via st.applies_to in the slim-index `sa`) is kept ONLY when the
@@ -3182,14 +3281,48 @@ def cmd_finalize(a):
     def _state_ok(state_name, base_lins):
         appl=_sa_appl.get(str(state_name).strip().lower())
         return (not appl) or bool(base_lins & appl)      # empty applies_to = GLOBAL state → always ok
+    # ★ WITHIN-BASE STATE GATE (2026-07-29): a program state is kept only when ≥2 of its markers are enriched vs
+    #   SIBLING leaves of the SAME final base celltype — not merely vs the whole dataset. auc/lf (vs-rest) cannot
+    #   tell a base-lineage-identity gene (macrophage C1q, Apoe) — uniform across the celltype yet high vs the
+    #   dataset — from a genuine program (MKI67, high only in the cycling subset); only within-base variation can.
+    #   So a pan-lineage 'state' (complement on every macrophage, lipid=Apoe) is dropped while proliferating/IFN
+    #   (which vary across siblings) survive. No siblings / no stored means → cannot compare → kept (conservative).
+    _sa_mk={(x.get("name") or "").strip().lower(): [str(g).upper() for g in (x.get("markers") or [])]
+            for x in (_full.get("sa") or [])}
+    _base_of_p={}
+    for _p,_d in decisions.items():
+        if _p not in st["leaves"]: continue
+        _ll=_d.get("label","")
+        _base_of_p[_p]=";".join(map(str,_ll)) if isinstance(_ll,(list,tuple)) else _ll
+    _base_paths={}
+    for _p,_b in _base_of_p.items(): _base_paths.setdefault(_b,[]).append(_p)
+    def _within_base_states(path, states):
+        if not states: return states
+        _b=_base_of_p.get(path); _sibs=[x for x in _base_paths.get(_b,[]) if x!=path and x in _state_means]
+        _me=_state_means.get(path)
+        if not _sibs or not _me: return states            # cannot compare (single leaf of this base / no means) → keep
+        _kept=[]
+        for _s in states:
+            _mk=_sa_mk.get(str(_s).strip().lower()) or []
+            if not _mk: _kept.append(_s); continue        # markers unknown (index missing/name mismatch) → cannot evaluate → keep
+            _nwl=0
+            for _g in _mk:
+                if _g not in _me: continue
+                _sv=[_state_means[x][_g] for x in _sibs if _g in _state_means[x]]
+                if not _sv: continue
+                _ref=float(np.median(_sv))
+                if _me[_g]>0 and _me[_g]>=max(1.5*_ref, _ref+1e-6): _nwl+=1
+            if _nwl>=2: _kept.append(_s)                  # ≥2 markers elevated vs same-base siblings → real program
+        return _kept
     def _synth(path, base, dec):
         base_s=str(base); _bl=base_s.strip().lower()
         _is_proc=((_gterms.get((dec.get("term_id") or "").strip(),{}) or {}).get("T") in _PROC_TIERS)
         if ((dec.get("decision") or "")!="celltype" or base_s in ("","Background","Unknown")
-                or _is_proc):   # scoring-based process 라벨엔 state 미부착
+                or _is_proc):
             return base_s
         states=dec.get("states")
         if states is None: states=_state_of.get(path, [])
+        states=_within_base_states(path, states)          # ★ drop pan-lineage states not enriched vs same-base siblings
         bl=base_s.lower(); blins=_base_lineages(base_s); seen=set(); keep=[]
         for s in (states or []):
             s=str(s).strip()
@@ -3203,10 +3336,9 @@ def cmd_finalize(a):
         lab=dec.get("label","")
         base=";".join(map(str,lab)) if isinstance(lab,(list,tuple)) else lab
         ann[cps==path]=_synth(path, base, dec)
-    adata.obs[col]=ann                            # ★ 핵심 컬럼만 추가(helper 강등/변경 없음)
+    adata.obs[col]=ann                            # ★ only the key column is added (the helper never demotes or alters anything)
     adata.write_h5ad(out_h5ad)
     print(f"[finalize] wrote {out_h5ad} (input copy + obs['{col}'])", flush=True)
-    # 상세 메타는 CSV
     rows=[]
     for path in st["leaves"]:
         dec=decisions[path]
@@ -3216,12 +3348,13 @@ def cmd_finalize(a):
             "reason_code":dec.get("reason_code",""),"key_markers":";".join(dec.get("key_markers",[]) if isinstance(dec.get("key_markers"),list) else [str(dec.get("key_markers",""))]),
             "rationale":dec.get("rationale",""),"alternatives_considered":dec.get("alternatives_considered",""),
             "open_question_flag":bool(dec.get("open_question_flag",False))})
-    sfx="_free" if "free" in col else ""           # free finalize는 표준 산출물을 덮지 않게 별도 이름
+    sfx="_free" if "free" in col else ""
     csv_path=os.path.join(a.out,f"expert_judgment_annotation{sfx}.csv")
     pd.DataFrame(rows).to_csv(csv_path,index=False)
     print(f"[finalize] wrote {csv_path}", flush=True)
-    # ★ annotation_rationale.md (SKILL §3.5) — 클러스터별 '어떻게 결정됐는가' 자연어 서술:
-    #   결정 경로 + 근거(ON 마커·기각 후보) + 뒷받침 PMID(선택 term의 KG grounding=slim `GM`). English.
+    # ★ annotation_rationale.md (SKILL §3.5) — a natural-language account of 'how each cluster was decided':
+    #   the decision path, the evidence (markers ON, rejected candidates) and supporting PMIDs (from the
+    #   chosen term's KG grounding = slim `GM`). English.
     try:
         _idx=json.load(open(os.path.join(a.out,"_ontology_index.json"))).get("terms",{})
     except Exception:
@@ -3249,8 +3382,10 @@ def cmd_finalize(a):
     rat_path=os.path.join(a.out,f"annotation{sfx}_rationale.md")
     open(rat_path,"w").write("\n".join(rl))
     print(f"[finalize] wrote {rat_path} (per-cluster natural-language rationale + PMIDs)", flush=True)
-    # h5ad·최종 CSV 이외의 모든 작업 산출물(state/decisions/ontology/profiles/global stats 등)을 단일 압축으로.
-    # → annotation_out: {input}_annotated.h5ad + expert_judgment_annotation.csv(merge 입력) + annotation_artifacts.tar.gz.
+    # every working artifact other than the h5ad and the final CSV (state, decisions, ontology, profiles,
+    # global stats, ...) goes into a single archive.
+    # -> annotation_out: {input}_annotated.h5ad + expert_judgment_annotation.csv (the merge input) +
+    #    annotation_artifacts.tar.gz.
     pats=["_global_stats.npz","_annotate_state.json","_annotate_decisions.json","_ontology_index.json","ontology_hits.json",
           "_annotate_recommendation.json","_annotate_violations.json","_annotate_finalize_review.json",
           "cluster_gene_profiles_round*.json","cluster_overview_round*.json","expert_judgment_round*.csv"]
@@ -3263,7 +3398,7 @@ def cmd_finalize(a):
         for f in tmp:
             try: os.remove(f)
             except OSError: pass
-        print(f"[finalize] archived {len(tmp)} artifacts → {arc} (annotation_out: h5ad + 압축파일만 남김)", flush=True)
+        print(f"[finalize] archived {len(tmp)} artifacts -> {arc} (annotation_out keeps only the h5ad + the archive)", flush=True)
 
 # ===================================================================== main
 def _helper_cli():
@@ -3271,57 +3406,60 @@ def _helper_cli():
     pi=sp.add_parser("init"); pi.add_argument("--h5ad",required=True); pi.add_argument("--cluster-col",dest="cluster_col",required=True)
     pi.add_argument("--out",required=True)
     pi.add_argument("--species",default=None); pi.add_argument("--organ",default=None)
-    pi.add_argument("--server-url",dest="server_url",default=None)   # 보통 불필요(기본 서버 자동연결)
-    pi.add_argument("--ontology-url",dest="ontology_url",default=None)  # 전체 URL 직접지정(고급)
+    pi.add_argument("--server-url",dest="server_url",default=None)
+    pi.add_argument("--ontology-url",dest="ontology_url",default=None)
     pi.add_argument("--ontology",default=None); pi.add_argument("--output",default=None)
     pi.add_argument("--force",dest="force_input",action="store_true",
-                    help="입력 행렬 검증(X=lognorm / var_names=symbol)을 경고로 낮추고 강행. 비표준 입력임을 인지한 경우만.")
-    pi.add_argument("--disease",default=None,help="입력 데이터의 질병 컨텍스트(예: 'brain cancer'). 그 질병의 state term을 leaf별 disease_candidates로 surface(§7).")
+                    help="Downgrade the input-matrix checks (X=lognorm / var_names=symbol) to warnings and proceed. Use only when you know the input is non-standard.")
+    pi.add_argument("--disease",default=None,help="Disease context of the input data (e.g. 'brain cancer'). State terms for that disease are surfaced per leaf as disease_candidates (§7).")
     pi.add_argument("--use-rep",dest="use_rep",default="auto",
-                    help="subcluster의 neighbors를 계산할 표현공간(obsm key, 예 X_scVI). "
-                         "기본 'auto'=obsm에서 통합 임베딩 자동탐지(X_scVI>scANVI>harmony>pca). "
-                         "'recompute'=normalize_total+log1p+PCA 재계산. 통합 임베딩이 있으면 그걸 쓰는 게 권장(정체성 분할 보존).")
-    # ★ subcluster metric/n_neighbors: 초기 클러스터링(cluster_vectors)과 일관되게 맞추는 입력.
-    #   subcluster recompute는 항상 log-normalize(+PCA).
-    #   use_rep(통합 임베딩)이 잡히면 metric은 무시되고 그 임베딩+euclidean 사용(기존 동작).
+                    help="Representation used to compute neighbors during subcluster (an obsm key, e.g. X_scVI). "
+                         "Default 'auto' = auto-detect an integrated embedding in obsm (X_scVI > scANVI > harmony > pca). "
+                         "'recompute' = redo normalize_total + log1p + PCA. When an integrated embedding exists, using it is recommended (it preserves identity-driven splits).")
+    # ★ subcluster metric / n_neighbors: inputs that keep the subcluster consistent with the initial
+    #   clustering (cluster_vectors).
+    #   A subcluster recompute always log-normalizes (+ PCA).
+    #   When use_rep (an integrated embedding) is found, metric is ignored and that embedding is used with
+    #   euclidean.
     pi.add_argument("--subcluster-metric",dest="sc_metric",default=None,
-                    help="subcluster kNN metric(correlation|euclidean). 미지정시 correlation(log-normalize 기본).")
+                    help="kNN metric for subcluster (correlation|euclidean). Defaults to correlation (assuming log-normalized input).")
     pi.add_argument("--subcluster-n-neighbors",dest="sc_n_neighbors",type=int,default=None,
-                    help="subcluster kNN 이웃 수(n_neighbors). 미지정시 30(기존 기본). 작을수록 미세구조 분할↑, 클수록 그래프 부드러움.")
+                    help="Number of kNN neighbors for subcluster (n_neighbors). Defaults to 30. Smaller values split fine structure more aggressively; larger values smooth the graph.")
     pi.add_argument("--auc-pos",dest="auc_pos",type=float,default=0.65,
-                    help="region-gated 안에서 positive 레이어/subtype 마커 ON 판정 auc bar (0.85=기존 strict, 0.65=quiet 레이어 복원)")
+                    help="AUC bar for calling a positive layer/subtype marker ON inside a region-gated leaf (0.85 = the strict default, 0.65 = recovers quiet layers)")
     pi.add_argument("--profile-cap",dest="profile_cap",type=int,default=150000,
-                    help="AUC/rank 프로파일을 계산할 최대 cell 수(stratified subsample; 0=무제한). 650k 전체 rank는 ~11분이 "
-                         "병목 → 150k cap이면 ~2분(마커는 population 신호라 정확도 보존, 희귀 클러스터는 전량 유지, 전역 "
-                         "gmu/gsd는 full 데이터 그대로). 정확도 최우선이면 0(full).")
+                    help="Maximum number of cells used to compute the AUC/rank profile (stratified subsample; 0 = unlimited). Ranking all 650k cells takes ~11 min and "
+                         "is the bottleneck -> a 150k cap takes ~2 min (accuracy is preserved because markers are a population signal, rare clusters are kept in full, and the global "
+                         "gmu/gsd still come from the full data). Use 0 (full) when accuracy matters most.")
     pi.add_argument("--adaptive-floor",dest="adaptive_floor",action="store_true",
-                    help="(opt-in) sparse 플랫폼용 데이터-유도 검출 floor: region-gated positive anchor에서 fon/pin 문턱을 "
-                         "min(고정, gpin/ghi×F)로 낮춤(reference-free). 0.5µm SSAM의 저카피 defining(Rspo1→L4) 회수용. "
-                         "scRNA/10µm엔 불필요(끄면 기존과 완전 동일). lineage/negative/region-scoring은 불변.")
-    pi.add_argument("--af-F",dest="af_F",type=float,default=3.0,help="adaptive-floor 전역대비 배수 F (기본 3)")
-    pi.add_argument("--af-Nmin",dest="af_Nmin",type=int,default=10,help="adaptive-floor 최소 검출 세포수 가드 (기본 10)")
+                    help="(opt-in) Data-derived detection floor for sparse platforms: lower the fon/pin thresholds of region-gated positive anchors to "
+                         "min(fixed, gpin/ghi x F) (reference-free). Recovers low-copy defining markers on a 0.5 um vector field (Rspo1 -> L4). "
+                         "Not needed for scRNA / 10 um data (leaving it off is exactly the previous behaviour). Lineage, negative and region scoring are unchanged.")
+    pi.add_argument("--af-F",dest="af_F",type=float,default=3.0,help="adaptive-floor multiplier F relative to the global level (default 3)")
+    pi.add_argument("--af-Nmin",dest="af_Nmin",type=int,default=10,help="adaptive-floor guard on the minimum number of detected cells (default 10)")
     pi.set_defaults(f=cmd_init)
     ps=sp.add_parser("subcluster"); ps.add_argument("--out",required=True); ps.add_argument("--paths",default=None)
-    ps.add_argument("--resolution",default="1.0")   # 수동 fallback만(옛 0.2는 under-split). 실제론 finalize start_resolution(_res_for=0.25·k)이 덮어씀
+    ps.add_argument("--resolution",default="1.0")   # manual fallback only (the old 0.2 under-splits). In practice the finalize start_resolution (_res_for = 0.25 x k) overrides it
     ps.add_argument("--gpu",default=None); ps.add_argument("--ontology",default=None)
-    # ★ Unknown carry-forward (2026-06-27): --repool-unknown이면 --paths 대신 현 라운드 Unknown-결정 leaf들의 셀을
-    #   전부 모아(cross-parent) 하나의 풀로 Leiden 재클러스터한다. 흩어진 동일-type Unknown 조각이 다시 뭉쳐 식별됨.
+    # ★ Unknown carry-forward: with --repool-unknown, instead of --paths, the cells of every leaf decided
+    #   Unknown in the current round are gathered across parents into one pool and re-clustered with Leiden.
+    #   Scattered Unknown fragments of the same type re-aggregate and become identifiable.
     ps.add_argument("--repool-unknown",dest="repool_unknown",action="store_true")
-    ps.add_argument("--decisions",default=None,help="--repool-unknown일 때 현 라운드 _annotate_decisions.json (Unknown leaf 식별용)")
-    ps.add_argument("--profile-cap",dest="profile_cap",type=int,default=150000)   # init과 동일(부모<cap이면 무영향)
-    ps.add_argument("--auc-pos",dest="auc_pos",type=float,default=0.65)            # init과 동일
-    ps.add_argument("--adaptive-floor",dest="adaptive_floor",action="store_true")  # init과 동일(라운드마다 명시 필요)
+    ps.add_argument("--decisions",default=None,help="With --repool-unknown, the current round's _annotate_decisions.json (used to identify Unknown leaves)")
+    ps.add_argument("--profile-cap",dest="profile_cap",type=int,default=150000)
+    ps.add_argument("--auc-pos",dest="auc_pos",type=float,default=0.65)
+    ps.add_argument("--adaptive-floor",dest="adaptive_floor",action="store_true")
     ps.add_argument("--af-F",dest="af_F",type=float,default=3.0); ps.add_argument("--af-Nmin",dest="af_Nmin",type=int,default=10)
     ps.set_defaults(f=_hcmd_subcluster)
-    # signal_split 제거(Leiden+absolute paradigm): 강제배정 오염 방지. 분할은 subcluster(Leiden) 전용.
+    # signal_split has been removed (the Leiden + absolute paradigm): it prevents force-assignment contamination. Splitting is done only by subcluster (Leiden).
     pc=sp.add_parser("check"); pc.add_argument("--out",required=True); pc.add_argument("--decisions",required=True); pc.set_defaults(f=cmd_check)
     pf=sp.add_parser("finalize"); pf.add_argument("--out",required=True); pf.add_argument("--decisions",required=True)
     pf.add_argument("--output",default=None); pf.add_argument("--force",action="store_true")
-    pf.add_argument("--accept-large",dest="accept_large",action="store_true")        # 대형 leaf 분할 리뷰 통과(user가 NO)
-    pf.add_argument("--max-split-depth",dest="max_split_depth",type=int,default=1)    # 분할 깊이 상한(무한루프 방지)
-    pf.add_argument("--large-min-n",dest="large_min_n",type=int,default=1500)         # '대형' 기준 셀 수
-    pf.add_argument("--column",default="cellman_annotation",                          # 표준=cellman_annotation
-                    help="obs 컬럼명. 표준 annotation=cellman_annotation(기본); 사용자 상호작용 결과=cellman_free_annotation.")
+    pf.add_argument("--accept-large",dest="accept_large",action="store_true")
+    pf.add_argument("--max-split-depth",dest="max_split_depth",type=int,default=1)    # split-depth cap (prevents infinite loops)
+    pf.add_argument("--large-min-n",dest="large_min_n",type=int,default=1500)
+    pf.add_argument("--column",default="cellman_annotation",
+                    help="obs column name. Standard annotation = cellman_annotation (default); the result of user interaction = cellman_free_annotation.")
     pf.set_defaults(f=cmd_finalize)
     a=p.parse_args(); a.f(a)
 
@@ -3331,8 +3469,10 @@ def _helper_cli():
 # ===================================================================================
 # ---------------------------------------------------------------- candidate marker axis (KG-aware)
 def _term_full_markers(terms, tid):
-    """term tid 의 FULL signature = 자신 ∪ 모든 조상(IS_A P-chain) 의 DF∪R (정규화 delta 복원).
-    supporting/negative 제외(변별축은 정체 마커 DF∪R 로 구성; supporting 은 광역 공발현이라 분리 신호 아님)."""
+    """FULL signature of term tid = its own DF u R plus that of every ancestor (the IS_A P-chain), which
+    reconstructs the normalized delta.
+    supporting/negative are excluded (the discriminating axis is built from the identity markers DF u R;
+    supporting markers are broadly co-expressed and carry no separating signal)."""
     seen = set(); stack = [tid]; genes = set()
     while stack:
         x = stack.pop()
@@ -3344,39 +3484,45 @@ def _term_full_markers(terms, tid):
     return genes
 
 def _children_of(terms, node_label):
-    """slim-index 에서 node_label term 의 **직속 자식** 라벨들(P 에 node 의 tid 가 든 term).
-    class/region-floor 하강(descend)의 후보 = 그 node 의 KG 자식(region 그룹 / subtype)."""
+    """Labels of the **direct children** of the term node_label in the slim-index (terms whose P contains that
+    node's tid).
+    The candidates for descending a class/region floor are exactly that node's KG children (region groups /
+    subtypes)."""
     nl = (node_label or "").strip().lower()
     tid = next((k for k, t in terms.items() if (t.get("L") or "").strip().lower() == nl), None)
     if tid is None: return []
     return sorted({t.get("L") for t in terms.values() if tid in (t.get("P") or []) and t.get("L")})
 
 def _candidate_axis(terms, cand_tids, var_up):
-    """cand 별 FULL 마커(_term_full_markers) → 변별축.
-    제거: (a) 패널 밖, (b) **모든** cand 공유(=공통 게이트, 변별 아님)만. 측정-광역(global_on) 필터도,
-    share 필터도 쓰지 않음 — 정규화·큐레이션된 KG 라 DF∪R 자체가 특이 신호이고, 광역-컷은 국소 변별자까지
-    버릴 수 있어 제거함. 반환 (axis_genes[list], per_cand{tid:set})."""
+    """FULL markers per candidate (_term_full_markers) -> the discriminating axis.
+    Removed: (a) off-panel genes and (b) only those shared by **every** candidate (= a common gate, not a
+    discriminator). Neither a measured-breadth (global_on) filter nor a share filter is applied — the KG is
+    normalized and curated, so DF u R is itself the specific signal, and a breadth cut would also discard
+    local discriminators. Returns (axis_genes[list], per_cand{tid:set})."""
     per = {tid: {g for g in _term_full_markers(terms, tid) if g.upper() in var_up} for tid in cand_tids}
     ncand = len(per)
     from collections import Counter
-    cnt = Counter(g for gs in per.values() for g in gs)              # cand 별 1회씩(교집합 판정용)
-    axis = [g for g, c in cnt.items() if not (ncand >= 2 and c >= ncand)]   # 전 cand 공유(공통 게이트)만 제거
+    cnt = Counter(g for gs in per.values() for g in gs)
+    axis = [g for g, c in cnt.items() if not (ncand >= 2 and c >= ncand)]
     return sorted(axis), per
 
 def _marker_axis_leiden(sub, axis_genes, gUp, resolution, nn, backend, mod):
-    """sub(AnnData) 를 axis_genes 만 subset → centering-free 90pct 스케일(0 보존) → kNN → Leiden.
-    ★ NO-SIGNAL GUARD (2026-07-09): 축 유전자를 하나도 안 켠 세포(all-zero row)는 클러스터에서 제외하고
-    **'u'(unassigned)로 반환** → caller가 parent(bare class)로 floor. 이유: (1) all-zero 세포가 다수면
-    kNN 그래프가 붕괴해 세포당 1클러스터로 degenerate(oligo 26504); (2) region 마커를 하나도 안 켠 세포를
-    노이즈로 어느 region sub-leaf에 강제배정하면 그 region 라벨을 받아 **공간 leak**(thalamic이 피질에 산포)이
-    난다. region 마커를 실제로 켠 세포만 region으로 가르고, 안 켠 세포는 정직하게 bare class로.
-    반환 labels[str]('u'=미배정) (분리 실패/신호부족 시 None)."""
+    """Subset sub (AnnData) to axis_genes only -> centering-free 90th-percentile scaling (0-preserving) ->
+    kNN -> Leiden.
+    ★ NO-SIGNAL GUARD (2026-07-09): cells that switch on none of the axis genes (an all-zero row) are
+    excluded from clustering and returned as **'u' (unassigned)**, so the caller floors them to the parent
+    (bare class). Why: (1) when all-zero cells are numerous the kNN graph collapses and degenerates into one
+    cluster per cell (oligo, 26504); (2) force-assigning a cell that switches on no region marker into some
+    region sub-leaf gives it that region's label and causes a **spatial leak** (thalamic cells scattered
+    through cortex). Only cells that actually switch on a region marker are split by region; the rest go
+    honestly to the bare class.
+    Returns labels[str] ('u' = unassigned), or None when separation fails or there is too little signal."""
     cols = [gUp[g.upper()] for g in axis_genes if g.upper() in gUp]
     if len(cols) < 2 or sub.n_obs < 3: return None
     Xa = np.asarray(sub.X.todense() if hasattr(sub.X, "todense") else sub.X)[:, cols].astype(float)
-    has_sig = (Xa > 0).any(axis=1)                                    # 축 신호가 있는 세포만 클러스터
+    has_sig = (Xa > 0).any(axis=1)
     n_sig = int(has_sig.sum())
-    if n_sig < 3: return None                                         # 축 신호 세포가 너무 적음 → 분리 불가(parent 유지)
+    if n_sig < 3: return None                                         # too few cells carry any axis signal -> cannot separate (keep the parent)
     for j in range(Xa.shape[1]):                                      # centering-free: nonzero 90pct
         nz = Xa[:, j][Xa[:, j] > 0]
         s = np.percentile(nz, 90) if nz.size >= 10 else (nz.max() if nz.size else 1.0)
@@ -3399,7 +3545,7 @@ def _marker_axis_leiden(sub, axis_genes, gUp, resolution, nn, backend, mod):
 def cmd_subcluster(a):
     st = _load_state(a.out)
     paths = json.loads(a.paths)
-    # --candidates: {path:[labels]} (per-path) 또는 [labels](전 path 공통). 없는 path → PCA fallback(annotate-mode 동일).
+    # --candidates: {path:[labels]} (per path) or [labels] (shared by all paths). A path with none -> PCA fallback (same as annotate-mode).
     craw = json.loads(a.candidates) if a.candidates else {}
     cand_of = (lambda p: craw.get(p, [])) if isinstance(craw, dict) else (lambda p: list(craw))
     try: _rj = json.loads(a.resolution)
@@ -3421,12 +3567,12 @@ def cmd_subcluster(a):
         mask = (cps == path); n = int(mask.sum())
         if n < 3:
             st.setdefault("unresolved_paths", []).append(path)
-            print(f"[skip] {path} n={n}<3: 분할 연산 불가.", flush=True); continue
+            print(f"[skip] {path} n={n}<3: too small to split.", flush=True); continue
         sub = adata[mask].copy(); res = res_of(path)
         cands = [c for c in cand_of(path)]
         tids = [lab2tid.get(c.strip().lower()) for c in cands]; tids = [t for t in tids if t]
         lbls = None; mode = "pca"
-        if len(tids) >= 2:                                            # ── MARKER-AXIS split (v2 핵심) ──
+        if len(tids) >= 2:
             axis, per = _candidate_axis(terms, tids, var_up)
             print(f"[{path}] candidates={cands} → axis {len(axis)} genes (ancestor-walked, share-free): {axis[:12]}{'…' if len(axis)>12 else ''}", flush=True)
             nn = max(2, min(int(getattr(a, "sc_n_neighbors", 15) or 15), n - 1))   # marker-axis kNN: default 15, override --subcluster-n-neighbors
@@ -3461,7 +3607,7 @@ def cmd_subcluster(a):
         print(f"[{path}] {mode}: → {len(nh)} sub-leaves", flush=True)
     st["leaves"] = [p for p in st["leaves"] if p not in parent_prof] + new_all
     st["cluster_paths"] = cps.tolist(); st["round"] += 1; _save_state(a.out, st)
-    # ── re-profile: helper.py 재사용(annotate-mode 판정 substrate 그대로) ──
+    # -- re-profile: reuses helper.py (the same substrate the annotate-mode judgment runs on) --
     ogs = _ontology_gene_set(idx); prot = _ontology_protected(idx); octx = _onto_ctx(idx)
     dz_terms = _disease_terms(idx, st.get("disease")); st_terms = _state_terms(idx); mt_terms = _mimicry_terms(idx)
     vf, low = _vf_setup(adata)
@@ -3499,173 +3645,26 @@ def cmd_subcluster(a):
     print(f"[round {st['round']}] {len(profiles)} new leaves. No h5ad write. (init/check/finalize: use helper.py)", flush=True)
 
 def cmd_descend(a):
-    """class/region-floor leaf 를 KG node 의 **직속 자식(region→subtype)으로 무조건** marker-axis 하강.
-    kg-mode 식 계층 하강 + annotate-mode 판정. graph_evidence 의 flat-multiplicity 를 **기다리지 않는다** —
-    region-혼합 floor 에서 region 축으로 먼저 쪼개 sub-leaf 를 region-농축시키면, 재판정이 비로소
-    dominant_region/anchor 를 잡아 region/subtype 을 해상(층 마커가 희석에서 풀림). 자식 후보를 marker
-    axis 로 써서 subcluster 코어에 그대로 위임. 반복(node→children→그 child node→…)은 agent 가 SKILL 대로.
+    """Unconditionally descend a class/region-floor leaf onto the **direct KG children** of a node
+    (region -> subtype) along the marker axis. This is a kg-mode style hierarchical descent judged by
+    annotate-mode. It does **not wait** for flat-multiplicity in graph_evidence — splitting a region-mixed
+    floor along the region axis first concentrates each sub-leaf by region, and only then can re-judgment
+    pick up dominant_region/anchors and resolve region/subtype (layer markers come out of dilution).
+    The child candidates are used as the marker axis and the work is delegated to the subcluster core.
+    Iteration (node -> children -> that child node -> ...) is driven by the agent per the SKILL.
 
-    사용: helper.py descend --out O --paths '["cl3"]' --node "glutamatergic neuron"
-      → node 의 자식(neocortical/thalamic/hippocampal… glut)을 marker-axis 후보로 subcluster.
-    STOP 조건(agent): 하강해도 sub-leaf 가 전부 부모와 같은 class 로 재판정되면 = 진짜 floor → 멈춘다."""
+    Usage: helper.py descend --out O --paths '["cl3"]' --node "glutamatergic neuron"
+      -> subcluster on the marker axis of that node's children (neocortical / thalamic / hippocampal glut ...).
+    STOP condition (agent): if every sub-leaf re-judges to the same class as the parent, that is a genuine
+    floor -> stop."""
     idx = _load_ontology_index(a.out); terms = (idx or {}).get("terms", {})
     kids = _children_of(terms, a.node)
     if len(kids) < 2:
         print(f"[descend] node '{a.node}' has <2 KG children in slim-index — nothing to descend."); return
     paths = json.loads(a.paths)
-    a.candidates = json.dumps({p: kids for p in paths})       # KG 자식 = marker-axis 후보 → subcluster 코어 재사용
+    a.candidates = json.dumps({p: kids for p in paths})
     print(f"[descend] node '{a.node}' → {len(kids)} KG children as marker-axis candidates: {kids[:6]}{'…' if len(kids)>6 else ''}", flush=True)
     cmd_subcluster(a)
-
-# ---------------------------------------------------------------- scoring-based helpers
-def _score_ctx_for(a):
-    """slim-index를 받아 _score_targets_ctx(idx, targets)를 돌린다. --targets(JSON list, 선택)=임의 KG class.
-    반환 (idx, ctx, targets)."""
-    import json
-    url=None if a.ontology else f"{_resolve_server(a.server_url)}/module/{a.species}/{a.organ}/slim-index"
-    idx=_fetch_slim_index(a.out, url, a.ontology)
-    targets=None
-    if getattr(a,"targets",None):
-        targets=json.loads(a.targets) if isinstance(a.targets,str) else a.targets
-    return idx, _score_targets_ctx(idx, targets), targets
-
-
-def _restrict_mask(A, restrict, column):
-    """--restrict: obs[column] 값이 주어진 라벨 집합에 속하는 벡터만 스코어링 대상으로 (예: neuron들 안에서
-    neuropil을 score). None/미지정 = 전 벡터. 반환: 전체길이 bool 마스크(None=전체)."""
-    import numpy as np, json
-    if not restrict: return None
-    want={str(x).strip() for x in (json.loads(restrict) if isinstance(restrict,str) else restrict)}
-    if column not in A.obs:
-        raise SystemExit(f"[score] --restrict 인데 obs['{column}'] 없음. 있는 것: {list(A.obs.columns)}")
-    m=np.isin(A.obs[column].astype(str).to_numpy(), list(want))
-    if not m.any():
-        raise SystemExit(f"[score] --restrict {sorted(want)} 에 해당하는 벡터가 obs['{column}']에 없음.")
-    return m
-
-
-def cmd_score_profile(a):
-    """scoring-based annotation의 **판단 재료**를 산출한다. 라벨을 쓰지 않는다 — REAL 판정은 에이전트가 한다.
-    대상 = --targets(임의 KG class 라벨) 또는 기본 tier='process' class. --restrict로 현 annotation 라벨
-    subset에 한정 스코어링(예: neuron들 안에서 neuropil). 대상이 없으면 applicable=false."""
-    import anndata as ad, json, os
-    _idx, ctx, targets = _score_ctx_for(a)
-    os.makedirs(a.out, exist_ok=True)
-    dst=os.path.join(a.out,"_score_profile.json")
-    if not ctx or not ctx.get("classes"):
-        json.dump({"applicable":False,
-                   "reason":(f"--targets {targets} 가 module {a.species}/{a.organ}의 어떤 term에도 매칭 안 됨"
-                             if targets else f"module {a.species}/{a.organ}에 tier='process' term 없음")},
-                  open(dst,"w"), ensure_ascii=False, indent=1)
-        print(f"[score] 대상 class 없음 → applicable=false. -> {dst}", flush=True); return
-    A=ad.read_h5ad(a.h5ad)
-    rmask=_restrict_mask(A, getattr(a,"restrict",None), a.column)
-    recs=_proc_scores(A, ctx, a.cand_pct, a.neg_pct, restrict=rmask)
-    prof={"applicable":True,"h5ad":a.h5ad,"n_vectors":int(A.n_obs),"module":f"{a.species}_{a.organ}",
-          "targets":(targets or "tier=process (default)"),
-          "restrict":{"column":a.column,
-                      "labels":(json.loads(a.restrict) if getattr(a,"restrict",None) else None),
-                      "n_restricted":(int(rmask.sum()) if rmask is not None else int(A.n_obs))},
-          "params":{"cand_pct":a.cand_pct,"neg_pct":a.neg_pct,
-                    "rule":"후보=pos_score 상위 cand_pct%; 제거=neg_score 상위 neg_pct%. "
-                           "score=표준화 composite(유전자별 z→평균→재표준화). "
-                           "AND/OR(k-of-n) 금지: 수율이 유전자 개수에 지수적으로 끌려감. "
-                           "검출(>0) 금지: blur 때문에 모든 마커가 ~100% '발현'됨."},
-          "classes":[{k:v for k,v in r.items() if not k.startswith("_")} for r in recs]}
-    json.dump(prof, open(dst,"w"), ensure_ascii=False, indent=1)
-    print(f"[score] module={prof['module']} n={A.n_obs} targets={prof['targets']} "
-          f"restrict={prof['restrict']['n_restricted']} classes={[r['label'] for r in recs]}", flush=True)
-    for r in recs:
-        if not r.get("usable"): print(f"  {r['label']:16s} 사용불가: {r['reason']}", flush=True); continue
-        rm=r.get("removal")
-        print(f"  {r['label']:16s} 후보 {r['pct_candidate']:5.2f}%  "
-              + (f"제거 {rm['observed_pct']:5.2f}% (우연 {rm['chance_pct']:.0f}%, 배수 {rm['ratio']:.2f})  "
-                 if rm else "제거축 없음  ")
-              + f"-> {r['pct_final']:5.2f}%", flush=True)
-        if r["pos_missing"] or r["neg_missing"]:
-            print(f"     ! 패널 누락  pos={r['pos_missing']} neg={r['neg_missing']}", flush=True)
-    print(f"-> {dst}", flush=True)
-
-
-def cmd_score_apply(a):
-    """에이전트의 REAL 판정을 obs['cellman_process']에 기록한다(어떤 대상 class인지; keep 벡터만, 나머지 '').
-    --decisions {"<class label>": true|false}  true = 그 class를 REAL로 인정. score-finalize가 이를 KG typed
-    subtype으로 세분화해 최종 라벨을 --column에 쓴다. (background/cellman_class 파티션 없음 — 2026-07-21.)"""
-    import anndata as ad, numpy as np, json, os, pandas as pd, collections
-    _idx, ctx, targets = _score_ctx_for(a)
-    if not ctx or not ctx.get("classes"):
-        raise SystemExit("[score-apply] 대상 class 없음 — score-profile을 먼저 확인하세요.")
-    A=ad.read_h5ad(a.h5ad)
-    dec=json.loads(open(a.decisions).read()) if os.path.exists(a.decisions) else json.loads(a.decisions)
-    rmask=_restrict_mask(A, getattr(a,"restrict",None), a.column)
-    recs=_proc_scores(A, ctx, a.cand_pct, a.neg_pct, restrict=rmask)
-    if "cellman_class" in A.obs: del A.obs["cellman_class"]      # 옛 파티션 컬럼 정리
-    lab=np.array([""]*A.n_obs, dtype=object)
-    for r in recs:
-        if not r.get("usable"): continue
-        if not dec.get(r["label"]):
-            print(f"  [skip] {r['label']}: 에이전트가 REAL로 인정 안 함", flush=True); continue
-        m=r["_mask"] & (lab=="")          # 먼저 인정된 class 보호(겹치면 첫 class 우선)
-        lab[m]=r["label"]
-    A.obs["cellman_process"]=pd.Categorical(lab)       # 어떤 대상 class인지 (neuropil / fiber tract / …; '' 아님)
-    A.uns["cellman_score"]=json.dumps(
-        {"params":{"cand_pct":a.cand_pct,"neg_pct":a.neg_pct},
-         "targets":(targets or "tier=process (default)"),
-         "restrict":{"column":a.column,
-                     "n_restricted":(int(rmask.sum()) if rmask is not None else int(A.n_obs))},
-         "decisions":dec,
-         "classes":[{k:v for k,v in r.items() if not k.startswith("_")} for r in recs]},
-        ensure_ascii=False)
-    A.write_h5ad(a.h5ad)
-    print("[score-apply] obs['cellman_process'] =", dict(collections.Counter(lab)), flush=True)
-    print(f"  -> {a.h5ad}", flush=True)
-
-
-def cmd_score_finalize(a):
-    """score-apply가 쓴 obs['cellman_process'](어떤 대상 class)를 KG typed subtype으로 세분화해 최종 라벨을
-    obs[--column](기본 cellman_annotation)에 쓴다 — process 벡터만 채우고 나머지 값은 그대로 둔다.
-    세분화 = subtype 델타 composite(표준화)의 per-vector argmax가 ENRICHED(>0)면 그 typed subtype, 아니면
-    bare class. (background 병합 없음 — 2026-07-21.)"""
-    import anndata as ad, numpy as np, pandas as pd, json, os, collections
-    _idx, ctx, targets = _score_ctx_for(a)
-    A=ad.read_h5ad(a.h5ad)
-    if "cellman_process" not in A.obs:
-        raise SystemExit("[score-finalize] obs['cellman_process'] 없음 — score-apply를 먼저 돌리세요.")
-    plab=A.obs["cellman_process"].astype(str).to_numpy()
-    col=a.column
-    if col in A.obs:
-        ann=A.obs[col].astype(object).to_numpy()
-    else:
-        ann=np.array([""]*A.n_obs, dtype=object)
-        print(f"[score-finalize] obs['{col}'] 없음 → 새로 만들고 process 벡터만 채움(나머지 '').", flush=True)
-    X=A.X; X=np.asarray(X.todense()) if hasattr(X,"todense") else np.asarray(X)
-    um={str(g).upper():i for i,g in enumerate(A.var_names)}
-    def zc(genes):
-        gi=[um[g] for g in genes if g in um]
-        if not gi: return None
-        return np.column_stack([(X[:,i]-X[:,i].mean())/(X[:,i].std()+1e-9) for i in gi]).mean(1)
-    subtype=np.array([""]*A.n_obs, dtype=object)
-    cls_children={c["label"]:c.get("children",[]) for c in (ctx.get("classes") or [])}
-    for cl_label in set(plab):
-        if not cl_label: continue
-        mask=(plab==cl_label)
-        cand=[]
-        for k in cls_children.get(cl_label,[]):
-            z=zc([g.upper() for g in k.get("delta",[])])
-            if z is not None: cand.append((k["label"],z))
-        if cand:
-            M=np.column_stack([z for _,z in cand]); names=[n for n,_ in cand]
-            best=M.argmax(1); bestval=M.max(1)
-            for i in np.where(mask)[0]:
-                subtype[i]= names[best[i]] if bestval[i]>0 else cl_label   # ENRICHED면 typed, 아니면 bare
-        else:
-            subtype[mask]=cl_label
-        ann[mask]=subtype[mask]
-    A.obs[col]=pd.Categorical([str(x) for x in ann])
-    A.write_h5ad(a.h5ad)
-    pcount={k:v for k,v in collections.Counter(subtype[plab!=""]).items()}
-    print(f"[score-finalize] obs['{col}']에 process 세분화 기록: {pcount}", flush=True)
-    print(f"  -> {a.h5ad}", flush=True)
 
 
 # ================================================================ annotate-mode CLI (single entry)
@@ -3674,43 +3673,21 @@ def main():
     init/check/finalize = the inlined helper engine (_helper_cli), run IN-PROCESS (no subprocess)."""
     argv = sys.argv[1:]
     if not argv or argv[0] in ("-h", "--help"):
-        print("usage: helper.py {init|descend|subcluster|check|finalize|score-profile|score-apply|score-finalize} ...\n"
-              "  [clustering-based annotation — 기본]\n"
-              "  init | check | finalize = the inlined annotate engine (사용자 지정 cluster 컬럼을 입력받음)\n"
-              "  descend    = v2 marker-axis descent into a KG node's children (region->subtype, unconditional)\n"
-              "  subcluster = v2 marker-axis split by EXPLICIT named candidates (PCA fallback when 0/1 candidate)\n"
-              "  [scoring-based annotation — 'score 기반으로 찾아' / process(neuropil·fiber tract) 탐지 전용]\n"
-              "  score-profile  = positive-후보/negative-배제 판단재료 (라벨 안 씀; --targets 임의 KG class)\n"
-              "  score-apply    = 에이전트 REAL 판정을 obs['cellman_process']에 기록\n"
-              "  score-finalize = process를 KG typed subtype으로 세분화해 obs[--column]에 기록")
+        print("usage: helper.py {init|descend|subcluster|check|finalize} ...\n"
+              "  init | check | finalize = the inlined annotate engine (reads the user-specified cluster column)\n"
+              "  descend    = marker-axis descent into a KG node's children (region->subtype, unconditional)\n"
+              "  subcluster = marker-axis split by EXPLICIT named candidates (PCA fallback when 0/1 candidate)")
         return
     cmd, rest = argv[0], argv[1:]
+    # ★ scoring-based annotation (score-profile/apply/finalize) is not in this release — its fixed-quota
+    #   candidates, absence of agent-judgeable material and unjudged auto-subtyping are unresolved, so
+    #   annotate-mode provides clustering-based annotation only (development continues out of tree).
     if cmd in ("score-profile", "score-apply", "score-finalize"):
-        ap = argparse.ArgumentParser(prog=f"helper.py {cmd}")
-        ap.add_argument("--h5ad", required=True)
-        ap.add_argument("--out", required=True)
-        ap.add_argument("--species", required=True)
-        ap.add_argument("--organ", required=True)
-        ap.add_argument("--server-url", dest="server_url", default=None)
-        ap.add_argument("--ontology", default=None)
-        # --targets: 스코어링할 KG class 라벨 JSON list(선택). 미지정 시 module의 tier='process' class가 기본 대상.
-        ap.add_argument("--targets", default=None,
-                        help='스코어링 대상 KG class 라벨 JSON list(예: \'["neuropil","fiber tract"]\'). '
-                             "미지정=tier='process' class 기본.")
-        # --column: (profile/apply) --restrict 기준 컬럼 · (finalize) 최종 라벨을 쓸 컬럼(기본 cellman_annotation).
-        ap.add_argument("--column", default="cellman_annotation")
-        if cmd in ("score-profile", "score-apply"):
-            ap.add_argument("--cand-pct", dest="cand_pct", type=float, default=_PROC_CAND_PCT)
-            ap.add_argument("--neg-pct", dest="neg_pct", type=float, default=_PROC_NEG_PCT)
-            # --restrict: obs[--column] 값이 이 라벨들에 속하는 벡터만 스코어링(예: neuron들 안에서 neuropil).
-            ap.add_argument("--restrict", default=None,
-                            help='스코어링을 한정할 현 annotation 라벨 JSON list(예: \'["glutamatergic neuron","GABAergic neuron"]\').')
-        if cmd == "score-apply":
-            ap.add_argument("--decisions", required=True)   # {"<class label>": true|false}
-        a = ap.parse_args(rest)
-        {"score-profile":cmd_score_profile,"score-apply":cmd_score_apply,
-         "score-finalize":cmd_score_finalize}[cmd](a)
-    elif cmd in ("subcluster", "descend"):
+        print(f"[helper] '{cmd}' is not supported in this version — annotate-mode provides clustering-based annotation "
+              "only (init/descend/subcluster/check/finalize).\n"
+              "         Detection of processes (neuropil, fiber tract, ...) is not supported yet.")
+        raise SystemExit(2)
+    if cmd in ("subcluster", "descend"):
         ap = argparse.ArgumentParser(prog=f"helper.py {cmd}")
         ap.add_argument("--out", required=True)
         ap.add_argument("--paths", required=True)
@@ -3728,7 +3705,7 @@ def main():
     elif cmd in ("init", "check", "finalize"):
         _helper_cli()   # inlined helper engine's argparse dispatch, in-process (reads sys.argv)
     else:
-        print(f"[helper] unknown command '{cmd}' — use init|subcluster|descend|check|finalize|score-profile|score-apply|score-finalize")
+        print(f"[helper] unknown command '{cmd}' — use init|subcluster|descend|check|finalize")
         raise SystemExit(2)
 
 

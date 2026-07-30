@@ -2,8 +2,8 @@
 
 Loaders return a :class:`spatialdata.SpatialData` with ``tables['table']`` (the
 count matrix, region-less, + ``uns['cellman']`` metadata) and ``images['staining']``
-(the morphology image with an ``px → µm`` Affine transform). The SSAM count backend
-(:meth:`SSAMAnalysis.compute_vf` etc.) adapts it via
+(the morphology image with an ``px → µm`` Affine transform). The count backend
+(:meth:`Analysis.compute_vf` etc.) adapts it via
 :meth:`cellman.spatial.GridDataset.from_sdata`. Transcript platforms
 (Xenium/MERSCOPE/CosMx) flow through their own SpatialData (points + images); the
 final cell-type map is written back into either as ``labels['cellman_celltype_map']``

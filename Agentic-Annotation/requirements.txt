@@ -1,4 +1,4 @@
-# 사용자 가상환경에 설치. annotate helper 실행용.
+# Install into the user's virtual environment. Required to run the annotate helper.
 anndata>=0.10
 scanpy>=1.10
 igraph>=0.11
@@ -6,5 +6,5 @@ leidenalg>=0.10
 numpy
 scipy
 pandas
-# GPU 가속(선택): rapids-singlecell + cupy (없으면 scanpy CPU 자동 사용)
+# Optional GPU acceleration: rapids-singlecell + cupy (falls back to scanpy CPU when absent)
 # rapids-singlecell

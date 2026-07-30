@@ -1,5 +1,5 @@
-# Runtime dependencies for the `unnamed` spatial cell-type mapping package.
-# (Trimmed from the SSAM dependency set to only what the kept code imports.)
+# Runtime dependencies for the `cellman.spatial` cell-type mapping package.
+# (Only what the package actually imports.)
 
 # Core scientific computing
 numpy>=1.26.4,<=2.0.2

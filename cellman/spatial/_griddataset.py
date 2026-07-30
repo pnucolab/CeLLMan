@@ -6,7 +6,7 @@ NovaSeq-X StrataMap) do **not** provide molecule-resolved transcripts; they give
 cell/bin x gene count matrix on a spatial lattice. Rather than unroll counts into
 synthetic transcripts (memory blow-up on dense data — Stereo-seq bin1 ~1e8 UMIs),
 the count path rasterizes counts onto a grid and GPU-blurs them into a
-KDE-equivalent vector field (see :meth:`SSAMAnalysis.compute_vf`).
+KDE-equivalent vector field (see :meth:`Analysis.compute_vf`).
 
 ``GridDataset`` is the lightweight hand-off between a platform loader
 (:mod:`cellman.spatial._io`) and that backend. It deliberately does **not** wrap a
@@ -108,7 +108,7 @@ class GridDataset:
         ``(µm_x, µm_y)``. This is the ONE cross-platform coordinate contract: each
         loader folds its own convention (StrataMap axis transpose, Stereo-seq
         mirror-flip, Visium HD lstsq lattice fit) into this matrix, so
-        :meth:`SSAMAnalysis.downsample_vector` samples voxels identically for all.
+        :meth:`Analysis.downsample_vector` samples voxels identically for all.
         World µm are converted to grid bins at compute time via ``origin`` +
         ``bin_um``. ``None`` ⇒ fall back to a plain ``um_per_px`` scale.
     he_revert : bool
@@ -168,8 +168,8 @@ class GridDataset:
           This is the single cross-platform coordinate contract, now expressed
           natively.
 
-        The count pipeline (:meth:`SSAMAnalysis.compute_vf`,
-        :meth:`~SSAMAnalysis.downsample_vector`) threads this object through;
+        The count pipeline (:meth:`Analysis.compute_vf`,
+        :meth:`~Analysis.downsample_vector`) threads this object through;
         :meth:`from_sdata` reconstructs the lightweight view the backend needs.
 
         :param table_key: Key under which the count table is stored in the

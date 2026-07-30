@@ -12,9 +12,9 @@ name = "cellman"
 version = "0.1.0"
 description = "CeLLMan — agentic KG-based cell-type annotation + segmentation-free spatial cell-type mapping"
 readme = "README.md"
-license = {text = "AGPL-3.0-or-later"}
+license = {text = "BSD-3-Clause"}
 requires-python = ">=3.9"
-keywords = ["spatial-transcriptomics", "cell-type", "kde", "ssam"]
+keywords = ["spatial-transcriptomics", "cell-type", "kde", "vector-field"]
 classifiers = [
     "Intended Audience :: Science/Research",
     "Operating System :: POSIX",
@@ -22,20 +22,20 @@ classifiers = [
     "Programming Language :: C++",
     "Topic :: Scientific/Engineering :: Bio-Informatics",
 ]
-# 버전 하한은 cellularspace/.venv(충돌 없음 확인된 환경) 기준.
+# Lower bounds follow a virtual environment verified to be conflict-free.
 dependencies = [
-    "numpy>=1.26.4,<=2.0.2",       # numba/C-ext 호환 위해 상한 유지
+    "numpy>=1.26.4,<=2.0.2",       # upper bound kept for numba / C-extension compatibility
     "scipy>=1.16.3",
     "pandas>=2.3.3",
     "scikit-learn>=1.7.2",
     "scikit-image>=0.25.2",
     "matplotlib>=3.10.7",
     "seaborn>=0.13.2",
-    "opencv-python-headless>=4.12.0.88",    # cv2 — otsu thresholding (_analysis.py); headless = libGL 불필요(서버)
+    "opencv-python-headless>=4.12.0.88",    # cv2 — Otsu thresholding (_analysis.py); headless = no libGL needed on servers
     "zarr>=3.1.6",
     "numcodecs>=0.15.1",
     "dask[array]>=2026.1.1",
-    "xarray>=2026.4.0",            # _dataset.py 이미지 저장
+    "xarray>=2026.4.0",            # image storage in _dataset.py
     "python-igraph>=1.0.0",
     "leidenalg>=0.11.0",
     "psutil>=7.1.3",
@@ -44,22 +44,43 @@ dependencies = [
     "anndata>=0.12.6",
     "scanpy>=1.11.5",
     "spatialdata>=0.7.3",
-    "spatialdata-io>=0.5.1",       # 플랫폼 raw 로더 (워크플로 Step 1)
-    "spatialdata-plot>=0.2.13",    # _dataset.py .pl 시각화 accessor
+    "spatialdata-io>=0.5.1",       # platform raw loaders (workflow Step 1)
+    "spatialdata-plot>=0.2.13",    # .pl plotting accessor used by _dataset.py
+    "pillow>=10.0.0",              # PIL.Image in _dataset.py
+    "tifffile>=2024.1.30",         # _io/_loaders.py
+    "requests>=2.31.0",            # ontology server calls in _panel.py
+    # tensorstore backs the vf_normalized write path in _count.py. Its import there is wrapped in
+    # try/except and falls back to zarr-python, so a missing install costs throughput silently
+    # rather than raising — declare it so that never happens by accident.
+    "tensorstore>=0.1.60",
 ]
 
 [project.optional-dependencies]
-# GPU 가속: downsample_vector(KDE) + cluster_vectors(rapids leiden) + map_celltypes_gpu.
-# 주의: CUDA 버전별 wheel — 일반 PyPI 불가. 설치 시 인덱스 추가 필요:
+# GPU acceleration: downsample_vector (KDE) + Leiden clustering (rapids-singlecell) + map_celltypes_gpu.
+# Note: wheels are CUDA-version specific and are not on plain PyPI. Extra indexes are required:
 #   uv pip install '.[gpu]' --index-strategy unsafe-best-match \
 #       --extra-index-url https://pypi.nvidia.com \
 #       --extra-index-url https://download.pytorch.org/whl/cu128
-#   (이 .venv 기준 CUDA13. cuml/cugraph/cuvs는 rapids-singlecell이 hard-dep으로 안 끌어와 직접 명시.)
+#   (CUDA 13 here. cuml/cugraph/cuvs are listed explicitly because rapids-singlecell
+#    does not pull them in as hard dependencies.)
+#   rapids-singlecell and cuml must be kept in step, and which pair is reachable depends on the
+#   interpreter, so the two branches are spelled out rather than left to resolver luck.
+#   cuml/cugraph/cuvs ship on one RAPIDS release cycle and are always pinned together.
 gpu = [
-    "rapids-singlecell>=0.13.4",
-    "cuml-cu13>=26.2.0",
-    "cugraph-cu13>=26.2.0",
-    "cuvs-cu13>=26.2.0",
+    # Python 3.11 — the tested configuration. 0.14+ requires >=3.12, so 0.13.4 is the ceiling here;
+    # it imports cuml.thirdparty_adapters.check_array, which cuml 26.6 moved to
+    # cuml.internals.validation. An unbounded cuml floor therefore installs cleanly and then dies at
+    # `import rapids_singlecell`. 26.2 is verified good; 26.4 is untested and so excluded.
+    "rapids-singlecell>=0.13.4,<0.14; python_version < '3.12'",
+    "cuml-cu13>=26.2.0,<26.4.0; python_version < '3.12'",
+    "cugraph-cu13>=26.2.0,<26.4.0; python_version < '3.12'",
+    "cuvs-cu13>=26.2.0,<26.4.0; python_version < '3.12'",
+    # Python 3.12+ — current rapids-singlecell tracks the current cuml API, so cuml is left open.
+    # NOT part of the tested matrix; 3.11 is what CI and the notebooks are run against.
+    "rapids-singlecell>=0.16.1; python_version >= '3.12'",
+    "cuml-cu13>=26.2.0; python_version >= '3.12'",
+    "cugraph-cu13>=26.2.0; python_version >= '3.12'",
+    "cuvs-cu13>=26.2.0; python_version >= '3.12'",
     "cupy-cuda13x>=14.0.1",
     "torch>=2.10.0",
     "triton>=3.6.0",

@@ -11,6 +11,16 @@ the class→region→subtype hierarchy, confusion pairs, context axes. `scripts/
 compute (global statistics, profiling, the marker-axis split, gates, the h5ad write) and hands you a
 **profile** per cluster; **you supply the biological judgment.** The caller talks to the user — you never do.
 
+> **ENGLISH ONLY — every word the user reads.** Reports, tables, cluster rationales, questions,
+> warnings, error relays, the post-finalize conversation (§8): all English, **whatever language the user
+> wrote in.** A prompt in Korean, Japanese, Chinese or any other language is still answered in English —
+> match its content, never its language, and never apologise for or explain the choice. This is not a
+> style preference: labels come from the Cell-Ontology, whose terms exist only in English, so a
+> translated report silently detaches the prose from the term it names and makes the judgment
+> unverifiable. Cell-type names, marker genes and rule names (R1–R8) are **never** translated or
+> transliterated. The one thing that may be quoted in the user's language is a literal string from their
+> own data (an `obs` value, a file path).
+
 Everything below is built on **one principle**, applied at four levels. Read §1 first; the rest is that
 principle in full detail.
 
@@ -247,7 +257,7 @@ multiplying:
 | actor | responsibility |
 |---|---|
 | **expert agent = you** | Run `helper.py`, read profiles, judge each leaf by R1–R8 (§5), drive the split yourself, write the decisions JSON + per-round CSV. **Never ask the user.** Standard annotation is autonomous. **You own your `--out` directory exclusively.** |
-| **caller (= the manager/main session)** | Spawns **one expert agent per dataset** and then **WAITS** for that agent's final result — nothing else. The caller **does NOT** run `helper.py`, read the agent's `--out` directory, inspect profiles, judge clusters, decide descents, or make any annotation call of its own. Doing so duplicates the agent's work and, if it writes, **corrupts `_annotate_state.json`** (two loops on one directory). Each `--out` is owned by exactly one expert agent. The caller's only jobs: spawn + wait, then relay the finished result to the user and run the post-finalize interactive phase (§8). For a single dataset it may run the expert inline instead of spawning — but still **one owner only**, never a second parallel brain on the same directory. |
+| **caller (= the manager/main session)** | Spawns **one expert agent per dataset** and then **WAITS** for that agent's final result — nothing else. The caller **does NOT** run `helper.py`, read the agent's `--out` directory, inspect profiles, judge clusters, decide descents, or make any annotation call of its own. Doing so duplicates the agent's work and, if it writes, **corrupts `_annotate_state.json`** (two loops on one directory). Each `--out` is owned by exactly one expert agent. The caller's only jobs: spawn + wait, then relay the finished result to the user and run the post-finalize interactive phase (§8). For a single dataset it may run the expert inline instead of spawning — but still **one owner only**, never a second parallel brain on the same directory. **Everything it says to the user is in English, regardless of the language the user wrote in** (see the rule at the top). |
 | **`helper.py`** | The **single, self-contained backend** — all compute (profiling, the identity engine, gates), the marker-axis split, and the final h5ad write, in one script. **Validates** your decisions (`check`/`finalize`) and returns violations — it **never silently changes a decision**. Every command (`init`/`subcluster`/`descend`/`check`/`finalize`) runs in this one file; it does not call any other helper. |
 
 ---
@@ -626,7 +636,7 @@ label merge, stop. Converge γ toward marker-purity, don't guess it.
 
 ### 7.1 Finalize split-review gate
 
-> **⛔ MUST-DESCEND HARD BLOCK (un-bypassable).** Before anything else, `finalize` counts every leaf you floored
+> **MUST-DESCEND HARD BLOCK (un-bypassable).** Before anything else, `finalize` counts every leaf you floored
 > to a class / region-group (`subclass_resolved=false`) that is large & dense and **was NEVER descended**
 > (top-level, no "." in the path) and whose node has ≥2 KG children. If any exist it **BLOCKS the write —
 > `--accept-large` does NOT bypass it** (only an explicit `--force` + a recorded reason). This is the mechanical
@@ -702,9 +712,10 @@ relays your helper calls. The user is engaged **only after finalize**.
    ends standard annotation.** Report the outcome to the caller.
 
 ### Interactive phase (after finalize — the only user touchpoint)
-The caller presents the finalized outcome (English; table + explanation) and offers **① done** or **②
-user-directed exploration**. This is free-form — the user asks in their own words; you translate it into
-targeted work and answer **honestly** (BIAS GUARD: the data decides, never manufacture a positive
+The caller presents the finalized outcome (table + explanation) and offers **① done** or **②
+user-directed exploration**. This is free-form — the user asks in their own words, in **any** language, and
+**every reply is still English** (top rule): read their language, answer in English. You translate the request
+into targeted work and answer **honestly** (BIAS GUARD: the data decides, never manufacture a positive
 to satisfy the user; never editorialize the *sample* as normal/diseased from the absence of a state label —
 that is an evidence/coverage outcome, not a determination). Every refinement here is the **same** method —
 `subcluster` / `descend` + re-judgment by R1–R8. Examples:
@@ -829,7 +840,7 @@ chosen term's grounding PMIDs from `GM`).
 - **Splitting a single-dominant-lineage cluster because no subtype passed** (R6/R8) — that tiles a continuous
   gradient into meaningless fragments; FLOOR at the dominant subtype or its class. (And the converse: when ≥2
   identities genuinely co-resolve, DO split — merge cleans redundancy.)
-- **⛔ Stopping at a class/region FLOOR without `descend`ing** (R4/R8 — THE failure this skill exists to prevent).
+- **Stopping at a class/region FLOOR without `descend`ing** (R4/R8 — THE failure this skill exists to prevent).
   A floor is EARNED by a descent that failed to separate, never chosen to save a round. Emitting a `class_floor`
   / region-group label on a leaf you never descended — or one still carrying `mixture_subtypes` /
   `children_resolvable` / a subtype in `df_present` — is INVALID; descend it first. A floor is usually

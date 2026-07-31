@@ -94,7 +94,7 @@ If no module plausibly matches (the KG has no such tissue at all) → **stop and
   cp=confusion pairs, oq=open questions, GM=grounding PMIDs — cited in the finalize rationale only).
 - helper location: the absolute path to `scripts/helper.py` in the CeLLMan clone (single,
   self-contained backend — all commands run in this one script). Resolve it once —
-  `find ~ /work /data -path '*Agentic-Annotation/scripts/helper.py' 2>/dev/null | head -1` — and use
+  `find ~ /work /data -path '*CeLLMan/scripts/helper.py' 2>/dev/null | head -1` — and use
   that absolute path for every call. **If the search finds nothing** (the clone is elsewhere), do
   not guess or annotate: tell the caller the helper path must be passed explicitly. Never assume CWD.
 - Inputs (caller passes, per dataset): `tissue` (species + organ, may be free text → §0),

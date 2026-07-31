@@ -2,14 +2,14 @@
 
 **AI agentic workflow for an automatic cell-type annotation based on knowledge graph of genes**
 
-Assigning cell types from spatial transcriptomics usually depends on cell segmentation, which is
-difficult to achieve accurately. CeLLMan removes that dependency: one specialized agent per organism
-and organ mines PubMed into a knowledge graph of cell-type marker genes and infers cell identity from
-mRNA signals alone — no segmentation, no neighborhood aggregation.
+One specialized agent per organism and organ mines PubMed into a knowledge graph of cell-type marker
+genes and infers cell identity from mRNA signals alone. It runs on any clustered `h5ad` — scRNA-seq
+or spatial — and writes `obs['cellman_annotation']`.
 
-<p align="center">
-  <img src="cellman.png" alt="CeLLMan overview" width="900">
-</p>
+CeLLMan is the agentic annotation component of
+[**SSAF-T**](https://github.com/pnucolab/SSAF-T) (Spatial Segmentation-free Agentic Framework -
+Transcriptomics), where it labels the vectors sampled from a segmentation-free spatial vector field.
+This repository is that component on its own, and needs no spatial data to be useful.
 
 ---
 
@@ -19,47 +19,28 @@ mRNA signals alone — no segmentation, no neighborhood aggregation.
 git clone https://github.com/pnucolab/CeLLMan.git
 uv venv .venv --python 3.11
 source .venv/bin/activate
+uv pip install -r CeLLMan/requirements.txt
 ```
-
-Then run **one** of the two commands below. 
-
-```bash
-# CPU only
-uv pip install ./CeLLMan
-```
-
-```bash
-# same as above, plus GPU acceleration.
-uv pip install './CeLLMan[gpu]'
-```
-
-Either command builds the C extension, and the default build enables AVX-512 on any x86_64 host
-without checking whether the CPU supports it — a machine that lacks it aborts with an illegal
-instruction the first time the extension runs. Append `--config-settings=setup-args=-Dsimd=disabled`
-to whichever command you chose if either of these applies:
-
-- **x86_64 Linux with no AVX-512** — `lscpu | grep -o avx512f | head -1` prints nothing (most
-  consumer Ryzen and Core chips)
-- **an Intel Mac** — no Mac has ever shipped with AVX-512
-
-Apple Silicon and other ARM hosts need nothing extra: SIMD is not enabled there to begin with.
 
 Then register the skill and the expert agent with your LLM host.
 
 ```bash
 # claude code
 mkdir -p .claude/skills .claude/agents
-cp -r CeLLMan/Agentic-Annotation/skills/annotate-mode .claude/skills/
-cp CeLLMan/Agentic-Annotation/agents/annotate-expert.md .claude/agents/
+cp -r CeLLMan/skills/annotate-mode .claude/skills/
+cp CeLLMan/agents/annotate-expert.md .claude/agents/
 ```
 
 ```bash
 # codex
 mkdir -p .agents/skills .codex/agents
-cp -r CeLLMan/Agentic-Annotation/skills/annotate-mode .agents/skills/
-cp CeLLMan/Agentic-Annotation/agents/annotate-expert.toml .codex/agents/
+cp -r CeLLMan/skills/annotate-mode .agents/skills/
+cp CeLLMan/agents/annotate-expert.toml .codex/agents/
 printf '\n[sandbox_workspace_write]\nnetwork_access = true\n' >> .codex/config.toml
 ```
+
+The agent locates the backend by name, so keep the clone directory called `CeLLMan`:
+`find . -path '*CeLLMan/scripts/helper.py'`.
 
 ---
 
@@ -67,16 +48,17 @@ printf '\n[sandbox_workspace_write]\nnetwork_access = true\n' >> .codex/config.t
 
 Full documentation is in preparation and will be published on Read the Docs.
 
-Until then, `notebooks/` holds one worked example per data modality:
+Until then, `notebooks/` holds a worked example:
 
 | notebook | modality |
 |---|---|
 | [`notebooks/TS_lung.ipynb`](notebooks/TS_lung.ipynb) | scRNA-seq |
-| [`notebooks/visiumhd_small_intestine.ipynb`](notebooks/visiumhd_small_intestine.ipynb) | array-based spatial transcriptomics |
-| [`notebooks/xenium_kidney.ipynb`](notebooks/xenium_kidney.ipynb) | imaging-based spatial transcriptomics |
+
+For spatial transcriptomics — array-based and imaging-based worked examples, where CeLLMan annotates
+a segmentation-free vector field — see [SSAF-T](https://github.com/pnucolab/SSAF-T).
 
 For how to phrase the prompt that starts an annotation run, see
-[`Agentic-Annotation/CALLER_PROMPT_GUIDE.md`](Agentic-Annotation/CALLER_PROMPT_GUIDE.md).
+[`CALLER_PROMPT_GUIDE.md`](CALLER_PROMPT_GUIDE.md).
 
 ---
 

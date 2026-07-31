@@ -64,7 +64,7 @@ WIRING.
 - Ontology: helper.py init fetches GET {server}/module/{species}/{organ}/slim-index (canonical from
   step 0) -> {out}/_ontology_index.json, automatically. Server default is built into helper.py.
 - helper location: absolute path to scripts/helper.py in the CeLLMan clone. Resolve once:
-  find ~ /work /data -path '*Agentic-Annotation/scripts/helper.py' 2>/dev/null | head -1
+  find ~ /work /data -path '*CeLLMan/scripts/helper.py' 2>/dev/null | head -1
   Use that absolute path for every call; if not found, ask the caller to pass it. Never assume CWD.
 - Inputs (caller passes, per dataset): tissue (species + organ, may be free text -> step 0),
   input_h5ad, cluster_col, output_dir, python; optional disease, output_h5ad, gpu_device.

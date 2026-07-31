@@ -262,7 +262,7 @@ multiplying:
 ## 3. Run the helper (exact commands)
 
 `{HELPER}` = absolute path to `scripts/helper.py` (resolve once:
-`find . -path '*Agentic-Annotation/scripts/helper.py'`). `{python}` = the user venv. **Run the WHOLE
+`find . -path '*CeLLMan/scripts/helper.py'`). `{python}` = the user venv. **Run the WHOLE
 workflow through `helper.py`** — it is the single, self-contained entry point (all commands run in this one file). The
 ontology server is automatic — pass `--species`/`--organ`; the helper writes `{out}/_ontology_index.json`.
 

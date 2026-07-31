@@ -44,6 +44,52 @@ The agent locates the backend by name, so keep the clone directory called `CeLLM
 
 ---
 
+## Knowledge Graph coverage
+
+The Knowledge Graph holds one module per `(species, organ)`. Each module carries that organ's own cell
+types; the common-lineage backbone (T/B/myeloid, endothelium, fibroblast …) is injected into every
+module on top of them, so it is not listed here.
+
+Give the tissue in any wording you like: an exact module name runs straight away, and anything else
+(`mammary gland`, `cerebellum`, `gut`) is turned into a question before annotation starts — see
+[`CALLER_PROMPT_GUIDE.md`](CALLER_PROMPT_GUIDE.md). Ask for several modules at once and they are
+served together.
+
+### Human
+
+| | | | |
+|---|---|---|---|
+| `adipose_tissue` | `bladder` | `blood` | `bone` |
+| `bone_marrow` | `brain` | `breast` | `connective_tissue` |
+| `ear` | `embryo` | `eye` | `fallopian_tube` |
+| `heart` | `joint` | `kidney` | `large_intestine` |
+| `liver` | `lung` | `lymph_node` | `mouth` |
+| `muscle` | `ovary` | `pancreas` | `peripheral_nervous_system` |
+| `pituitary_gland` | `placenta` | `prostate` | `salivary_gland` |
+| `skin` | `small_intestine` | `spinal_cord` | `spleen` |
+| `stomach` | `testis` | `thymus` | `tongue` |
+| `tonsil` | `tooth` | `trachea` | `uterus` |
+| `vasculature` |  |  |  |
+
+### Mouse
+
+| | | | |
+|---|---|---|---|
+| `adipose_tissue` | `bladder` | `blood` | `bone` |
+| `bone_marrow` | `brain` | `breast` | `connective_tissue` |
+| `ear` | `embryo` | `eye` | `fallopian_tube` |
+| `heart` | `joint` | `kidney` | `large_intestine` |
+| `liver` | `lung` | `lymph_node` | `mouth` |
+| `muscle` | `nasal_cavity` | `ovary` | `pancreas` |
+| `peripheral_nervous_system` | `pituitary_gland` | `placenta` | `prostate` |
+| `salivary_gland` | `skin` | `small_intestine` | `spinal_cord` |
+| `spleen` | `stomach` | `testis` | `thymus` |
+| `tongue` | `tooth` | `trachea` | `uterus` |
+| `vasculature` |  |  |  |
+
+
+---
+
 ## Documentation
 
 Full documentation is in preparation and will be published on Read the Docs.

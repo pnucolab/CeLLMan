@@ -274,7 +274,37 @@ notebook — so the h5ad arrives already clustered):**
   REQUIRED input — `init --cluster-col {cluster_col}` reads exactly that column, and every distinct value in it
   becomes a leaf to annotate. If the user did not state which column, the caller **asks** (the one question it
   must resolve up front); do not guess `leiden` when the h5ad has several candidate columns.
-- **`{species}` / `{organ}`** — the module (e.g. `mouse` / `brain`). From the prompt or obvious from the dataset.
+- **`{species}` / `{organ}`** — the KG module, resolved by the **MODULE RESOLUTION** protocol below before
+  `init` is run. The user's tissue is free text; `--organ` takes the **canonical** module name.
+
+**MODULE RESOLUTION (the caller does this BEFORE spawning the agent — it is the caller that talks to the user):**
+
+1. `GET {server}/modules` → the canonical `(species, organ)` list the KG actually serves, with `n_terms`.
+2. Normalise the user's tissue for comparison: lowercase, spaces ↔ underscores, drop a leading article.
+   Compare against that list.
+3. **EXACT match → use it silently.** `brain` → `brain`, `Large Intestine` → `large_intestine`. No question is
+   asked; a name that already IS a module is never second-guessed.
+4. **Otherwise → ASK the user and WAIT.** "Otherwise" is every one of these:
+   - **different name** — a synonym (`mammary gland` → `breast`, `colon` → `large_intestine`),
+   - **subtype of a served module** — the KG holds only the parent (`cerebellum` → `brain`,
+     `white adipose tissue` → `adipose_tissue`, `hippocampus` → `brain`),
+   - **several plausible modules** — (`gut` → `small_intestine` / `large_intestine`, `immune` → `blood` /
+     `bone_marrow` / `lymph_node` / `spleen` / `thymus`).
+   Present the candidate module(s) with `n_terms` and one line of WHY each was proposed, and state plainly that
+   the KG has no module under the name the user wrote. Never start `init` on an unconfirmed module.
+5. **The user's answer decides — always:**
+   - picks one → that module.
+   - **asks for several / "use them all"** → serve them ALL: `--organ brain,spinal_cord` (comma-separated). The
+     helper fetches each wing and merges them into one slim-index (common-lineage terms de-duplicated). The
+     label set then spans those organs — say so, since a wider candidate set makes cross-organ force-fit easier.
+   - **names a module you did not propose** → use the user's module verbatim. Do not argue it back to your own
+     candidate. Only if that name 404s do you report it and ask again (the helper's error lists the served modules).
+6. **No plausible module at all** (the KG has no such tissue) → tell the user and stop. Never annotate from
+   guesswork, and never silently substitute a "close" organ.
+
+The agent re-validates whatever `(species, organ)` it is handed. If it is not an exact served module and the
+caller did not record a user confirmation, the agent **stops and returns `MODULE_CONFIRM_REQUIRED` + candidates**
+instead of guessing — the caller then asks the user and re-spawns it with the confirmed module(s).
 - **`{disease}`** (optional) — pass `--disease "<name>"` only if the user says the data is disease/cancer (R7 hint).
 - **`{output}`** (optional) — a save path the user names for the annotated h5ad (*"output: /data/kidney_done.h5ad"*,
   *"save it to …"*). Pass it as `--output {output}` on `init` and it persists to `finalize`; passing it on

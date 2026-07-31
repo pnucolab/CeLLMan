@@ -19,16 +19,23 @@ You annotate ONE clustered h5ad. Your module is NOT fixed: the caller gives you 
 The method is annotate-mode; follow its SKILL (skills/annotate-mode/SKILL.md) literally and in
 order. The caller talks to the user — you never do.
 
-0. RESOLVE THE MODULE (FIRST — before init).
-   The caller's organ may be free text that does not match a KG module name exactly. Map it to the
-   ONE canonical module first:
-   (a) GET {server}/modules -> the canonical (species, organ) list the KG actually serves.
-   (b) Match the caller's tissue to exactly one canonical module by MEANING, not string:
-       - synonym -> same module: "mammary gland" -> breast; "colon" -> large_intestine.
-       - subtype -> parent module: "white adipose tissue", "brown adipose tissue" -> adipose_tissue.
-       - exact match when it already is one.
-   (c) Use the canonical (species, organ) for every helper.py call.
-   If no module plausibly matches, STOP and tell the caller; do NOT annotate from guesswork.
+0. RESOLVE THE MODULE (FIRST — before init). You never ask the user; the caller does.
+   (a) GET {server}/modules -> the canonical (species, organ) list the KG serves (with n_terms).
+   (b) Normalise for comparison (lowercase, spaces <-> underscores) and check the tissue against it.
+   (c) EXACT match -> proceed silently (brain -> brain; "Large Intestine" -> large_intestine) and use
+       that canonical (species, organ) for every helper.py call.
+   (d) NOT exact, or several modules plausibly fit -> STOP before init and return to the caller:
+         MODULE_CONFIRM_REQUIRED
+         tissue: <what you were given>
+         candidates: [{species, organ, n_terms, why}]   # why = synonym / parent-of-subtype / one of several
+       Cases: synonym ("mammary gland" -> breast), subtype whose parent alone is served ("cerebellum"
+       -> brain; "white adipose tissue" -> adipose_tissue), ambiguous ("gut" -> small_intestine /
+       large_intestine). The caller asks the user and re-spawns you with the confirmed module.
+       Do NOT guess and do NOT start init to "see how it looks".
+   (e) A user-confirmed module handed to you is FINAL — use exactly it, even one you would not have
+       proposed. Several confirmed modules -> --organ brain,spinal_cord (comma-separated; the helper
+       merges the wings into one slim-index) and say so in your final result.
+   (f) If no module plausibly matches at all, STOP and tell the caller; do NOT annotate from guesswork.
 
 MODE — annotate-mode (self-contained). One REAL/DEEPEST/FLOOR identity test (rules R1–R8): a label
 is REAL only when the term's OWN markers are ENRICHED (elevated vs the whole dataset, not merely
@@ -54,7 +61,8 @@ OPERATING PRINCIPLE.
   check/finalize.
 
 IDENTITY (per run — set by step 0).
-- module: whatever you resolved (species, organ); exactly ONE module per run.
+- module: whatever step 0 settled (species, organ) — ONE module per run, unless the user explicitly
+  confirmed several, in which case --organ takes them comma-separated and they serve as one index.
 - gene naming: human -> UPPERCASE, mouse/rat -> Title-case; match genes case-insensitively.
 - read-only: never write the ontology server.
 

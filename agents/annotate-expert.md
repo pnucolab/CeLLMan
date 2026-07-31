@@ -18,19 +18,32 @@ keeps results stable across strong and weak models. The caller talks to the user
 
 ## 0. Resolve the module (FIRST — before `init`)
 
-The caller's organ may be **free text that does not match a KG module name exactly**. Map it to the
-**one** canonical module before anything else:
+The tissue you are handed may be **free text that does not match a KG module name exactly**. Settle the
+module before anything else. **You never ask the user** — the caller does; you either proceed on an
+exact module or hand the question back.
 
-1. `GET {server}/modules` → the canonical `(species, organ)` list the KG actually serves.
-2. Match the caller's tissue to **exactly one** canonical module by **meaning, not string**:
-   - **synonym → same module**: `mammary gland` → `breast`; `colon` → `large_intestine`.
-   - **subtype → parent module**: `white adipose tissue`, `brown adipose tissue` → `adipose_tissue`
-     (the KG has one `adipose_tissue` module; both subtypes use it).
-   - exact match when it already is one (`brain` → `brain`).
-3. Use the **canonical** `(species, organ)` for **every** `helper.py` call below.
+1. `GET {server}/modules` → the canonical `(species, organ)` list the KG actually serves (with `n_terms`).
+2. Normalise for comparison (lowercase, spaces ↔ underscores) and check the tissue against that list.
+3. **EXACT match → proceed silently** (`brain` → `brain`, `Large Intestine` → `large_intestine`). Use that
+   canonical `(species, organ)` for **every** `helper.py` call below.
+4. **Not an exact match, or several modules plausibly fit → STOP before `init`** and return to the caller:
 
-If no module plausibly matches (the KG has no such tissue at all) → **stop and tell the caller**; do
-**not** annotate from guesswork.
+   ```
+   MODULE_CONFIRM_REQUIRED
+   tissue: <what you were given>
+   candidates: [{species, organ, n_terms, why}]      # why = synonym / parent-of-subtype / one of several
+   ```
+
+   Cases that land here: synonym (`mammary gland` → `breast`), subtype whose parent alone is served
+   (`cerebellum` → `brain`; `white adipose tissue` → `adipose_tissue`), or an ambiguous term
+   (`gut` → `small_intestine` / `large_intestine`). The caller asks the user and re-spawns you with the
+   confirmed module. **Do not guess, and do not start `init` to "see how it looks".**
+5. **When the caller hands you an explicitly user-confirmed module, use exactly that** — including a module
+   you would not have proposed yourself. The user's choice is final.
+6. **Several confirmed modules** (the user asked for all the candidates) → pass them comma-separated:
+   `--organ brain,spinal_cord`. The helper fetches each wing and merges them into one slim-index. Note in
+   your final result that the label space spanned several organs.
+7. **No module plausibly matches at all** → stop and tell the caller; do **not** annotate from guesswork.
 
 ## Mode — annotate-mode (the only mode; self-contained)
 

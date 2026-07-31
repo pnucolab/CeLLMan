@@ -46,28 +46,94 @@ def _dedup_parents(idx):
                 t["P"] = list(dict.fromkeys(P))
     return idx
 
+def _served_organs(url, species):
+    """The organs the server actually serves for `species` — used to make a 404 actionable.
+    Best-effort: any failure returns [] and the caller just omits the hint."""
+    try:
+        import urllib.request
+        base = url.split("/module/")[0]
+        with urllib.request.urlopen(f"{base}/modules", timeout=20) as r:
+            wings = json.loads(r.read().decode()).get("wings", [])
+        return sorted(w["organ"] for w in wings if w.get("species") == species)
+    except Exception:
+        return []
+
+
+def _merge_slim_indexes(idxs, organs):
+    """Union of several wings' slim-indexes into ONE index (multi-module serving).
+
+    Requested by the user when a tissue legitimately spans wings (e.g. 'brain' + 'spinal_cord').
+    Term ids are globally unique and wing-prefixed (HUMAN_BRAIN:… / HUMAN_COMMON:…), so the union is
+    by id: organ-specific terms never collide, and the common-lineage terms injected into every wing
+    collide on the SAME id — first wing wins (the requested organ order), which keeps that wing's
+    REFINES-merged deltas. Axis payloads (cp/ca/sa/oq) are concatenated and de-duplicated."""
+    species = {i.get("species") for i in idxs if i.get("species")}
+    if len(species) > 1:
+        sys.exit(f"[init][ERROR:MODULE_SPECIES_MISMATCH] the merged modules disagree on species ({sorted(species)}). "
+                 f"All --organ entries must belong to ONE species.")
+    merged = {"species": next(iter(species), None), "organ": "+".join(organs), "terms": {}}
+    dup = 0
+    for idx in idxs:
+        for tid, t in (idx.get("terms") or {}).items():
+            if tid in merged["terms"]:
+                dup += 1
+                continue
+            merged["terms"][tid] = t
+    for key in ("cp", "oq", "ca", "sa"):
+        seen, out_l = set(), []
+        for idx in idxs:
+            for item in (idx.get(key) or []):
+                k = json.dumps(item, sort_keys=True)
+                if k in seen:
+                    continue
+                seen.add(k); out_l.append(item)
+        merged[key] = out_l
+    merged["n_terms"] = len(merged["terms"])
+    merged["version"] = max((i.get("version") or "") for i in idxs) or None
+    print(f"[ontology] merged {len(idxs)} modules ({', '.join(organs)}) -> {merged['n_terms']} terms "
+          f"({dup} shared common-lineage terms de-duplicated)", flush=True)
+    return merged
+
+
 def _fetch_slim_index(out, ontology_url=None, ontology_file=None):
     """Obtain the slim-index and store it at {out}/_ontology_index.json.
-    Precedence: server fetch (ontology_url) > local file (ontology_file) > a file that already exists."""
+    Precedence: server fetch (ontology_url) > local file (ontology_file) > a file that already exists.
+    `ontology_url` may be a LIST of URLs — one per module — in which case the wings are merged
+    into one index (multi-module serving; the user asked for several modules at once)."""
     dst = os.path.join(out, "_ontology_index.json")
     if ontology_url:
         import urllib.request, urllib.error
-        try:
-            with urllib.request.urlopen(ontology_url, timeout=60) as r:
-                idx = json.loads(r.read().decode())
-        except urllib.error.HTTPError as e:
-            if e.code == 404:
-                sys.exit(f"[init][ERROR:MODULE_NOT_FOUND] the server has no such module ({ontology_url}, HTTP 404). "
-                         f"Check (species, organ) or request a build of that module. -> the caller should tell the user "
-                         f"'the ontology for the requested tissue (species/organ) is not on the server, so annotation cannot proceed'.")
-            sys.exit(f"[init][ERROR:SERVER_HTTP_{e.code}] the ontology server returned error {e.code} ({ontology_url}).")
-        except urllib.error.URLError as e:
-            sys.exit(f"[init][ERROR:SERVER_UNREACHABLE] cannot reach the ontology server ({ontology_url}; {e.reason}). "
-                     f"Check that the server is running and verify CELLONTO_SERVER_URL. -> the caller should tell the user "
-                     f"'the ontology server is unreachable (server down or wrong address)'.")
-        if not idx or not idx.get("terms"):
-            sys.exit(f"[init][ERROR:MODULE_EMPTY] the module responded but contains no terms ({ontology_url}). "
-                     f"That module needs to be built. -> the caller should tell the user 'the ontology for this tissue is empty, so we cannot proceed'.")
+        urls = [ontology_url] if isinstance(ontology_url, str) else list(ontology_url)
+
+        def _get(url):
+            try:
+                with urllib.request.urlopen(url, timeout=60) as r:
+                    return json.loads(r.read().decode())
+            except urllib.error.HTTPError as e:
+                if e.code == 404:
+                    parts = url.split("/module/")[-1].split("/")
+                    sp = parts[0] if parts else ""
+                    served = _served_organs(url, sp)
+                    hint = (f" The server serves these {sp} modules: {', '.join(served)}." if served else "")
+                    sys.exit(f"[init][ERROR:MODULE_NOT_FOUND] the server has no such module ({url}, HTTP 404).{hint} "
+                             f"Check (species, organ) or request a build of that module. -> the caller should tell the user "
+                             f"'the ontology for the requested tissue (species/organ) is not on the server, so annotation cannot proceed' "
+                             f"and, when a close module exists, ASK which one to use instead.")
+                sys.exit(f"[init][ERROR:SERVER_HTTP_{e.code}] the ontology server returned error {e.code} ({url}).")
+            except urllib.error.URLError as e:
+                sys.exit(f"[init][ERROR:SERVER_UNREACHABLE] cannot reach the ontology server ({url}; {e.reason}). "
+                         f"Check that the server is running and verify CELLONTO_SERVER_URL. -> the caller should tell the user "
+                         f"'the ontology server is unreachable (server down or wrong address)'.")
+
+        idxs = []
+        for url in urls:
+            idx = _get(url)
+            if not idx or not idx.get("terms"):
+                sys.exit(f"[init][ERROR:MODULE_EMPTY] the module responded but contains no terms ({url}). "
+                         f"That module needs to be built. -> the caller should tell the user 'the ontology for this tissue is empty, so we cannot proceed'.")
+            idxs.append(idx)
+        idx = (idxs[0] if len(idxs) == 1
+               else _merge_slim_indexes(idxs, [i.get("organ") or "?" for i in idxs]))
         idx = _dedup_parents(idx)                       # dedup duplicate parents in P (prevents bogus sibling groups)
         with open(dst, "w") as f: json.dump(idx, f, separators=(",", ":"))
         print(f"[ontology] fetched slim-index from server -> {dst} ({len(idx.get('terms',{}))} terms)", flush=True)
@@ -2153,8 +2219,13 @@ def cmd_init(a):
         if not (a.species and a.organ):
             sys.exit("[init] --species/--organ are required (or --ontology-url / a local --ontology). "
                      "The client connects to the default Cell-Ontology server automatically.")
-        url=f"{_resolve_server(a.server_url)}/module/{a.species}/{a.organ}/slim-index"
-        print(f"[init] ontology server: {_resolve_server(a.server_url)} (module {a.species}/{a.organ})", flush=True)
+        # --organ accepts SEVERAL modules, comma-separated ("brain,spinal_cord"): the user was shown the
+        # candidates and asked for all of them. The wings are fetched independently and merged into one index.
+        organs=[o.strip() for o in str(a.organ).split(",") if o.strip()]
+        url=[f"{_resolve_server(a.server_url)}/module/{a.species}/{o}/slim-index" for o in organs]
+        if len(url)==1: url=url[0]
+        print(f"[init] ontology server: {_resolve_server(a.server_url)} "
+              f"(module{'s' if len(organs)>1 else ''} {a.species}/{'+'.join(organs)})", flush=True)
     idx=_fetch_slim_index(a.out, url, a.ontology)
     if not idx or not _ontology_gene_set(idx):
         sys.exit("[init] FATAL: the ontology (slim-index) is empty — check the server / module. Running ontology-blind is not allowed.")
@@ -3369,7 +3440,11 @@ def _helper_cli():
     p=argparse.ArgumentParser(); sp=p.add_subparsers(dest="cmd"); sp.required=True
     pi=sp.add_parser("init"); pi.add_argument("--h5ad",required=True); pi.add_argument("--cluster-col",dest="cluster_col",required=True)
     pi.add_argument("--out",required=True)
-    pi.add_argument("--species",default=None); pi.add_argument("--organ",default=None)
+    pi.add_argument("--species",default=None)
+    pi.add_argument("--organ",default=None,
+                    help="canonical KG module organ (e.g. brain). Several comma-separated modules "
+                         "(e.g. 'brain,spinal_cord') are merged into one index — use ONLY when the user "
+                         "explicitly asked for several candidate modules at once.")
     pi.add_argument("--server-url",dest="server_url",default=None)
     pi.add_argument("--ontology-url",dest="ontology_url",default=None)
     pi.add_argument("--ontology",default=None); pi.add_argument("--output",default=None)

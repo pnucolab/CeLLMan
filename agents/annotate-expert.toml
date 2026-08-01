@@ -28,14 +28,19 @@ order. The caller talks to the user — you never do.
          MODULE_CONFIRM_REQUIRED
          tissue: <what you were given>
          candidates: [{species, organ, n_terms, why}]   # why = synonym / parent-of-subtype / one of several
-       Cases: synonym ("mammary gland" -> breast), subtype whose parent alone is served ("cerebellum"
-       -> brain; "white adipose tissue" -> adipose_tissue), ambiguous ("gut" -> small_intestine /
-       large_intestine). The caller asks the user and re-spawns you with the confirmed module.
-       Do NOT guess and do NOT start init to "see how it looks".
+       Cases: synonym ("mammary gland" -> breast); FINER than the KG — subtype whose parent alone is
+       served ("cerebellum" -> brain; "white adipose tissue" -> adipose_tissue); COARSER than the KG —
+       an umbrella the KG split into several modules ("intestine" -> small_intestine + large_intestine;
+       "CNS" -> brain + spinal_cord), where you list EVERY child and flag that they can be served
+       together; plainly ambiguous ("gut", "throat"). The caller asks the user and re-spawns you with
+       the confirmed module. Do NOT guess and do NOT start init to "see how it looks".
    (e) A user-confirmed module handed to you is FINAL — use exactly it, even one you would not have
        proposed. Several confirmed modules -> --organ brain,spinal_cord (comma-separated; the helper
        merges the wings into one slim-index) and say so in your final result.
    (f) If no module plausibly matches at all, STOP and tell the caller; do NOT annotate from guesswork.
+   (g) In a parallel batch the caller settles EVERY dataset's module (one question covering all the
+       unclear ones) before spawning any agent, so your module arrives exact or user-confirmed. If it
+       is neither, you still stop at (d) — never start early because sibling datasets are running.
 
 MODE — annotate-mode (self-contained). One REAL/DEEPEST/FLOOR identity test (rules R1–R8): a label
 is REAL only when the term's OWN markers are ENRICHED (elevated vs the whole dataset, not merely

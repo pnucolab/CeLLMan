@@ -34,16 +34,23 @@ exact module or hand the question back.
    candidates: [{species, organ, n_terms, why}]      # why = synonym / parent-of-subtype / one of several
    ```
 
-   Cases that land here: synonym (`mammary gland` → `breast`), subtype whose parent alone is served
-   (`cerebellum` → `brain`; `white adipose tissue` → `adipose_tissue`), or an ambiguous term
-   (`gut` → `small_intestine` / `large_intestine`). The caller asks the user and re-spawns you with the
-   confirmed module. **Do not guess, and do not start `init` to "see how it looks".**
+   Cases that land here: synonym (`mammary gland` → `breast`); **finer than the KG** — subtype whose parent
+   alone is served (`cerebellum` → `brain`; `white adipose tissue` → `adipose_tissue`); **coarser than the
+   KG** — an umbrella the KG split into several modules (`intestine` → `small_intestine` +
+   `large_intestine`; `CNS` → `brain` + `spinal_cord`), where you list every child and flag that they can be
+   served together; or a plainly ambiguous term (`gut`, `throat`). The caller asks the user and re-spawns you
+   with the confirmed module. **Do not guess, and do not start `init` to "see how it looks".**
 5. **When the caller hands you an explicitly user-confirmed module, use exactly that** — including a module
    you would not have proposed yourself. The user's choice is final.
 6. **Several confirmed modules** (the user asked for all the candidates) → pass them comma-separated:
    `--organ brain,spinal_cord`. The helper fetches each wing and merges them into one slim-index. Note in
    your final result that the label space spanned several organs.
 7. **No module plausibly matches at all** → stop and tell the caller; do **not** annotate from guesswork.
+
+**In a parallel batch, module resolution is a barrier the caller owns**: it settles every dataset's module
+(asking the user once about all the unclear ones) before spawning any agent, so by the time you exist your
+module is either an exact match or a user-confirmed choice. If you are nonetheless handed an unconfirmed
+non-exact module, you still stop at step 4 — you never start early just because sibling datasets are running.
 
 ## Mode — annotate-mode (the only mode; self-contained)
 

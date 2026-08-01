@@ -254,7 +254,7 @@ multiplying:
 | actor | responsibility |
 |---|---|
 | **expert agent = you** | Run `helper.py`, read profiles, judge each leaf by R1–R8 (§5), drive the split yourself, write the decisions JSON + per-round CSV. **Never ask the user.** Standard annotation is autonomous. **You own your `--out` directory exclusively.** |
-| **caller (= the manager/main session)** | Spawns **one expert agent per dataset** and then **WAITS** for that agent's final result — nothing else. The caller **does NOT** run `helper.py`, read the agent's `--out` directory, inspect profiles, judge clusters, decide descents, or make any annotation call of its own. Doing so duplicates the agent's work and, if it writes, **corrupts `_annotate_state.json`** (two loops on one directory). Each `--out` is owned by exactly one expert agent. The caller's only jobs: spawn + wait, then relay the finished result to the user and run the post-finalize interactive phase (§8). For a single dataset it may run the expert inline instead of spawning — but still **one owner only**, never a second parallel brain on the same directory. **Everything it says to the user is in English, regardless of the language the user wrote in** (see the rule at the top). |
+| **caller (= the manager/main session)** | Spawns **one expert agent per dataset** and then **WAITS** for that agent's final result — nothing else. The caller **does NOT** run `helper.py`, read the agent's `--out` directory, inspect profiles, judge clusters, decide descents, or make any annotation call of its own. Doing so duplicates the agent's work and, if it writes, **corrupts `_annotate_state.json`** (two loops on one directory). Each `--out` is owned by exactly one expert agent. The caller's only jobs: **settle the KG module of every dataset first** (§3 MODULE RESOLUTION — one confirmation round covering the whole batch, before a single agent is spawned), spawn + wait, then relay the finished result to the user and run the post-finalize interactive phase (§8). For a single dataset it may run the expert inline instead of spawning — but still **one owner only**, never a second parallel brain on the same directory. **Everything it says to the user is in English, regardless of the language the user wrote in** (see the rule at the top). |
 | **`helper.py`** | The **single, self-contained backend** — all compute (profiling, the identity engine, gates), the marker-axis split, and the final h5ad write, in one script. **Validates** your decisions (`check`/`finalize`) and returns violations — it **never silently changes a decision**. Every command (`init`/`subcluster`/`descend`/`check`/`finalize`) runs in this one file; it does not call any other helper. |
 
 ---
@@ -286,12 +286,19 @@ notebook — so the h5ad arrives already clustered):**
    asked; a name that already IS a module is never second-guessed.
 4. **Otherwise → ASK the user and WAIT.** "Otherwise" is every one of these:
    - **different name** — a synonym (`mammary gland` → `breast`, `colon` → `large_intestine`),
-   - **subtype of a served module** — the KG holds only the parent (`cerebellum` → `brain`,
-     `white adipose tissue` → `adipose_tissue`, `hippocampus` → `brain`),
-   - **several plausible modules** — (`gut` → `small_intestine` / `large_intestine`, `immune` → `blood` /
-     `bone_marrow` / `lymph_node` / `spleen` / `thymus`).
-   Present the candidate module(s) with `n_terms` and one line of WHY each was proposed, and state plainly that
-   the KG has no module under the name the user wrote. Never start `init` on an unconfirmed module.
+   - **finer than the KG (subtype → parent)** — the user names a part, the KG serves only the whole
+     (`cerebellum`/`hippocampus` → `brain`, `white adipose tissue` → `adipose_tissue`). One candidate:
+     confirm that the parent module is acceptable for this sample.
+   - **coarser than the KG (umbrella → children)** — the user names a region the KG has **split into
+     several modules** (`intestine` → `small_intestine` + `large_intestine`; `CNS` → `brain` +
+     `spinal_cord`; `immune` → `blood` + `bone_marrow` + `lymph_node` + `spleen` + `thymus`). List
+     **every** child module and offer both readings explicitly: **one of them**, or **all of them served
+     together**. Say which way you would lean and why — all of them when the sample genuinely spans the
+     parts (a whole gut roll, whole CNS section), one of them when the user probably has a single part.
+   - **plainly ambiguous** — the word maps to different organs depending on intent (`gut` may be either
+     intestine; `throat` → `trachea`/`tonsil`/`mouth`).
+   Present the candidate module(s) with one line of WHY each was proposed, and state plainly that the KG has
+   no module under the name the user wrote. Never start `init` on an unconfirmed module.
 5. **The user's answer decides — always:**
    - picks one → that module.
    - **asks for several / "use them all"** → serve them ALL: `--organ brain,spinal_cord` (comma-separated). The
@@ -305,6 +312,30 @@ notebook — so the h5ad arrives already clustered):**
 The agent re-validates whatever `(species, organ)` it is handed. If it is not an exact served module and the
 caller did not record a user confirmation, the agent **stops and returns `MODULE_CONFIRM_REQUIRED` + candidates**
 instead of guessing — the caller then asks the user and re-spawns it with the confirmed module(s).
+
+**BATCH RULE — several datasets: resolve ALL modules first, then start ALL agents.** Module resolution is a
+**barrier**, not a per-dataset step. With N datasets the caller:
+
+1. Runs steps 1–3 above for **every** dataset first, and spawns **nothing** yet. Datasets whose tissue is an
+   exact module name are settled silently; the rest collect candidates.
+2. If **any** dataset needs confirmation, asks **one** question covering them all — never one question per
+   dataset, and never a question after some agents are already running. Show the whole plan so the user sees
+   what is settled and what is being asked:
+
+   ```
+   Modules for this run:
+     [1] mouse_brain.h5ad   mouse, brain            -> mouse/brain            (exact match)
+     [3] mouse_liver.h5ad   mouse, liver            -> mouse/liver            (exact match)
+     [2] ts_breast.h5ad     human, mammary gland    -> human/breast?          (synonym — confirm)
+     [4] gut.h5ad           mouse, gut              -> small_intestine OR large_intestine? (choose, or both)
+   Datasets [2] and [4] need your confirmation before anything starts.
+   ```
+3. Applies the answers (a pick, several modules, or a module the user names instead), then spawns **all N
+   agents at once**, in parallel, each with its own `--out`.
+
+No dataset may start annotating while another dataset's module is still unconfirmed — an exact-match dataset
+waits at the same barrier as an ambiguous one, so every run in the batch begins from the same confirmed plan.
+The only exception is a dataset the user drops from the run; the rest then start together.
 - **`{disease}`** (optional) — pass `--disease "<name>"` only if the user says the data is disease/cancer (R7 hint).
 - **`{output}`** (optional) — a save path the user names for the annotated h5ad (*"output: /data/kidney_done.h5ad"*,
   *"save it to …"*). Pass it as `--output {output}` on `init` and it persists to `finalize`; passing it on

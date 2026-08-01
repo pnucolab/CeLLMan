@@ -36,6 +36,8 @@ Run each dataset as an INDEPENDENT agent IN PARALLEL — one agent per dataset, 
 OWN --out directory.
 Do NOT annotate, read any out directory, or run helper.py yourself — only spawn the agents and
 wait for their results; each out directory belongs to its agent alone.
+Settle the KG module for EVERY dataset first — ask me ONCE about all the tissues that need
+confirmation — and only then start all datasets together.
 
 Datasets:
   [1] input  : /path/mouse_brain.h5ad
@@ -71,6 +73,8 @@ Run each dataset as an INDEPENDENT agent IN PARALLEL — one agent per dataset, 
 OWN --out directory.
 Do NOT annotate, read any out directory, or run helper.py yourself — only spawn the agents and
 wait for their results; each out directory belongs to its agent alone.
+Settle the KG module for EVERY dataset first — ask me ONCE about all the tissues that need
+confirmation — and only then start all datasets together.
 
 Datasets:
   [1] input  : /path/mouse_brain.h5ad
@@ -95,9 +99,24 @@ The KG serves one module per `(species, organ)` — see the table in the [README
 |---|---|
 | `mouse, brain` — a module of that exact name exists | used immediately, no question |
 | `human, mammary gland` — a different name for a served module | you are **asked**: "the KG has no `mammary gland`; use `human/breast` (61 terms)?" |
-| `mouse, cerebellum` — only the parent organ is served | you are **asked**: "the KG serves the parent `mouse/brain` (413 terms); use it?" |
-| `human, gut` — several modules fit | you are **asked** to choose between `small_intestine` and `large_intestine` |
+| `mouse, cerebellum` — finer than the KG; only the parent organ is served | you are **asked**: "the KG serves the parent `mouse/brain`; use it?" |
+| `human, intestine` — coarser than the KG; it is split into several modules | you are **asked**: "the KG splits this into `small_intestine` and `large_intestine` — one of them, or both served together?" |
+| `human, gut` — ambiguous wording | you are **asked** to choose between `small_intestine` and `large_intestine` |
 | `human, pineal gland` — nothing plausible | you are told the KG has no such module; annotation does not start |
+
+**With several datasets, the modules are settled for all of them before any annotation starts.** The
+question comes once, as a single plan covering the whole batch — never one pop-up per dataset, and
+never after some datasets are already running:
+
+```
+Modules for this run:
+  [1] mouse_brain.h5ad   mouse, brain           -> mouse/brain     (exact match)
+  [2] ts_breast.h5ad     human, mammary gland   -> human/breast?   (synonym — confirm)
+Dataset [2] needs your confirmation before anything starts.
+```
+
+Once you answer, every dataset — the ones that matched exactly and the ones you confirmed — is spawned
+together in parallel. So the batch always begins from one plan you have seen.
 
 You always have the last word:
 

@@ -2141,15 +2141,39 @@ def _check_input_matrix(adata, force=False):
                             "The annotator expects non-negative log-normalized X — use the stage before scaling/residuals.")
         else:
             nz=finite[finite>0]
-            allint = nz.size>0 and np.allclose(nz, np.round(nz))
             xmax=float(finite.max())
-            # log-normalized X is the result of log1p and is virtually never all-integer -> all-integer means raw counts.
-            # (This does not rely on a max threshold: low-depth data must be caught too, and max>1 only rules out a
-            # binary mask false positive.)
-            if allint and xmax>1:
-                problems.append(f"X looks like integer raw counts (all non-zero values are integers, max={xmax:.0f}). "
-                                f"The annotator expects log-normalized X (counts distort the marker-axis statistics). "
-                                f"Apply sc.pp.normalize_total(adata, target_sum=1e4) followed by sc.pp.log1p(adata).")
+            # Raw counts are detected by ANY of three independent signatures. Requiring ALL-integer was too
+            # narrow: bin-to-cell toolchains (bin2cell / ENACT `weighted_by_area`) split a shared bin's counts
+            # by overlap area, so a large share of the non-zeros is fractional and the matrix is still counts.
+            sigs=[]
+            #   (1) integrality SHARE — log1p output is essentially never integral (raw=100%, area-weighted
+            #       counts ~60-70%, log-normalized ~0%), so a low threshold separates them with room to spare.
+            int_share = float(np.mean(np.isclose(nz, np.round(nz)))) if nz.size else 0.0
+            if int_share>=0.10 and xmax>1:
+                sigs.append(f"{int_share*100:.0f}% of the non-zero values are whole numbers (max={xmax:.4g})")
+            #   (2) out of range for log1p — log1p of even a 1e6-normalized value is 13.8, so max>20 cannot be
+            #       log-normalized (raw counts, CPM/CP10K without log1p, or another linear scaling).
+            if xmax>20:
+                sigs.append(f"max={xmax:.4g} is far above what log1p can produce (log1p(1e6)=13.8)")
+            #   (3) row sums reproduce a sequencing-depth column in obs -> the row still IS that cell's counts.
+            depth_col=next((c for c in ("total_counts","num_transcripts","nCount_RNA","n_counts","nCount_Spatial")
+                            if c in adata.obs.columns), None)
+            if depth_col is not None:
+                try:
+                    rs=np.asarray(Xs.sum(axis=1)).ravel()
+                    dv=np.asarray(adata.obs[depth_col].values[:rows], dtype=np.float64)
+                    ok=(dv>0)&np.isfinite(dv)&np.isfinite(rs)
+                    if ok.sum()>=20 and np.mean(np.isclose(rs[ok], dv[ok], rtol=1e-3))>=0.9:
+                        sigs.append(f"row sums equal obs['{depth_col}'] — the rows are still that cell's transcript counts")
+                except Exception:
+                    pass
+            if sigs:
+                problems.append("X looks like raw counts, not log-normalized: " + "; ".join(sigs) + ". "
+                                "The annotator expects log-normalized X (counts distort the marker-axis statistics). "
+                                "Apply sc.pp.normalize_total(adata, target_sum=1e4) followed by sc.pp.log1p(adata). "
+                                "Note that counts do not have to be integers — bin-to-cell pipelines "
+                                "(bin2cell / ENACT weighted_by_area) split shared bins by overlap area, which makes "
+                                "many values fractional while the matrix is still counts.")
     if problems:
         msg="\n".join(f"   • {p}" for p in problems)
         if force:

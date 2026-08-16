@@ -252,6 +252,17 @@ def _derive_lineages(idx):
     markers attached to descendants into the lineage set, so it points at 'neuron' rather than at 'which
     lineage' — that is why cluster 38 was called glut via Camk2a despite Slc17a7=0. Narrowing to the
     root's own R leaves only transmitters and keeps the lineage call clean.
+    ★ An R-EMPTY root is SKIPPED, and must stay skipped — do NOT fall back to its DF. An empty R is curated,
+    not missing: a broad class has no marker its children all share (mouse/brain `glial cell` R=[] because
+    astrocytes lack Sox10/Plp1 and oligodendrocytes lack Gfap/Aqp4), so nothing is *required*. Its DF
+    ([S100b,Gfap,Sox10,Plp1]) is a union, and every one of those is pan (R/S degree>=4 = octx.pan_disc).
+    Lineage strength scores by on_present (ABSOLUTE presence, not enrichment — see the on_present comment
+    below), and on KDE/spatial data ambient myelin/Gfap is present in ~every voxel, so registering that DF set
+    makes `glial cell` win the lineage in CORTICAL leaves too; cls_root becomes glial, the anchor loop drops
+    every term outside it, and the neocortical layer subtypes (L4 IT = Rspo1/Rorb) become unreachable. Measured:
+    the DF fallback silently removed L4 from a stereo-seq cortex run. The cost of skipping is real but smaller —
+    the glial branch is reached via restrict_root/descend instead — and the fix belongs in the KG (give the
+    broad roots a genuinely shared R, or make the transmitter classes roots), not here.
     Returns {} when there is no hierarchy (-> fallback). {lineage_label: {MARKER_UPPER}}."""
     terms=(idx or {}).get("terms",{})
     if not terms or not any(t.get("P") for t in terms.values()): return {}
@@ -403,7 +414,16 @@ def _context_axis_eval(lineage_label, ca, fon, lf, pin, gidx_U, lean_ratio=1.15,
         top=present[0]["score"] if present else 0.0
         second=present[1]["score"] if len(present)>1 else 0.0
         dom=None; conf=None
-        if top>0 and top>=lean_ratio*max(second,1e-9):
+        # ★ MEASURABILITY + POSITIVE-EVIDENCE gate (fixes assignment-by-exclusion, e.g. kidney mTAL):
+        #   assign a pole ONLY if (a) the winner has >=1 of its OWN on-panel context markers ON
+        #   (on_context_markers non-empty, not just a faint sub-threshold sum), AND (b) EVERY pole of the
+        #   axis is measurable on this panel (n_onpanel>0). If ANY pole's context markers are entirely
+        #   off-panel (mTAL medulla: Cldn10/Ptgs2 off-panel) the axis cannot discriminate the zones -> the
+        #   winner would lead only because a competitor is silent = assignment by exclusion -> withhold the
+        #   pole so the leaf floors to its lineage class. (Conservative for a >2-pole axis with an off-panel
+        #   middle pole: the whole axis is withheld -> honest parent-class floor, never a forced zone.)
+        all_measurable = all(p["n_onpanel"]>0 for p in poles)
+        if top>0 and top>=lean_ratio*max(second,1e-9) and present[0]["on_context_markers"] and all_measurable:
             dom=present[0]; conf=("medium" if top>=1.5*max(second,1e-9) else "low")
         # ★ mixed = the second pole is *substantially* present (>=0.4x) -> for a large parent, subcluster to
         #   separate both poles so the minority pole is not buried. A leaf can have a dominant_pole and still be

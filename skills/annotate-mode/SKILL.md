@@ -507,12 +507,23 @@ mechanically** (poles scored graded — weak zonal signal counts; a lean ≥1.15
 - **`mixed==true`** (both poles ≥0.4× each) AND a large top-level parent (n≳1500, no ".") → **split**
   (`needs_subclustering`, reason `context_axis`) — labeling the whole parent by its lean buries the minority
   pole. `check` enforces this (`CONTEXT_AXIS_SPLIT`).
-- **else `dominant_pole` set** → label `suggested_subtype` directly (`reason_code="context_axis"`,
-  `confidence=pole_confidence` — **low for a weak lean is still preferred over the bare class** on this
-  bounded same-lineage axis). Use the engine's pole; do NOT re-judge from the subtype's (off-panel)
-  intrinsic markers, do NOT downgrade a weak lean to class.
-- **no pole present** → stop at the lineage class. Context can NEVER change the lineage (a `Glul⁺`
-  hepatocyte is a pericentral *hepatocyte*, never "pericentral LSEC").
+- **`dominant_pole` set** (the engine passed its POSITIVE-EVIDENCE gate: the winning pole has ≥1 of its OWN
+  on-panel context markers ON **and** every pole of the axis is measurable on this panel) → label
+  `suggested_subtype` directly (`reason_code="context_axis"`, `confidence=pole_confidence`). A weak-but-
+  *positive* lean is still preferred over the bare class on this bounded same-lineage axis; do NOT re-judge
+  from the subtype's off-panel intrinsic markers. **Use ONLY the engine's `context_axis` poles — do NOT
+  substitute other neighbour markers or spatial-neighbour composition the axis does not declare** (that is
+  how a leaf gets force-called to a pole whose own markers are off-panel). **NOTE — own vs neighbor:**
+  context_markers are the dominant *neighbour's* genes read as ambient; when they are the cell's OWN zonal
+  genes (hepatocyte `Glul`/`Cyp2f2`) the pole is strong, but when only a neighbour's genes are borrowed via
+  KDE blur (a periportal LSEC via hepatocyte markers) keep `confidence=low` and SPLIT a large parent rather
+  than blanket-labelling it.
+- **`dominant_pole` NOT set** — either no pole is present, OR the engine withheld the pole because a pole's
+  context markers are entirely off-panel (the axis cannot discriminate the zones) or the winner had no
+  positive on-panel marker (*assignment by exclusion*) → **floor to the lineage class.** (kidney cortico-
+  medullary: mTAL's own `Cldn10`/`Ptgs2` off-panel → 'medulla' cannot be positively confirmed → label
+  *thick ascending limb cell*, not mTAL, even when the cortex markers are also low.) Context can NEVER
+  change the lineage (a `Glul⁺` hepatocyte is a pericentral *hepatocyte*, never "pericentral LSEC").
 
 ### Step 2c — STATE-AXIS is NOT decided in standard annotation (interactive only)  [engine: `state_axis`, slim-index `sa`]
 Some biology is a **cross-cutting cell PROGRAM**, not a cell type — proliferating, interferon-stimulated,
@@ -859,16 +870,73 @@ term — neuropil / fiber tract / … — as a celltype decision; this version d
 ### 10.2 `{out}/expert_judgment_round{k}.csv`
 `cluster_path,n_cells,decision,label,term_id,subclass_resolved,confidence,reason_code,key_markers,rationale`.
 
-### 10.3 Final layout after `finalize`
+### 10.3 `{out}/celltype_markers.yaml` — write this yourself at finalize
+
+The machine-readable marker panel downstream mapping consumes (`key_markers` in the CSV is only a 3–5 gene
+summary of a decision — too thin to build a centroid from). It is a **tree**, not a flat list: every label you
+emitted plus **its ancestors**, nested by `children`.
+
+```yaml
+endothelial cell:
+  required: [Kdr]
+  supporting: [Egfl7, Emcn, Vwf]
+  children:
+    arterial endothelial cell:
+      defining: [Dkk2, Sema3g, Efnb2, Gja5]
+      supporting: [Cxcl12]
+    glomerular endothelial cell:
+      defining: [Ehd3]
+      supporting: [Kdr, Icam2, Emcn, Podxl]
+epithelial cell:
+  defining: [Epcam]
+  children:
+    collecting duct epithelial cell:        # ancestor only — you never called a cluster this
+      children:
+        collecting duct principal cell:
+          defining: [Aqp2]
+          required: [Avpr2]
+          supporting: [Scnn1g, Aqp4]
+```
+
+**Why a tree.** A celltype's full marker set is *the union along the path from the root down to its node*. The
+KG puts a marker on the parent when ALL of that parent's children share it, and on the children when only some
+do — so the path carries what a flat file would have to duplicate. Written flat, `Epcam` alone would land in 18
+of the 27 mouse-kidney entries and stop discriminating anything. The tree says it once, in the right place.
+
+**Hard rules.**
+1. **Dataset genes only.** Every gene must be `panel=true` in `ontology_gene_table` — actually measured in this
+   dataset. Off-panel KG markers are dropped here (they are still fine to *reason* about under R3
+   panel-blindness, but they cannot go in this file).
+2. **Transcribe each node's KG tiers verbatim** (`DF`/`R`/`S`) — do not compare against the ancestors and do
+   not subtract. A gene may legitimately sit on BOTH a parent and a child (`Prox1` is on
+   `dentate gyrus glutamatergic neuron` and on `dentate gyrus granule cell`): the parent carries it as the
+   lineage-level marker, the child as its own identity marker. Subtracting it empties the child of the very
+   gene that defines it, and consumers union along the path anyway, so a repeat costs nothing. Within ONE node
+   a gene appears in one tier only — strongest wins (DF > R > S).
+3. Never list a gene that is a NEGATIVE marker of that node or of any of its ancestors.
+4. **Omit empty tiers and empty nodes' bodies** — a node that contributes no on-panel marker is written with
+   `children:` alone. Do not pad with `[]`, do not substitute markers you did not have.
+5. Labels `Unknown` / `Background` get no node.
+6. One node per label, not per cluster — many clusters can share a label (25 did for
+   `distal convoluted tubule cell` in the mouse kidney run); they resolve to one term, so one node.
+7. **Ancestors only, not siblings.** Include a parent because one of your labels descends from it — never add
+   the parent's other children that this dataset did not show.
+
+### 10.4 Final layout after `finalize`
 Helper writes `{input}_annotated.h5ad` (input copy + `obs['cellman_annotation']`), packs every other artifact
 into `annotation_artifacts.tar.gz`, and leaves `annotation_out/` with exactly: the annotated h5ad,
-`expert_judgment_annotation.csv` (loose), and the tarball. `finalize` also writes `annotation_rationale.md`
+`expert_judgment_annotation.csv` (loose), `celltype_markers.yaml` (loose, §10.3), and the tarball. `finalize` also writes `annotation_rationale.md`
 (English, one paragraph per leaf: the rule path that fired, the markers ON, competing terms rejected, and the
 chosen term's grounding PMIDs from `GM`).
 
 ---
 
 ## 11. Self-check — run BEFORE writing each decision (helper validates the same)
+0. **At `finalize` only:** `celltype_markers.yaml` (§10.3) exists and is a TREE. Verify by ENUMERATION, not by
+   impression: take the set of labels you actually emitted, add every ancestor of each, and check that set is
+   EXACTLY the set of node names in the file — no label missing (a called label with no node makes it invisible
+   to the mapper), no sibling you never called. Then per node: tiers copied from the KG verbatim, every gene
+   `panel=true`, no negative marker of that node or any ancestor, no `[]` padding, tiers not invented.
 1. Every gene in `key_markers` appears in this leaf's `up ∪ hp ∪ parent_ctx ∪ ontology_gene_table(present)`.
 2. `celltype` ⇒ `term_id` exists in `_ontology_index.json`; `label` == that term's `L` (never invent).
 3. You did NOT deny a clear absolute identity because `up`/`sibling_contrast` was flat (R1 backbone survives

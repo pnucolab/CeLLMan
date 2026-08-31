@@ -1853,11 +1853,13 @@ def _profile_leaves(X, genes, leaf_arr, leaves, ont_gene_set, ont_protected,
     hk2=_data_driven_hk(mean_in_mat, max_auc, genes_arr)
     hk=(hk1|hk2)-(ont_protected or set())
     hk_mask=np.array([g in hk for g in genes_arr])
-    # ontology gene index
-    panel=set(genes_arr.tolist())
-    ont_on=sorted(g for g in (ont_gene_set or set()) if g in panel)
-    ont_off=sorted(g for g in (ont_gene_set or set()) if g not in panel)
-    ont_on_idx=np.array([np.where(genes_arr==g)[0][0] for g in ont_on], dtype=np.int64) if ont_on else np.array([],dtype=np.int64)
+    # ontology gene index (case-insensitive panel matching — SKILL contract "gene matching is
+    # case-insensitive throughout"; mirrors the .upper() normalization at :180/:1774/:1836)
+    gidx_U={str(g).upper():i for i,g in enumerate(genes_arr.tolist())}
+    panelU=set(gidx_U)
+    ont_on=sorted(g for g in (ont_gene_set or set()) if str(g).upper() in panelU)
+    ont_off=sorted(g for g in (ont_gene_set or set()) if str(g).upper() not in panelU)
+    ont_on_idx=np.array([gidx_U[str(g).upper()] for g in ont_on], dtype=np.int64) if ont_on else np.array([],dtype=np.int64)
 
     # absolute identity (global reference) precomputed: the global high threshold THR = gmu+gsd, and per leaf
     # frac_on = (M@HI)/n_in.
@@ -1915,7 +1917,7 @@ def _profile_leaves(X, genes, leaf_arr, leaves, ont_gene_set, ont_protected,
             best=max(nonhk_order, key=lambda i: auc[i])
             if auc[best]>=auc_up:
                 sp_peak=[genes_arr[best],round(float(auc[best]),3),round(float(mi[best]),3),round(float(mo[best]),3)]
-        lin_present=[g for g in ont_on if (ogt[g]["mean"] is not None) and pin[np.where(genes_arr==g)[0][0]]>=0.4
+        lin_present=[g for g in ont_on if (ogt[g]["mean"] is not None) and pin[gidx_U[str(g).upper()]]>=0.4
                      and g.upper() not in PAN]
         # housekeeping_share + cross_lineage
         cross={"multi_lineage":multi,"n_in":ni,"specific_id_rescue":has_spec}

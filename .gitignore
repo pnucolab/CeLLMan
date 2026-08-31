@@ -6,7 +6,9 @@ __pycache__/
 
 # backups
 *.bak
+*.bak_*
 *.orig
+*.pre_revert_*
 *_BACKUP_*.tar.gz
 
 # meson / C extension build artifacts

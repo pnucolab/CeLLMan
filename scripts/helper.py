@@ -22,6 +22,7 @@ import numpy as np
 import anndata as ad
 from scipy.stats import rankdata
 from scipy.sparse import csr_matrix
+import scipy.sparse as _spx
 
 # ===================================================================== ontology
 # The single Cell-Ontology server we publish (public, read-only). Users normally need to pass nothing
@@ -31,6 +32,17 @@ from scipy.sparse import csr_matrix
 DEFAULT_ONTOLOGY_SERVER = "https://cellman.pnucolab.com"
 def _resolve_server(server_url=None):
     return (server_url or os.environ.get("CELLONTO_SERVER_URL") or DEFAULT_ONTOLOGY_SERVER).rstrip("/")
+
+def _wing_of(tid):
+    """The wing a term id belongs to: 'MOUSE_SKIN:0000001' -> 'MOUSE_SKIN', 'MOUSE_COMMON:...' -> 'MOUSE_COMMON'.
+    Term ids are globally unique and wing-prefixed, so this is exact (no heuristics)."""
+    t=str(tid); i=t.find(":")
+    return t[:i] if i>0 else ""
+
+def _organ_wings(terms):
+    """The ORGAN wings present in an index (the common wing is not an organ). >=2 means this index is a MERGE."""
+    return {w for w in (_wing_of(t) for t in (terms or {})) if w and not w.endswith("_COMMON")}
+
 
 def _dedup_parents(idx):
     """Guard against a KG build defect: a term's P (parent list) can contain the same
@@ -59,6 +71,239 @@ def _served_organs(url, species):
         return []
 
 
+# ===================================================================== module discovery (LLM-facing)
+# The caller — and the agent, re-validating — needs the canonical (species, organ) vocabulary BEFORE
+# `init`, and needs a free-text tissue turned into that vocabulary. Both used to be done by hand: the
+# SKILL said "GET {server}/modules" without saying how, so the LLM improvised a curl and then did the
+# lowercasing / synonym / parent-vs-umbrella judgement from prose rules. Two consequences: the caller
+# and the agent could disagree, and the LLM's server address was decided independently of the engine's.
+# Both are fixed here — the rules are code, and every answer carries the `server_url` it was resolved
+# against so the agent can hand that exact address to `init --server-url`.
+#
+# NOTE ON THE ALIAS TABLES — these are the CLIENT-side stopgap. The canonical home for organ aliases is
+# the KG server (api/server.py::_ORGAN_ALIAS already holds the legacy whole_brain->brain rename). When
+# /modules starts publishing `synonyms` / `parent` / `children` per wing, DELETE these tables and read
+# the server's instead. Until then a stale entry is harmless: every proposal is intersected with what
+# /modules ACTUALLY serves, so this can never name a module that does not exist.
+
+_SPECIES_ALIAS = {
+    "mus_musculus": "mouse", "mus": "mouse", "mmu": "mouse", "murine": "mouse", "m_musculus": "mouse",
+    "homo_sapiens": "human", "hsa": "human", "hs": "human", "h_sapiens": "human", "hsapiens": "human",
+    "rattus_norvegicus": "rat", "rno": "rat", "r_norvegicus": "rat",
+}
+
+# free text -> ONE served organ under a different name
+_ORGAN_SYNONYM = {
+    "mammary_gland": "breast", "mammary": "breast",
+    "colon": "large_intestine", "large_bowel": "large_intestine",
+    "small_bowel": "small_intestine",
+    "whole_brain": "brain",                       # legacy wing name (server keeps the same alias)
+    "marrow": "bone_marrow",
+    "fat": "adipose_tissue", "adipose": "adipose_tissue",
+    "windpipe": "trachea",
+    "renal": "kidney",
+    "hepatic": "liver",
+    "pulmonary": "lung", "lungs": "lung",
+    "cardiac": "heart",
+    "cutaneous": "skin",
+    "skeletal_muscle": "muscle",
+    "pbmc": "blood", "peripheral_blood": "blood", "whole_blood": "blood",
+    "womb": "uterus",
+    "urinary_bladder": "bladder",
+    "oral_cavity": "mouth", "buccal": "mouth",
+}
+
+# free text is a PART of a served organ (finer than the KG -> confirm the parent is acceptable)
+_ORGAN_PARENT = {
+    "cerebellum": "brain", "hippocampus": "brain", "neocortex": "brain", "cerebral_cortex": "brain",
+    "midbrain": "brain", "forebrain": "brain", "hindbrain": "brain", "hypothalamus": "brain",
+    "thalamus": "brain", "striatum": "brain", "amygdala": "brain", "olfactory_bulb": "brain",
+    "dentate_gyrus": "brain", "cerebrum": "brain", "pons": "brain", "medulla_oblongata": "brain",
+    "brainstem": "brain", "brain_stem": "brain", "substantia_nigra": "brain", "corpus_callosum": "brain",
+    "white_adipose_tissue": "adipose_tissue", "brown_adipose_tissue": "adipose_tissue",
+    "wat": "adipose_tissue", "bat": "adipose_tissue",
+    "visceral_adipose_tissue": "adipose_tissue", "subcutaneous_adipose_tissue": "adipose_tissue",
+    "epididymal_fat": "adipose_tissue", "gonadal_fat": "adipose_tissue",
+    "duodenum": "small_intestine", "jejunum": "small_intestine", "ileum": "small_intestine",
+    "cecum": "large_intestine", "caecum": "large_intestine", "rectum": "large_intestine",
+    "sigmoid_colon": "large_intestine", "proximal_colon": "large_intestine",
+    "distal_colon": "large_intestine",
+    "alveolus": "lung", "alveoli": "lung", "bronchus": "lung", "bronchi": "lung", "airway": "lung",
+    "glomerulus": "kidney", "nephron": "kidney", "renal_cortex": "kidney", "renal_medulla": "kidney",
+    "renal_papilla": "kidney",
+    "epidermis": "skin", "dermis": "skin", "hair_follicle": "skin",
+    "retina": "eye", "cornea": "eye", "lens": "eye", "iris": "eye", "choroid": "eye", "sclera": "eye",
+    "cochlea": "ear", "inner_ear": "ear", "middle_ear": "ear", "outer_ear": "ear",
+    "atrium": "heart", "left_ventricle": "heart", "right_ventricle": "heart", "myocardium": "heart",
+    "islet": "pancreas", "islets_of_langerhans": "pancreas", "pancreatic_islet": "pancreas",
+    "endometrium": "uterus", "myometrium": "uterus", "decidua": "uterus",
+    "dorsal_root_ganglion": "peripheral_nervous_system", "drg": "peripheral_nervous_system",
+    "sciatic_nerve": "peripheral_nervous_system",
+    "enteric_nervous_system": "peripheral_nervous_system",
+    "aorta": "vasculature", "artery": "vasculature", "vein": "vasculature", "capillary": "vasculature",
+    "gingiva": "mouth",
+}
+
+# free text is an UMBRELLA the KG split into several modules — they CAN be served together
+_ORGAN_UMBRELLA = {
+    "intestine": ["small_intestine", "large_intestine"],
+    "bowel": ["small_intestine", "large_intestine"],
+    "cns": ["brain", "spinal_cord"],
+    "central_nervous_system": ["brain", "spinal_cord"],
+    "nervous_system": ["brain", "spinal_cord", "peripheral_nervous_system"],
+    "immune": ["blood", "bone_marrow", "lymph_node", "spleen", "thymus"],
+    "immune_system": ["blood", "bone_marrow", "lymph_node", "spleen", "thymus"],
+    "lymphoid_tissue": ["lymph_node", "spleen", "thymus", "tonsil"],
+    "digestive_tract": ["stomach", "small_intestine", "large_intestine"],
+    "gastrointestinal_tract": ["stomach", "small_intestine", "large_intestine"],
+    "gi_tract": ["stomach", "small_intestine", "large_intestine"],
+}
+
+# the word means DIFFERENT organs depending on intent — the user must pick ONE
+_ORGAN_AMBIGUOUS = {
+    "gut": ["small_intestine", "large_intestine"],
+    "throat": ["trachea", "tonsil", "mouth"],
+    "gonad": ["ovary", "testis"],
+    "cortex": ["brain", "kidney"],
+    "medulla": ["brain", "kidney"],
+    "ventricle": ["heart", "brain"],
+    "white_matter": ["brain", "spinal_cord"],
+    "grey_matter": ["brain", "spinal_cord"],
+    "gray_matter": ["brain", "spinal_cord"],
+    "neural": ["brain", "spinal_cord", "peripheral_nervous_system"],
+    "neuronal": ["brain", "spinal_cord", "peripheral_nervous_system"],
+}
+
+_TISSUE_NOISE = ("tissue", "sample", "section", "slide", "biopsy", "specimen", "organ", "data",
+                 "dataset", "whole", "adult", "normal", "healthy")
+
+def _norm_key(s):
+    """Free text -> comparison key: lowercase, articles dropped, separators unified to '_'."""
+    s = str(s or "").strip().lower()
+    s = re.sub(r"^(the|a|an)\s+", "", s)
+    s = re.sub(r"[\s\-/,\.]+", "_", s)
+    s = re.sub(r"[^a-z0-9_]", "", s)
+    return re.sub(r"_+", "_", s).strip("_")
+
+def _norm_variants(s):
+    """The key plus the forms worth trying: noise words stripped ('brain tissue' -> 'brain'), and the
+    plural dropped. Order matters — the first hit wins, and the full string is always tried first so a
+    real module name that CONTAINS a noise word (adipose_tissue, connective_tissue) is never mangled."""
+    k = _norm_key(s)
+    out = [k]
+    toks = [t for t in k.split("_") if t]
+    lean = [t for t in toks if t not in _TISSUE_NOISE]
+    if lean and lean != toks:
+        out.append("_".join(lean))
+    for v in list(out):
+        if len(v) > 3 and v.endswith("s") and not v.endswith("ss"):
+            out.append(v[:-1])
+    seen = set(); return [v for v in out if v and not (v in seen or seen.add(v))]
+
+def _fetch_modules(server_url=None, timeout=30):
+    """GET {server}/modules -> (base_url, wings). Fails loudly: an unreachable ontology server must stop
+    the run before `init`, not after it."""
+    import urllib.request, urllib.error
+    base = _resolve_server(server_url)
+    try:
+        with urllib.request.urlopen(f"{base}/modules", timeout=timeout) as r:
+            data = json.loads(r.read().decode())
+    except urllib.error.HTTPError as e:
+        sys.exit(f"[modules][ERROR:SERVER_HTTP_{e.code}] {base}/modules returned HTTP {e.code}. "
+                 f"-> the caller should tell the user the ontology server is not answering.")
+    except urllib.error.URLError as e:
+        sys.exit(f"[modules][ERROR:SERVER_UNREACHABLE] cannot reach the ontology server ({base}; {e.reason}). "
+                 f"Check that the server is running and verify CELLONTO_SERVER_URL / --server-url.")
+    except Exception as e:
+        sys.exit(f"[modules][ERROR:SERVER_BAD_RESPONSE] {base}/modules did not return usable JSON ({e}).")
+    return base, (data.get("wings") or [])
+
+def _resolve_module(species, tissue, server_url=None, wings=None):
+    """Free-text (species, tissue) -> the module vocabulary the KG actually serves.
+
+    Returns a decision-ready record; it NEVER decides for the user. `status='exact'` means proceed
+    silently (an exact module name is never second-guessed); `status='candidates'` means the CALLER
+    must ask the user — `match_type` says which of the four cases it is, so the caller knows WHICH question
+    to put; `can_serve_together` says whether
+    'use all of them' is a valid answer; `status='none'` means the KG has nothing plausible and
+    annotation must not start."""
+    base = _resolve_server(server_url)
+    if wings is None:
+        base, wings = _fetch_modules(server_url)
+    sp_in = species
+    sp = _norm_key(species)
+    sp = _SPECIES_ALIAS.get(sp, sp)
+    served_species = sorted({str(w.get("species")) for w in wings if w.get("species")})
+    n_of = {(str(w.get("species")), str(w.get("organ"))): int(w.get("n_terms") or 0) for w in wings}
+    served = sorted(o for (s, o) in n_of if s == sp)
+    rec = {"server_url": base, "species_input": sp_in, "species": sp,
+           "species_served": bool(served), "tissue_input": tissue,
+           "normalized": _norm_key(tissue), "served_organs": served}
+    if not served:
+        rec.update({"status": "none", "candidates": [], "can_serve_together": False,
+                    "reason": "species_not_served", "served_species": served_species})
+        return rec
+
+    served_set = set(served)
+    for key in _norm_variants(tissue):
+        if key in served_set:                                   # an exact module name is never questioned
+            rec.update({"status": "exact", "organ": key, "n_terms": n_of[(sp, key)],
+                        "candidates": [], "can_serve_together": False})
+            return rec
+    for key in _norm_variants(tissue):
+        for table, mtype, together in ((_ORGAN_SYNONYM, "synonym", False),
+                                       (_ORGAN_PARENT, "parent_of_subtype", False),
+                                       (_ORGAN_UMBRELLA, "umbrella_children", True),
+                                       (_ORGAN_AMBIGUOUS, "ambiguous", False)):
+            if key not in table: continue
+            tgt = table[key]
+            organs = [tgt] if isinstance(tgt, str) else list(tgt)
+            cands = [{"organ": o, "n_terms": n_of[(sp, o)], "match_type": mtype} for o in organs if o in served_set]
+            if cands:
+                rec.update({"status": "candidates", "candidates": cands,
+                            "can_serve_together": bool(together and len(cands) > 1)})
+                return rec
+    # last resort: a served module name appearing as a whole token of the input ("left kidney",
+    # "mouse brain section"). Token-level only — a substring match would map 'ear' onto 'heart'.
+    toks = set(_norm_key(tissue).split("_"))
+    hits = [o for o in served if set(o.split("_")) <= toks]
+    if hits:
+        hits.sort(key=lambda o: -len(o.split("_")))
+        rec.update({"status": "candidates", "can_serve_together": False,
+                    "candidates": [{"organ": o, "n_terms": n_of[(sp, o)], "match_type": "token"} for o in hits[:4]]})
+        return rec
+    rec.update({"status": "none", "candidates": [], "can_serve_together": False,
+                "reason": "no_plausible_module"})
+    return rec
+
+def cmd_modules(a):
+    """The canonical (species, organ) list the KG actually serves. Read-only, no --out, no h5ad:
+    this is what the caller runs BEFORE anything else."""
+    base, wings = _fetch_modules(a.server_url)
+    if a.species:
+        sp = _SPECIES_ALIAS.get(_norm_key(a.species), _norm_key(a.species))
+        wings = [w for w in wings if str(w.get("species")) == sp]
+    wings = sorted(wings, key=lambda w: (str(w.get("species")), str(w.get("organ"))))
+    print(json.dumps({"server_url": base, "count": len(wings),
+                      "species": sorted({str(w.get("species")) for w in wings}),
+                      "wings": [{"species": w.get("species"), "organ": w.get("organ"),
+                                 "n_terms": w.get("n_terms"), "last_updated": w.get("last_updated")}
+                                for w in wings]}, indent=1))
+
+def cmd_resolve_module(a):
+    """Free-text tissue -> canonical module(s). The JSON tells the caller whether to proceed silently
+    (status=exact), to ASK the user (status=candidates + why + can_serve_together), or to stop
+    (status=none). The judgement of WHAT to recommend stays with the caller; this only supplies the
+    ground truth it was previously deriving by hand."""
+    tissue = a.tissue; species = a.species
+    if not species and tissue and "," in tissue:                # accept the SKILL's "mouse, brain" form
+        head, _, rest = tissue.partition(",")
+        if rest.strip(): species, tissue = head.strip(), rest.strip()
+    if not species:
+        sys.exit("[resolve-module] --species is required (or pass --tissue 'mouse, brain').")
+    print(json.dumps(_resolve_module(species, tissue, a.server_url), indent=1))
+
+
 def _merge_slim_indexes(idxs, organs):
     """Union of several wings' slim-indexes into ONE index (multi-module serving).
 
@@ -72,13 +317,26 @@ def _merge_slim_indexes(idxs, organs):
         sys.exit(f"[init][ERROR:MODULE_SPECIES_MISMATCH] the merged modules disagree on species ({sorted(species)}). "
                  f"All --organ entries must belong to ONE species.")
     merged = {"species": next(iter(species), None), "organ": "+".join(organs), "terms": {}}
-    dup = 0
+    dup = 0; diverged = []
+    # ★ PRIMARY WING FIRST. `organs` is in the order the caller asked for, and organs[0] is the module the run
+    #   is actually about; its version of a shared common term wins. This matters because the SAME common term
+    #   can carry a DIFFERENT parent in each wing (measured: 6 of 41 shared common terms in human
+    #   lung+lymph_node — 'T cell' hangs under a LUNG node in the lung wing and under the common leukocyte in
+    #   the lymph-node wing). root / region_of / restrict_root all read P[0], so whichever wing wins decides
+    #   the hierarchy the descent uses — that must be the primary module, never an accident of fetch order.
     for idx in idxs:
         for tid, t in (idx.get("terms") or {}).items():
             if tid in merged["terms"]:
                 dup += 1
+                if (merged["terms"][tid].get("P") or []) != (t.get("P") or []):
+                    diverged.append(merged["terms"][tid].get("L", tid))
                 continue
             merged["terms"][tid] = t
+    # ★ exact per-wing membership. The common wing is curated PER WING (measured: mouse skin carries 31
+    #   common terms, mouse muscle 35, only 11 shared), so "a common term belongs to every wing" is false and
+    #   would still inflate the degree of a gene that a SECOND wing's extra common terms happen to list.
+    #   Recording what each wing actually served makes the per-wing degree exact.
+    merged["wings"] = {o: sorted((i.get("terms") or {}).keys()) for o, i in zip(organs, idxs)}
     for key in ("cp", "oq", "ca", "sa"):
         seen, out_l = set(), []
         for idx in idxs:
@@ -91,7 +349,13 @@ def _merge_slim_indexes(idxs, organs):
     merged["n_terms"] = len(merged["terms"])
     merged["version"] = max((i.get("version") or "") for i in idxs) or None
     print(f"[ontology] merged {len(idxs)} modules ({', '.join(organs)}) -> {merged['n_terms']} terms "
-          f"({dup} shared common-lineage terms de-duplicated)", flush=True)
+          f"({dup} shared common-lineage terms de-duplicated; primary wing '{organs[0]}' wins)", flush=True)
+    if diverged:
+        print(f"[ontology][note] {len(diverged)} shared term(s) are attached to a DIFFERENT parent in the "
+              f"secondary wing(s); the primary wing's hierarchy is kept: {sorted(set(diverged))[:6]}"
+              f"{'…' if len(set(diverged))>6 else ''}", flush=True)
+    print(f"[ontology] marker degree (share/region_share) is computed PER WING and minimised, so a marker that "
+          f"is exclusive inside one organ keeps its discriminative power in the merge", flush=True)
     return merged
 
 
@@ -327,6 +591,472 @@ def _sibling_groups(idx):
 _PROC_TIERS={"process","compartment"}
 
 
+# ===================================================================== reference restriction (annotate-reference-mode)
+# ★ REFERENCE MODE — the user supplies an answer-key (a set of expected cell types) and the annotator may
+#   label ONLY within it; anything the reference cannot explain becomes Unknown (never a force-fit, and never
+#   an out-of-reference "honest class floor").
+#
+#   THE DESIGN RULE — restrict the CANDIDATES, never the GRAPH:
+#     GRAPH      = the full wing index. share / region_share / pan_disc, lineage roots, path_to_root,
+#                  region_of and restrict_root all keep using EVERY term. Untouched.
+#     ASSIGNABLE = the terms that may become a LABEL.
+#   Pruning the index instead (the obvious implementation, and what the retired ref_prep.py did) silently
+#   rescales every degree-based threshold the engine depends on: with a small reference set no gene reaches
+#   pan_n=12 (PAN empties) and region_share collapses toward 1, so R2/R3 stop discriminating and force-fit
+#   INSIDE the reference set becomes EASIER — the opposite of what the mode is for. Ancestors therefore stay
+#   in the graph (the lineage/region machinery needs them) but are not assignable unless the user listed them.
+#
+#   strict (default) : ASSIGNABLE = the matched reference terms themselves.
+#   refine           : ASSIGNABLE = those terms ∪ their KG descendants (label finer than the answer-key).
+#   The chosen set is stored in the index as idx["reference"], so EVERY consumer that loads
+#   _ontology_index.json (profiling, validate, the finalize review, later rounds) inherits it for free.
+def _norm_label(s):
+    return re.sub(r"[^a-z0-9]+", " ", str(s or "").strip().lower()).strip()
+
+def _resolve_reference(idx, ref_items, alias=None):
+    """reference labels/term_ids -> term_ids. Match order: exact term_id > normalized label > alias map.
+    Returns (matched_tids set, mapping{item:tid|None}, unmatched[item])."""
+    terms=(idx or {}).get("terms",{})
+    by_norm={}
+    for tid,t in terms.items(): by_norm.setdefault(_norm_label(t.get("L","")), tid)   # first occurrence wins
+    al={_norm_label(k):v for k,v in (alias or {}).items()}
+    matched=set(); mapping={}; unmatched=[]
+    for it in ref_items:
+        tid=None
+        if it in terms: tid=it
+        elif _norm_label(it) in by_norm: tid=by_norm[_norm_label(it)]
+        elif _norm_label(it) in al:
+            av=al[_norm_label(it)]; tid=av if av in terms else by_norm.get(_norm_label(av))
+        mapping[it]=tid
+        (matched.add(tid) if tid else unmatched.append(it))
+    return matched, mapping, unmatched
+
+def _reference_assignable(idx, anchors, scope="strict"):
+    """ASSIGNABLE term set. strict = the anchors themselves; refine = anchors + all their KG descendants."""
+    anchors=set(anchors)
+    if scope!="refine": return set(anchors)
+    terms=(idx or {}).get("terms",{}); ch={}
+    for tid,t in terms.items():
+        for p in dict.fromkeys(t.get("P") or []):
+            if p in terms and p!=tid: ch.setdefault(p,[]).append(tid)
+    out=set(anchors); stack=list(anchors)
+    while stack:
+        x=stack.pop()
+        for c in ch.get(x,()):
+            if c not in out: out.add(c); stack.append(c)
+    return out
+
+def _load_reference_items(ref_path=None, ref_h5ad=None, ref_col=None):
+    """The answer-key as a list of label strings (or term_ids).
+    Source: a .json/.csv/.tsv list file, OR an already-annotated reference h5ad's obs column (the reference's
+    EXPRESSION is never read — the reference supplies the TERM SET only, markers always come from the KG)."""
+    items=[]
+    if ref_h5ad:
+        if not os.path.exists(ref_h5ad): sys.exit(f"[init][ERROR:REFERENCE] --reference-h5ad not found: {ref_h5ad}")
+        if not ref_col: sys.exit("[init][ERROR:REFERENCE] --reference-h5ad requires --reference-col (the annotation column).")
+        rad=ad.read_h5ad(ref_h5ad, backed="r")
+        if ref_col not in rad.obs: sys.exit(f"[init][ERROR:REFERENCE] column '{ref_col}' not in the reference h5ad obs. Available: {list(rad.obs.columns)}")
+        items=[str(x) for x in rad.obs[ref_col].astype(str).unique().tolist()]
+    elif ref_path:
+        if not os.path.exists(ref_path): sys.exit(f"[init][ERROR:REFERENCE] --reference not found: {ref_path}")
+        if ref_path.lower().endswith(".json"):
+            raw=json.load(open(ref_path))
+            if isinstance(raw, dict): raw=raw.get("reference") or raw.get("labels") or raw.get("celltypes") or []
+            items=[str(x) for x in raw]
+        else:
+            sep="\t" if ref_path.lower().endswith((".tsv",".txt")) else ","
+            rows=[l.rstrip("\n").split(sep) for l in open(ref_path) if l.strip()]
+            if not rows: sys.exit(f"[init][ERROR:REFERENCE] the reference file is empty: {ref_path}")
+            hdr=rows[0]; ci=0
+            if ref_col and ref_col in hdr: ci=hdr.index(ref_col); rows=rows[1:]
+            elif len(hdr)==1 or (ref_col is None and not _looks_like_label(hdr[0])): rows=rows[1:]
+            items=[r[ci].strip() for r in rows if len(r)>ci and r[ci].strip()]
+    seen=set(); out=[]
+    for x in items:
+        k=str(x).strip()
+        if k and k.lower() not in seen and k.lower() not in ("nan","none",""):
+            seen.add(k.lower()); out.append(k)
+    if not out: sys.exit("[init][ERROR:REFERENCE] no labels could be extracted from the reference.")
+    return out
+
+def _looks_like_label(s):
+    return bool(re.search(r"[A-Za-z]", str(s)))
+
+# ---------------------------------------------------------------- reference NAME resolution (expression-walled)
+# ★ THE FIREWALL. Celltype judgment is KG-ONLY: the reference narrows the CANDIDATE SET and nothing else,
+#   and the reference's expression must NEVER reach the annotation. But a user's label ("Proximal tubule
+#   S1", "PT-S1", "PTS1") will rarely be the KG's exact string, and asking the user to hand-write KG names
+#   is the wrong burden. So expression is allowed for EXACTLY ONE question — *which KG celltype is this
+#   label?* — and it is walled off in this one command:
+#
+#     ref-resolve  reads the reference h5ad  ->  emits {reference_label: term_id} + the evidence
+#     init         reads ONLY that mapping   ->  the reference is a set of term_ids from here on
+#
+#   Nothing else in the pipeline ever opens the reference h5ad, so a marker measured in the reference can
+#   never become evidence for a cluster in the TARGET data. That is label matching, not label transfer.
+def _ref_marker_resolve(ref_h5ad, ref_col, idx, top_auc=0.70, max_genes=40, n_cand=5):
+    """Match each reference label to KG terms by MARKER AGREEMENT (name resolution only — see the firewall
+    note above). For each label: its vs-rest enriched genes inside the REFERENCE dataset; for each KG term:
+    how many of that term's OWN required/defining (and then supporting) markers are among them, weighted by
+    marker specificity. A term is a candidate only when >=1 of its required/defining markers is enriched —
+    the same 'own markers must fire' discipline as R3, applied to a NAME question.
+    Returns {label: {n_cells, enriched[], candidates[{term_id,label,score,req_hits[],sup_hits[],cov}]}}."""
+    rad=ad.read_h5ad(ref_h5ad)
+    if ref_col not in rad.obs:
+        sys.exit(f"[ref-resolve][ERROR] column '{ref_col}' not in the reference h5ad obs. Available: {list(rad.obs.columns)}")
+    X=rad.X; X=np.asarray(X.todense() if hasattr(X,"todense") else X).astype(np.float64)
+    # defensive normalization — this command only ever produces a NAME mapping, so the transform cannot
+    # leak into any annotation; it just makes the vs-rest ranking comparable if raw counts were handed in.
+    nz=X[X>0]
+    if nz.size and (float(np.mean(np.isclose(nz,np.round(nz))))>=0.10 or X.max()>20):
+        rs=X.sum(1,keepdims=True); X=np.log1p(X/np.maximum(rs,1e-9)*1e4)
+        print("[ref-resolve] reference X looked like counts -> normalize_total+log1p applied (for ranking only)", flush=True)
+    genes=[str(g) for g in rad.var_names]; gU={g.upper():i for i,g in enumerate(genes)}
+    lab=rad.obs[ref_col].astype(str).values
+    terms=(idx or {}).get("terms",{})
+    share={}
+    for t in terms.values():
+        for g in set((t.get("R") or [])+(t.get("S") or [])+(t.get("DF") or [])): share[g.upper()]=share.get(g.upper(),0)+1
+    R=np.asarray(rankdata(X, method="average", axis=0), dtype=np.float64)
+    out={}
+    for L in sorted(set(lab.tolist())):
+        m=(lab==L); ni=int(m.sum()); no=int((~m).sum())
+        if ni==0 or no==0: continue
+        auc=(R[m].sum(axis=0)-ni*(ni+1)/2.0)/(ni*no)
+        order=np.argsort(auc)[::-1]
+        enr=[genes[i] for i in order[:max_genes] if auc[i]>=top_auc]
+        enrU={g.upper() for g in enr}
+        cands=[]
+        for tid,t in terms.items():
+            req={g.upper() for g in (t.get("R") or [])+(t.get("DF") or [])} & set(gU)
+            sup={g.upper() for g in (t.get("S") or [])} & set(gU)
+            rh=sorted(req & enrU); sh=sorted(sup & enrU)
+            if not rh: continue                       # its OWN required/defining marker must be among the enriched
+            w=lambda g: 1.0/max(share.get(g,1),1)
+            sc=sum(2.0*w(g) for g in rh)+sum(1.0*w(g) for g in sh)
+            cands.append({"term_id":tid,"label":t.get("L",tid),"score":round(sc,3),
+                          "req_hits":rh,"sup_hits":sh[:6],
+                          "req_cov":round(len(rh)/max(len(req),1),2)})
+        cands.sort(key=lambda c:(-c["score"], -c["req_cov"]))
+        out[L]={"n_cells":ni,"enriched":enr[:15],"candidates":cands[:n_cand]}
+    return out
+
+def _anc_ids_of(terms, tid):
+    seen=set(); stack=[tid]
+    while stack:
+        x=stack.pop()
+        if x in seen or x not in terms: continue
+        seen.add(x)
+        for q in (terms.get(x,{}).get("P") or []): stack.append(q)
+    seen.discard(tid); return seen
+
+def cmd_ref_resolve(a):
+    """Resolve reference labels -> KG term_ids. EXPRESSION IS USED ONLY HERE, ONLY FOR THIS QUESTION."""
+    os.makedirs(a.out, exist_ok=True)
+    url=a.ontology_url
+    if not url and not a.ontology:
+        if not (a.species and a.organ):
+            sys.exit("[ref-resolve] --species/--organ are required (or --ontology-url / a local --ontology).")
+        organs=[o.strip() for o in str(a.organ).split(",") if o.strip()]
+        url=[f"{_resolve_server(a.server_url)}/module/{a.species}/{o}/slim-index" for o in organs]
+        if len(url)==1: url=url[0]
+    idx=_fetch_slim_index(a.out, url, a.ontology)
+    if not idx: sys.exit("[ref-resolve] FATAL: could not load the slim-index.")
+    terms=idx.get("terms",{})
+    items=_load_reference_items(a.reference, a.reference_h5ad, a.reference_col)
+    matched,mapping,unmatched=_resolve_reference(idx, items, None)     # names first (exact / normalized)
+    mk={}
+    if a.reference_h5ad and unmatched:
+        mk=_ref_marker_resolve(a.reference_h5ad, a.reference_col, idx)
+    res={}
+    for it in items:
+        tid=mapping.get(it)
+        e={"reference_label":it,
+           "name_match":({"term_id":tid,"label":terms.get(tid,{}).get("L")} if tid else None),
+           "marker_candidates":(mk.get(it,{}) or {}).get("candidates",[]),
+           "enriched_in_reference":(mk.get(it,{}) or {}).get("enriched",[]),
+           "n_cells":(mk.get(it,{}) or {}).get("n_cells")}
+        if tid: e["status"]="name_exact"
+        elif e["marker_candidates"]:
+            e["status"]="marker_proposed"
+            top=e["marker_candidates"]; e["proposed"]=top[0]["label"]
+            # ★ CONFIDENCE — deliberately hard to earn. A NAME mapping decides the whole label space, so a
+            #   wrong-but-unflagged mapping silently mislabels every cell of that type. Anything short of
+            #   overwhelming goes to the user. Observed failures this guards: 'FR_PT' -> macrophage (one
+            #   shared marker on 74 cells), 'PTS2' -> S3 (siblings sharing a marker), 'Per-SMC' -> VSMC
+            #   (the reference lumps pericyte+SMC, so only the PARENT is faithful).
+            _rel=None
+            if len(top)>=2:
+                _a,_b=top[0]["term_id"],top[1]["term_id"]
+                if _b in _anc_ids_of(terms,_a): _rel="top-2 are parent/child (a GRANULARITY choice, not a marker question)"
+                elif _a in _anc_ids_of(terms,_b): _rel="top-2 are child/parent (a GRANULARITY choice, not a marker question)"
+                elif set(terms.get(_a,{}).get("P") or []) & set(terms.get(_b,{}).get("P") or []):
+                    _rel="top-2 are SIBLINGS sharing a marker — the discriminating one may be off-panel"
+            e["relation_note"]=_rel
+            _ratio=(top[0]["score"]/top[1]["score"]) if len(top)>1 and top[1]["score"]>0 else 999.0
+            _why=[]
+            if _ratio<1.5: _why.append(f"runner-up is close ({_ratio:.2f}x)")
+            if top[0]["score"]<1.0: _why.append(f"weak evidence (score {top[0]['score']})")
+            if top[0]["req_cov"]<0.5: _why.append(f"only {int(top[0]['req_cov']*100)}% of its required/defining markers are ON")
+            if (e["n_cells"] or 0)<20: _why.append(f"only {e['n_cells']} cells carry this label")
+            if _rel: _why.append(_rel)
+            e["confident"]=not _why
+            e["confirm_because"]=_why
+        else:
+            e["status"]="unresolved"
+        res[it]=e
+    path=os.path.join(a.out,"_reference_resolution.json")
+    json.dump({"species":idx.get("species"),"organ":idx.get("organ"),
+               "note":("Expression of the reference was used ONLY to answer 'which KG celltype is this label?'. "
+                       "The only thing that leaves this step is a {reference_label: term_id} mapping; celltype "
+                       "judgment on the TARGET data is KG-only."),
+               "labels":res}, open(path,"w"), ensure_ascii=False, indent=1)
+    ne=sum(1 for e in res.values() if e["status"]=="name_exact")
+    nm=sum(1 for e in res.values() if e["status"]=="marker_proposed")
+    nu=sum(1 for e in res.values() if e["status"]=="unresolved")
+    print(f"[ref-resolve] {len(res)} reference label(s): {ne} matched by name, {nm} proposed from markers, "
+          f"{nu} unresolved -> {path}", flush=True)
+    nc=sum(1 for e in res.values() if e["status"]=="marker_proposed" and e.get("confident"))
+    print(f"[ref-resolve] of the {nm} marker-proposed, {nc} are confident and {nm-nc} NEED USER CONFIRMATION.", flush=True)
+    for it,e in res.items():
+        if e["status"]=="marker_proposed":
+            c=e["marker_candidates"][0]
+            alt=(" | next: "+e["marker_candidates"][1]["label"]) if len(e["marker_candidates"])>1 else ""
+            print(f"   '{it}' -> '{c['label']}'  (own req/def ON: {', '.join(c['req_hits'][:4])}; score {c['score']}{alt})", flush=True)
+            if not e.get("confident"):
+                print(f"       ↳ CONFIRM: {'; '.join(e['confirm_because'])}", flush=True)
+                print(f"         enriched in the reference: {', '.join(e['enriched_in_reference'][:8])}", flush=True)
+        elif e["status"]=="unresolved":
+            print(f"   '{it}' -> NO KG term in this module (its cells will fall to Unknown)", flush=True)
+    print("[ref-resolve] write the accepted mapping to an alias JSON and pass it to init via --reference-alias.", flush=True)
+
+
+# ===================================================================== module expansion (annotate-mode only)
+# ★ WHY. The run is confined to ONE confirmed module, which is right — but a tissue does not stop at the
+#   module boundary. Mouse skin carries panniculus carnosus, so a skin section contains skeletal muscle, and
+#   the mouse/skin wing has NO muscle term: measured on a real 315-plex skin vector field, cluster 3 (5,771
+#   cells) is Ttn-top at auc 0.88 yet lands lineage=None / top=None => Unknown, because `Ttn` is not in the
+#   skin index AT ALL. `skeletal muscle cell` (DF: Myh2/Ttn/Acta1/Tnnt1) exists one wing away.
+#   So: after judging, look at what the UNKNOWN leaves are expressing, find which other wing could name it,
+#   and ASK. The user decides; nothing is added silently.
+def _run_species(cur, flag, cmd):
+    """★ SAME SPECIES, ALWAYS. Expansion crosses the ORGAN boundary, never the SPECIES boundary: a mouse skin
+    run that needs muscle must take **mouse** muscle. The species is whatever the confirmed module already
+    is — the index decides, the flag can only fill a blank, and a contradicting flag is an error (a
+    cross-species merge would produce terms whose markers are the wrong organism's gene symbols)."""
+    sp=(cur or {}).get("species")
+    if sp and flag and str(flag).strip().lower()!=str(sp).strip().lower():
+        sys.exit(f"[{cmd}][ERROR:SPECIES_MISMATCH] this run's module is '{sp}' but --species '{flag}' was passed. "
+                 f"Module expansion stays within ONE species — drop the flag (the index already knows it).")
+    sp=sp or flag
+    if not sp: sys.exit(f"[{cmd}] species is unknown (the index records none) — pass --species.")
+    return sp
+
+def _module_scan_dir(out):
+    d=os.path.join(out,"_module_scan"); os.makedirs(d, exist_ok=True); return d
+
+def _fetch_wing(out, species, organ, server_url=None):
+    """Cached slim-index fetch for a candidate wing (12-26 KB each, ~0.2 s — a full sweep of a species is cheap)."""
+    f=os.path.join(_module_scan_dir(out), f"{species}__{organ}.json")
+    if not os.path.exists(f):
+        import urllib.request
+        url=f"{_resolve_server(server_url)}/module/{species}/{organ}/slim-index"
+        try:
+            with urllib.request.urlopen(url, timeout=60) as r: raw=r.read()
+        except Exception as e:
+            return None
+        open(f,"wb").write(raw)
+    try: return json.load(open(f))
+    except Exception: return None
+
+def _unknown_leaves(st, decisions, profiles):
+    """Leaves the module could not name. From the decisions when they exist, else from the profiles
+    (no identity_scores.top AND no graph_evidence anchor = the engine found nothing to anchor)."""
+    out=[]
+    for lf in st.get("leaves",[]):
+        d=(decisions or {}).get(lf)
+        if d is not None:
+            if str(d.get("label","")).strip().lower()=="unknown": out.append(lf)
+            continue
+        p=profiles.get(lf) or {}
+        if not ((p.get("identity_scores") or {}).get("top")) and not ((p.get("graph_evidence") or {}).get("anchors")):
+            out.append(lf)
+    return out
+
+def cmd_suggest_modules(a):
+    """Which OTHER KG module could name the Unknown leaves? Evidence only — the caller asks the user."""
+    import glob as _glob
+    st=_load_state(a.out)
+    cur=_load_ontology_index(a.out) or {}
+    cur_terms=cur.get("terms",{}) or {}
+    cur_tids=set(cur_terms)
+    cur_genes={g.upper() for v in cur_terms.values() for g in (v.get("R") or [])+(v.get("S") or [])+(v.get("DF") or [])}
+    species=_run_species(cur, a.species, "suggest-modules")
+    profiles={}
+    for f in sorted(_glob.glob(os.path.join(a.out,"cluster_gene_profiles_round*.json"))): profiles.update(json.load(open(f)))
+    decisions=json.load(open(a.decisions)) if (a.decisions and os.path.exists(a.decisions)) else None
+    unk=_unknown_leaves(st, decisions, profiles)
+    ncnt={}
+    for p in (st.get("cluster_paths") or []): ncnt[p]=ncnt.get(p,0)+1
+    if not unk:
+        print("[suggest-modules] no Unknown leaf — nothing to expand into.", flush=True)
+        json.dump({"unknown_leaves":[],"ranked":[]}, open(os.path.join(a.out,"_module_suggestions.json"),"w"), indent=1)
+        return
+    # panel = the genes actually measured (the init reference records them)
+    _gs=os.path.join(a.out,"_global_stats.npz")
+    panel={str(g).upper() for g in np.load(_gs, allow_pickle=True)["genes"].tolist()} if os.path.exists(_gs) else None
+    # what each Unknown leaf is actually expressing (vs-rest, from the profile — no data is re-read)
+    enr={lf:{r[0].upper():r[1] for r in ((profiles.get(lf) or {}).get("up") or []) if r[1]>=a.min_auc} for lf in unk}
+    served=[]
+    try:
+        import urllib.request
+        with urllib.request.urlopen(f"{_resolve_server(a.server_url)}/modules", timeout=30) as r:
+            served=[w["organ"] for w in json.loads(r.read().decode()).get("wings",[]) if w.get("species")==species]
+    except Exception as e:
+        sys.exit(f"[suggest-modules] could not list the served modules: {e}")
+    here={o.strip() for o in str(cur.get("organ") or "").split("+") if o.strip()}
+    wings={}
+    for o in served:
+        if o in here: continue
+        d=_fetch_wing(a.out, species, o, a.server_url)
+        if d: wings[o]=d
+    # ★ GLOBAL marker degree — how many terms in the WHOLE served KG claim this gene as their own
+    #   required/defining. This is the ranking key: a broad marker (SDC1 on 'plasma cell' in eight wings)
+    #   must never outrank a narrow one (TTN on 'skeletal muscle cell', degree 1) just because it happens to
+    #   sit on a bigger cluster. Sorting by cells instead of specificity buried the true muscle hit.
+    gdeg={}
+    for d in list(wings.values())+[cur]:
+        for v in (d.get("terms") or {}).values():
+            for g in {x.upper() for x in (v.get("R") or [])+(v.get("DF") or [])}: gdeg[g]=gdeg.get(g,0)+1
+    label_wings={}
+    for o,d in wings.items():
+        for v in (d.get("terms") or {}).values(): label_wings.setdefault(v.get("L"), set()).add(o)
+    hits_by_organ={}
+    for o,d in wings.items():
+        for tid,v in (d.get("terms") or {}).items():
+            if tid in cur_tids: continue          # ★ the current module already sees this term — no reason to expand
+            if (v.get("T") or "") in _PROC_TIERS: continue
+            rd={g.upper() for g in (v.get("R") or [])+(v.get("DF") or [])}
+            df={g.upper() for g in (v.get("DF") or [])}
+            onp=rd&panel if panel else rd         # what this panel can actually confirm
+            if not onp: continue
+            for lf,E in enr.items():
+                hh=sorted(onp & set(E))
+                if not hh: continue
+                off=[g for g in hh if g not in cur_genes]   # ★ genes the current module could not even see
+                if not off: continue
+                # ★ PANEL-BLIND relaxation (mirrors R3): normally >=2 of the term's own required/defining
+                #   must be ON, but on a targeted panel a real type may have only ONE measurable own marker
+                #   ('skeletal muscle cell' has only Ttn on a 315-plex skin panel) — then that one is allowed
+                #   if it is a DEFINING marker (curated as sufficient on its own).
+                if not (len(hh)>=2 or (len(onp)==1 and hh[0] in df)): continue
+                hits_by_organ.setdefault(o,[]).append({
+                    "cluster_path":lf,"n_cells":int(ncnt.get(lf,0)),"term":v.get("L"),"term_id":tid,
+                    "markers_on":hh,"off_index_markers":off,"n_onpanel_own":len(onp),
+                    "specificity":min(gdeg.get(g,99) for g in hh),
+                    "auc":round(max(E[g] for g in hh),3),
+                    "term_offered_by_n_wings":len(label_wings.get(v.get("L"),()))})
+    ranked=[]
+    for o,hs in hits_by_organ.items():
+        hs.sort(key=lambda h:(h["specificity"], -h["n_cells"]))
+        leaves=sorted({h["cluster_path"] for h in hs}, key=lambda x:-int(ncnt.get(x,0)))
+        ranked.append({"organ":o,"best_specificity":min(h["specificity"] for h in hs),
+                       "n_unknown_cells":sum(int(ncnt.get(l,0)) for l in leaves),
+                       "n_leaves":len(leaves),"leaves":leaves,"evidence":hs[:8]})
+    # rank by MARKER SPECIFICITY first, cells second (see the gdeg note above)
+    ranked.sort(key=lambda r:(r["best_specificity"], -r["n_unknown_cells"]))
+    tot_unk=sum(int(ncnt.get(l,0)) for l in unk)
+    res={"species":species,"current_modules":sorted(here),"scanned_modules":len(wings),
+         "unknown_leaves":[{"cluster_path":l,"n_cells":int(ncnt.get(l,0)),
+                            "top_enriched":[g for g,_ in sorted(enr[l].items(), key=lambda kv:-kv[1])[:8]]} for l in
+                           sorted(unk, key=lambda x:-int(ncnt.get(x,0)))],
+         "n_unknown_cells":tot_unk,"ranked":ranked,
+         "note":("EVIDENCE ONLY. Judge each candidate yourself, then ask the USER before adding anything: a "
+                 "marker can be shared between organs for real biological reasons (Foxn1 is thymic epithelium "
+                 "AND skin/hair follicle), so a top-ranked wing can still be wrong.")}
+    path=os.path.join(a.out,"_module_suggestions.json")
+    json.dump(res, open(path,"w"), ensure_ascii=False, indent=1)
+    print(f"[suggest-modules] {len(unk)} Unknown leaf/leaves ({tot_unk} cells); scanned {len(wings)} other "
+          f"ORGAN module(s) of the SAME species ({species}) -> {path}", flush=True)
+    for r in ranked[:a.top]:
+        print(f"  {r['organ']:22s} best-specificity={r['best_specificity']} "
+              f"{r['n_unknown_cells']:6d} Unknown cells in {r['n_leaves']} leaf/leaves", flush=True)
+        for h in r["evidence"][:3]:
+            print(f"      cl{h['cluster_path']} n={h['n_cells']}: '{h['term']}' via {', '.join(h['markers_on'])}"
+                  f" (auc {h['auc']}, claimed by {h['specificity']} term(s) KG-wide, "
+                  f"{h['n_onpanel_own']} own marker(s) on this panel)", flush=True)
+    print("[suggest-modules] EVIDENCE ONLY — judge it, then ask the user before expanding.", flush=True)
+
+
+def cmd_expand_modules(a):
+    """Add the user-APPROVED module(s) and re-profile ONLY the Unknown leaves.
+    Already-labelled leaves are FROZEN: their round-1 profiles stay authoritative, so an expansion can add
+    answers but can never rewrite calls the primary module already earned."""
+    import glob as _glob
+    st=_load_state(a.out)
+    cur=_load_ontology_index(a.out) or {}
+    species=_run_species(cur, a.species, "expand-modules")
+    here=[o.strip() for o in str(cur.get("organ") or "").split("+") if o.strip()]
+    add=[o.strip() for o in str(a.add).split(",") if o.strip() and o.strip() not in here]
+    if not add: sys.exit(f"[expand-modules] nothing to add (already serving: {here}).")
+    idxs=[cur]
+    for o in add:
+        d=_fetch_wing(a.out, species, o, a.server_url)
+        if not d: sys.exit(f"[expand-modules][ERROR] could not fetch {species}/{o}.")
+        idxs.append(d)
+    # PRIMARY FIRST: the module the run was confirmed on keeps its hierarchy; the approved wings are appended.
+    merged=_dedup_parents(_merge_slim_indexes(idxs, here+add))
+    if _ref_block(cur): merged["reference"]=cur["reference"]        # (reference mode does not use this path, but never drop it)
+    with open(os.path.join(a.out,"_ontology_index.json"),"w") as f: json.dump(merged,f,separators=(",",":"))
+    st["organs"]=here+add
+    st.setdefault("expansions",[]).append({"added":add,"round":st.get("round",1)})
+    _save_state(a.out, st)
+    profiles={}
+    for f in sorted(_glob.glob(os.path.join(a.out,"cluster_gene_profiles_round*.json"))): profiles.update(json.load(open(f)))
+    decisions=json.load(open(a.decisions)) if (a.decisions and os.path.exists(a.decisions)) else None
+    targets=[p.strip() for p in json.loads(a.paths)] if a.paths else _unknown_leaves(st, decisions, profiles)
+    targets=[t for t in targets if t in st["leaves"]]
+    if not targets: sys.exit("[expand-modules] no Unknown leaf to re-judge.")
+    adata=ad.read_h5ad(st["h5ad_path"])
+    # ★ X stays SPARSE: _profile_leaves / _absent_region_groups read it as-is, so neither the 21.3 GiB
+    #   dense copy nor the 42.6 GiB rank array it fed is ever allocated (see _leaf_stats_sparse).
+    X=adata.X if _spx.issparse(adata.X) else np.asarray(adata.X)
+    cps=np.array(st["cluster_paths"], dtype=object)
+    ogs=_ontology_gene_set(merged); prot=_ontology_protected(merged); octx=_onto_ctx(merged)
+    vf,low=_vf_setup(adata)
+    gmu=gsd=None; _g=os.path.join(a.out,"_global_stats.npz")
+    if os.path.exists(_g):
+        _z=np.load(_g, allow_pickle=True); gmu=_z["mean"]; gsd=_z["std"]     # the reference NEVER changes
+    _arp=os.path.join(a.out,"_region_presence.json")
+    absent_rg=set(json.load(open(_arp)).get("absent_region_groups",[])) if os.path.exists(_arp) else set()
+    # profiled over the FULL dataset so vs-rest (`up`) means exactly what it meant in round 1 …
+    pr=_profile_leaves(X, list(adata.var_names), cps, st["leaves"], ogs, prot, octx, vf, low,
+                       gmu=gmu, gsd=gsd, mt_terms=_mimicry_terms(merged),
+                       profile_cap=getattr(a,"profile_cap",150000), auc_pos=getattr(a,"auc_pos",0.65),
+                       absent_rg=absent_rg, adaptive_floor=bool(st.get("adaptive_floor",False)),
+                       af_F=float(st.get("af_F",3.0)), af_Nmin=int(st.get("af_Nmin",10)))
+    # … but ONLY the Unknown leaves are written into the new round, so every decided leaf keeps the profile
+    #   its call was made on and the finalize gates cannot be re-opened by the added wing.
+    st["round"]=int(st.get("round",1))+1; _save_state(a.out, st)
+    out_p={t:pr[t] for t in targets if t in pr}
+    json.dump(out_p, open(os.path.join(a.out,f"cluster_gene_profiles_round{st['round']}.json"),"w"), separators=(",",":"))
+    _write_overview(a.out, st["round"], out_p)
+    print(f"[expand-modules] added {species}/{add} -> serving {here+add} ({len(merged['terms'])} terms). "
+          f"Re-profiled {len(out_p)} Unknown leaf/leaves (round {st['round']}); all decided leaves are frozen.", flush=True)
+    for t in sorted(out_p, key=lambda x:-(out_p[x].get("n") or 0)):
+        e=out_p[t]; ge=e.get("graph_evidence") or {}; top=(e.get("identity_scores") or {}).get("top") or {}
+        anc=[x["label"] for x in (ge.get("anchors") or [])][:2]
+        print(f"    cl{t} n={e.get('n')}: lineage={ge.get('lineage')} verdict={ge.get('verdict')} "
+              f"top={top.get('label')} anchors={anc}", flush=True)
+    print("[expand-modules] re-judge these by R1-R8 and finalize. A leaf the added wing still cannot name stays Unknown.", flush=True)
+
+
+def _ref_block(idx):
+    """The reference restriction carried inside the slim-index, or None when the run is unrestricted."""
+    r=(idx or {}).get("reference")
+    return r if (r and r.get("assignable")) else None
+
+
 def _onto_ctx(idx):
     """Domain context used by profiling/validate (derived from the ontology, with fallbacks)."""
     terms_all=(idx or {}).get("terms",{})
@@ -354,6 +1084,12 @@ def _onto_ctx(idx):
             "pan_disc": _derive_pan(idx_ct, 12) or set(_PAN_FALLBACK),
             "siblings": _sibling_groups(idx_ct),
             "terms": terms,
+            # ★ ASSIGNABLE (reference mode): the terms that may become a LABEL. None = unrestricted (normal
+            #   annotate-mode). Degree statistics above are deliberately computed on the FULL term set.
+            "assignable": ({t for t in (_ref_block(idx) or {}).get("assignable",()) if t in terms}
+                           if _ref_block(idx) else None),
+            "ref_scope": ((_ref_block(idx) or {}).get("scope") or (_ref_block(idx) or {}).get("mode")) if _ref_block(idx) else None,
+            "wing_members": (idx or {}).get("wings"),   # ★ {organ: [tids]} when this index is a MERGE (per-wing degree)
             "cp": (idx or {}).get("cp") or [],   # confusion pairs from slim-index → surfaced by _graph_evidence
             "ca": (idx or {}).get("ca") or [],   # context axes (zonation/layer) → surfaced by _context_axis_eval (§4.3)
             "sa": (idx or {}).get("sa") or [],   # state axes (base-agnostic cell states) → surfaced by _state_axis_eval
@@ -560,8 +1296,10 @@ def _candidate_subtypes(terms, ogt, up_rows, octx, parent_up_auc=None, region_sh
                 onp.append(a is not None and a>=0.55)
         return (not onp) or any(onp)
     out=[]; sugg=[]
+    _ASSIGN=octx.get("assignable")                                  # ★ reference mode: propose only labelable terms
+    _ok=lambda t:(_ASSIGN is None or t in _ASSIGN)
     for tid,t in (terms or {}).items():
-        if not (t.get("R")): continue
+        if not (t.get("R")) or not _ok(tid): continue
         dms=disc_markers(tid)
         if dms and required_ok(tid):
             sugg.append({"term_id":tid,"label":t.get("L",""),"n_disc":len(dms),
@@ -574,6 +1312,7 @@ def _candidate_subtypes(terms, ogt, up_rows, octx, parent_up_auc=None, region_sh
         # only (parent inheritance excluded).
         kids=[]
         for kt in children.get(tid,[]):
+            if not _ok(kt): continue                                # ★ reference mode: a non-labelable child is not a split gain
             krec,knp,knn,kno=term_evidence(kt, inherit=False)
             if knn>=1 or knp>=2:
                 kids.append({"label":(terms.get(kt) or {}).get("L",""),"n_req_present":knp,"n_nonpan_present":knn})
@@ -679,9 +1418,39 @@ def _build_ident_maps(octx, genes, pan_n=12):
             if not ps: return x
             x=ps[0]
         return x
-    share={}                                            # marker specificity: #terms whose disc lists each gene
-    for dc in term_disc.values():
-        for g in dc: share[g]=share.get(g,0)+1
+    # ★ PER-WING marker degree (multi-module serving only). `share` measures how many terms list a gene =
+    #   how discriminative it is. Pooling that across MERGED wings silently DESTROYS discriminators: measured
+    #   on human lung+lymph_node, 28 markers lost region-exclusivity (CCL19 1->5, CCL21 2->4), i.e. the lymph
+    #   node's OWN fibroblastic-reticular identity markers stopped counting as its own. A marker that is
+    #   exclusive INSIDE an organ stays exclusive when a second organ is served alongside it, so the degree is
+    #   computed per organ wing (each wing = its own terms + the common terms, which belong to every wing) and
+    #   the MINIMUM is taken — "in the wing where this gene is most specific, how specific is it?".
+    #   SINGLE-module runs are untouched (one wing => the min is the ordinary count) so nothing regresses.
+    _wm=octx.get("wing_members") or None
+    _wings=set(_wm) if _wm else _organ_wings(terms)
+    _memb=({w:set(ts) for w,ts in _wm.items()} if _wm else None)
+    def _in_wing(tid, w):
+        if _memb is not None: return tid in _memb[w]
+        _x=_wing_of(tid); return (_x==w) or (_x not in _wings)    # fallback: a COMMON term counts everywhere
+    def _degree(pairs):
+        """pairs = iterable of (tid, [gene ids]). Returns {gene: degree}."""
+        pairs=list(pairs)
+        if len(_wings)<=1:
+            d={}
+            for _tid,gs in pairs:
+                for g in gs: d[g]=d.get(g,0)+1
+            return d
+        per={w:{} for w in _wings}
+        for _tid,gs in pairs:
+            for w in _wings:
+                if not _in_wing(_tid,w): continue
+                for g in gs: per[w][g]=per[w].get(g,0)+1
+        out={}
+        for w,d in per.items():
+            for g,c in d.items():
+                if c>0 and (g not in out or c<out[g]): out[g]=c
+        return out
+    share=_degree(term_disc.items())    # marker specificity: #terms whose disc lists each gene (per-wing min when merged)
     # ★ HIERARCHY-AWARE specificity (region_share): a marker's true specificity is how many
     #   distinct REGION-GROUPS (depth-1 children of a class) it spans — NOT how many terms list it. A region
     #   master TF (Tcf7l2→thalamus, Satb2→neocortex) is shared across that region's OWN subtypes (high `share`)
@@ -699,15 +1468,31 @@ def _build_ident_maps(octx, genes, pan_n=12):
             if par in seen: return cur
             seen.add(par); cur=par
     _rmap={tid:region_of(tid) for tid in terms}
-    region_share={}
-    for tid,dc in term_disc.items():
-        r=_rmap.get(tid,tid)
-        for g in dc: region_share.setdefault(g,set()).add(r)
-    region_share={g:len(rs) for g,rs in region_share.items()}
+    # region_share gets the SAME per-wing treatment (a region-group is a within-wing structure, so counting
+    # region-groups across merged wings inflates it exactly like `share`).
+    if len(_wings)<=1:
+        region_share={}
+        for tid,dc in term_disc.items():
+            r=_rmap.get(tid,tid)
+            for g in dc: region_share.setdefault(g,set()).add(r)
+        region_share={g:len(rs) for g,rs in region_share.items()}
+    else:
+        _per={w:{} for w in _wings}
+        for tid,dc in term_disc.items():
+            r=_rmap.get(tid,tid)
+            for w in _wings:
+                if not _in_wing(tid,w): continue
+                for g in dc: _per[w].setdefault(g,set()).add(r)
+        region_share={}
+        for w,d in _per.items():
+            for g,rs in d.items():
+                c=len(rs)
+                if c>0 and (g not in region_share or c<region_share[g]): region_share[g]=c
     return {"disc":term_disc,"neg":term_neg,"neg_soft":term_neg_soft,"tier":term_tier,"lab":term_lab,"share":share,
             "dz":term_dz,
             "region_share":region_share,"defn":term_def,"core":term_core,"region_of":_rmap,
             "lin_idx":lin_idx,"lin_class":lin_class,"root":{tid:root(tid) for tid in terms},
+            "assignable":octx.get("assignable"),          # ★ reference mode: labelable terms (None = unrestricted)
             "genes":list(genes), "P":{tid:[p for p in (t.get("P") or []) if p in terms] for tid,t in terms.items()}}
 
 # ★ ANATOMICAL REGION-PRESENCE GATE (F-B) — blocks force-fits in the brain module.
@@ -759,12 +1544,20 @@ def _absent_region_groups(X, genes, octx, gmu, gsd, thr=REGION_PRESENT_THR):
         return set(), {}
     genes = list(genes); gi = {g: i for i, g in enumerate(genes)}
     gmu = np.asarray(gmu).ravel(); gsd = np.asarray(gsd).ravel()
-    Xa = np.asarray(X.todense() if hasattr(X, "todense") else X)
-    HI = (Xa >= (gmu + gsd))
+    # ★ Only the anatomical marker columns are ever read, so slice them out BEFORE densifying — the full
+    #   matrix is 21.3 GiB on a large organ and was materialised just to look at a few dozen columns.
+    _need = sorted({gi[g] for mks in BRAIN_ANAT_MARKERS.values() for g in mks if g in gi})
+    _pos = {c: i for i, c in enumerate(_need)}
+    if _need:
+        _Xn = X[:, _need]
+        _Xn = np.asarray(_Xn.todense() if hasattr(_Xn, "todense") else _Xn)
+        HIn = (_Xn >= (gmu[_need] + gsd[_need]))
+    else:
+        HIn = np.zeros((X.shape[0], 0), dtype=bool)
     present = {}
     for anat, mks in BRAIN_ANAT_MARKERS.items():
-        idxs = [gi[g] for g in mks if g in gi]
-        present[anat] = float((HI[:, idxs].sum(1) >= 2).mean()) if len(idxs) >= 2 else None
+        idxs = [_pos[gi[g]] for g in mks if g in gi]
+        present[anat] = float((HIn[:, idxs].sum(1) >= 2).mean()) if len(idxs) >= 2 else None
     IDM = _build_ident_maps(octx, np.asarray(genes))
     region_of = IDM["region_of"]; lab = IDM["lab"]; tier = IDM["tier"]
     absent = set()
@@ -796,6 +1589,11 @@ def _graph_evidence(fon, lf, pin, IDM, octx, frac=0.30, lf_on=1.5, pin_min=0.25,
     lab=IDM["lab"]; tier=IDM["tier"]; genes=IDM.get("genes"); P=IDM.get("P",{})
     lin_idx=IDM["lin_idx"]; lin_class=IDM["lin_class"]; terms=octx.get("terms",{})
     region_of=IDM.get("region_of",{})
+    # ★ REFERENCE MODE gate: only ASSIGNABLE terms may become anchors / split targets. The graph itself
+    #   (lineage, region scoring, path_to_root, restrict_root) still uses every term, so the descent and the
+    #   degree statistics are unchanged — only the set of terms that can carry a LABEL is narrowed.
+    ASSIGN=octx.get("assignable")
+    def _ok_assign(t): return ASSIGN is None or t in ASSIGN
     # ★ TWO predicates (region-coherent redesign, replaces the absolute noise-floor gate):
     #   on_present — ABSOLUTE PRESENCE (detected across the cluster), used for LINEAGE. A pan-within-lineage
     #     transmitter (Slc17a7 in cortex: pin~1) shows little FOLD vs the transmitter-rich global background, so
@@ -1135,6 +1933,7 @@ def _graph_evidence(fon, lf, pin, IDM, octx, frac=0.30, lf_on=1.5, pin_min=0.25,
     #   at e.g. 'neocortical glutamatergic neuron', NOT the bare lineage class.
     anchors=[]
     for tid in terms:
+        if not _ok_assign(tid): continue                            # ★ reference mode: not a labelable term
         # dual-transmitter cross-root term (MHb): admitted as a candidate and allowed to bypass the region gate
         # when it carries the detected lineage's transmitter in R, even under a different root
         cross_dual=bool(lin_tx_sym and IDM["root"].get(tid)!=cls_root and tier.get(tid)!="class"
@@ -1206,6 +2005,7 @@ def _graph_evidence(fon, lf, pin, IDM, octx, frac=0.30, lf_on=1.5, pin_min=0.25,
             e["path"]=path_to_root(tid); anchors.append(e)
     if not anchors and region_gated:
         for rg in sorted(dominant, key=lambda r:-rg_score[r]):
+            if not _ok_assign(rg): continue                         # ★ reference mode: a region floor must itself be in the answer-key
             e=ev(rg)
             if e["neg_on"]>0: continue          # a region node is not surfaced either when it has a negative leak (e.g. a DG region on an Slc17a6+ cluster)
             # ★ Fix A: to surface a region node as a floor, >=1 of that region's OWN exclusive/defining markers must
@@ -1245,7 +2045,7 @@ def _graph_evidence(fon, lf, pin, IDM, octx, frac=0.30, lf_on=1.5, pin_min=0.25,
             _rl=lab.get(IDM["root"].get(_t,_t),"").lower(); _tl=lab.get(_t,"").lower()
             return any(k in _rl or k in _tl for k in _NONPAR)
         for tid in terms:
-            if tid in _anch or not _nonpar(tid): continue
+            if tid in _anch or not _nonpar(tid) or not _ok_assign(tid): continue
             _dfset=set(defn.get(tid,()))   # DEFINING markers bypass the share filter (curated-specific; ependymal Foxj1 has share=4)
             strong=[g for g in core_map.get(tid,())
                     if (g in _dfset or share.get(g,99)<=SPEC_REGION_MAX) and auc[g]>=_RESC_AUC and lf[g]>=_RESC_LF]
@@ -1346,6 +2146,7 @@ def _graph_evidence(fon, lf, pin, IDM, octx, frac=0.30, lf_on=1.5, pin_min=0.25,
     WEAK_AUC=0.6
     cand=[]
     for tid in terms:
+        if not _ok_assign(tid): continue                            # ★ reference mode: splitting toward a non-labelable child gains nothing
         if IDM["root"].get(tid)!=cls_root or tier.get(tid)=="class": continue
         if region_of.get(tid,tid) in _absent: continue
         if allow is not None and tid not in allow: continue
@@ -1410,7 +2211,9 @@ def _bimodal_split(Xleaf, IDM, octx, lineage_label, genes_arr,
     if Xleaf.shape[0]<min_cells: return []
     det=(Xleaf>0).mean(axis=0)                                    # per-gene detection within the leaf
     reg_mk={}                                                     # region-group → its low-share exclusive markers PRESENT here
+    _ASSIGN=octx.get("assignable")
     for tid in terms:
+        if _ASSIGN is not None and tid not in _ASSIGN: continue                  # ★ reference mode
         if root.get(tid)!=cls_root or tier.get(tid)=="class": continue
         if (terms.get(tid,{}).get("D") or "normal")!="normal": continue          # disease/dev state terms aren't discrete split poles
         exc=[g for g in disc.get(tid,()) if share.get(g,99)<=2 and 0<=g<det.shape[0] and det[g]>=min_present_frac]
@@ -1611,7 +2414,9 @@ def _identity_scores(fon, lf, M, pin=None, frac=0.30, lf_high=2.0, lf_on=1.5, pi
         return [g for g in defn.get(tid,()) if _on(g) and share.get(g,99)>SPEC_SHARE_MAX
                 and auc is not None and auc[g]>=auc_hi]
     cand=[]
+    _ASSIGN=M.get("assignable")                                     # ★ reference mode: score only labelable terms
     for tid,dc in disc.items():
+        if _ASSIGN is not None and tid not in _ASSIGN: continue
         on=[g for g in dc if _on(g)]
         df_dom=_df_dom(tid)                                              # region-broad DEFINING marker that DOMINATES (vs-rest auc≥auc_hi)
         on_eff=list(dict.fromkeys(on+df_dom))                           # disc-ON ∪ dominant-broad-DEFINING
@@ -1730,6 +2535,65 @@ def _identity_scores(fon, lf, M, pin=None, frac=0.30, lf_high=2.0, lf_on=1.5, pi
 # ===================================================================== profile core
 def _rankcols(M): return np.asarray(rankdata(M, method="average", axis=0), dtype=np.float64)
 
+# ---------------------------------------------------------------- sparse leaf statistics
+# ★ WHY: `_rankcols` sorts the WHOLE (n_cells x n_genes) matrix even though the data is ~5% dense, and it
+#   materialises an (n_cells x n_genes) float64 rank array (42.6 GiB on TS/adipose_tissue, 94k x 60k) purely
+#   to be consumed at ONE line, `sumR = M @ ranks`.  That single step was 68% of `init`'s wall time and the
+#   reason several organs at once exhausted a 754 GB node.
+#   The zeros of a column all share one average rank, in closed form:
+#       z = #zeros in the column;  rank(0) = (z+1)/2;  rank(x!=0) = rank_among_nonzeros(x) + z
+#   so the per-leaf rank SUM can be accumulated over the nonzeros alone and the rank matrix never has to
+#   exist.  Verified against the shipped path: sumR / sumX / sumBin / AUC come out BIT-IDENTICAL.
+def _avg_rank_1d(v):
+    """`rankdata(v, method='average')` without the per-call dispatch — called once per gene."""
+    o=np.argsort(v, kind="stable"); sv=v[o]; n=sv.size
+    newg=np.empty(n,dtype=bool); newg[0]=True; np.not_equal(sv[1:],sv[:-1],out=newg[1:])
+    gid=np.cumsum(newg)-1; cnt=np.bincount(gid)
+    ssum=np.bincount(gid, weights=np.arange(1,n+1,dtype=np.float64))
+    r=np.empty(n,dtype=np.float64); r[o]=(ssum/cnt)[gid]; return r
+
+def _leaf_stats_sparse(Xc, leaf_of, K, n_cells):
+    """(sumR, sumX, sumBin, totX, totBin) — what `M@_rankcols(X)`, `M@X`, `M@binX` produce, to
+    floating-point equality, without densifying anything.  `leaf_of` uses K for 'not in any leaf'."""
+    ip,ix,dt=Xc.indptr,Xc.indices,Xc.data; v=Xc.shape[1]
+    nk=np.bincount(leaf_of,minlength=K+1).astype(np.float64)[:K]
+    sumR=np.empty((K,v)); sumX=np.zeros((K,v)); sumBin=np.zeros((K,v))
+    for j in range(v):
+        s,e=ip[j],ip[j+1]; nz=e-s; z=n_cells-nz; base=(z+1)*0.5
+        if nz==0:
+            sumR[:,j]=nk*base; continue
+        lk=leaf_of[ix[s:e]]; vals=dt[s:e].astype(np.float64,copy=False)
+        cnt=np.bincount(lk,minlength=K+1).astype(np.float64)[:K]
+        sumR[:,j]=np.bincount(lk,weights=_avg_rank_1d(vals)+z,minlength=K+1)[:K]+(nk-cnt)*base
+        sumX[:,j]=np.bincount(lk,weights=vals,minlength=K+1)[:K]
+        sumBin[:,j]=cnt
+    return sumR,sumX,sumBin,np.asarray(Xc.sum(axis=0)).ravel(),np.diff(ip).astype(np.float64)
+
+def _leaf_hi_sparse(Xc, leaf_of, K, n_cells, thr):
+    """(sumHI, ghi) for HI = (X >= thr) — thr<=0 means every cell (zeros included) is HI, which is
+    exactly what the dense comparison does for an all-zero / zero-threshold gene."""
+    ip,ix,dt=Xc.indptr,Xc.indices,Xc.data; v=Xc.shape[1]
+    nk=np.bincount(leaf_of,minlength=K+1).astype(np.float64)[:K]
+    sumHI=np.zeros((K,v)); ghi=np.zeros(v)
+    for j in range(v):
+        if thr[j]<=0.0:
+            sumHI[:,j]=nk; ghi[j]=n_cells; continue
+        s,e=ip[j],ip[j+1]
+        if e==s: continue
+        m=dt[s:e]>=thr[j]
+        if not m.any(): continue
+        lk=leaf_of[ix[s:e][m]]
+        sumHI[:,j]=np.bincount(lk,minlength=K+1)[:K]; ghi[j]=float(m.sum())
+    return sumHI,ghi
+
+def _global_stats_sparse(Xs):
+    """(mean, std) per gene, accumulated in float64 over the nonzeros.  More accurate than the shipped
+    `X.std(axis=0)` on the float32 dense array (median relative error 2.8e-8 vs 5.8e-6)."""
+    n=Xs.shape[0]
+    mu=np.asarray(Xs.mean(axis=0)).ravel().astype(np.float64)
+    sq=np.asarray(Xs.multiply(Xs).sum(axis=0)).ravel().astype(np.float64)/n
+    return mu, np.sqrt(np.maximum(sq-mu*mu,0.0))
+
 def _exclusive_mixture(Xleaf, IDM, octx, lineage_label, genes_arr, split_frac=0.15, min_cells=80, hi_thr=None):
     """★ MUTUAL-EXCLUSIVITY mixture (CASE+RULE, no hardcoding).
     CASE: the leaf stopped at one lineage CLASS (class_floor/ambiguous), yet two sibling subtypes of that
@@ -1753,8 +2617,10 @@ def _exclusive_mixture(Xleaf, IDM, octx, lineage_label, genes_arr, split_frac=0.
     cls=IDM["lin_class"].get(lineage_label)
     if cls is None: return None
     cls_root=root.get(cls,cls)
+    _ASSIGN=octx.get("assignable")                                  # ★ reference mode
     sibs=[t for t in terms if root.get(t)==cls_root and tier.get(t)!="class"
-          and (terms[t].get("D") or "normal")=="normal"]
+          and (terms[t].get("D") or "normal")=="normal"
+          and (_ASSIGN is None or t in _ASSIGN)]
     U=lambda xs:{str(g).upper() for g in (xs or [])}
     # exclusive discriminators = DEFINING markers only (DF, curated as 'one is sufficient'). required (R)
     #   includes maturation-stage shared markers such as RAG1 and would create false pairs that are not
@@ -1828,20 +2694,27 @@ def _profile_leaves(X, genes, leaf_arr, leaves, ont_gene_set, ont_protected,
                 _k=max(_MINKEEP, int(round(_il.size*_frac)))
                 _parts.append(_rng.choice(_il, min(_k,_il.size), replace=False))
         _sel=np.sort(np.concatenate(_parts))
-        X=np.ascontiguousarray(X[_sel]); leaf_arr=leaf_arr[_sel]
+        X=(X.tocsr()[_sel] if _spx.issparse(X) else np.ascontiguousarray(X[_sel])); leaf_arr=leaf_arr[_sel]
         if vf_norm is not None: vf_norm=np.asarray(vf_norm)[_sel]
         print(f"[profile] stratified subsample {len(_sel)}/{_n_full} cells (cap={profile_cap}, MINKEEP={_MINKEEP}) — speeds up AUC/rank", flush=True)
     n_cells, n_genes = X.shape
-    genes_arr=np.asarray(genes); ranks=_rankcols(X)
+    genes_arr=np.asarray(genes)
     gidx_U={str(g).upper():i for i,g in enumerate(genes_arr.tolist())}
     leaf_to_idx={l:k for k,l in enumerate(leaves)}
     cli=np.fromiter((leaf_to_idx.get(p,-1) for p in leaf_arr), dtype=np.int64, count=n_cells)
     valid=cli>=0; rows=cli[valid]; cols=np.nonzero(valid)[0]; K=len(leaves)
     M=csr_matrix((np.ones(rows.size),(rows,cols)), shape=(K,n_cells))
     n_in_per=np.asarray(M.sum(axis=1)).ravel()
-    binX=(X>0).astype(np.float64)
-    sumR=M@ranks; sumX=M@X; sumBin=M@binX
-    totX=X.sum(axis=0); totBin=binX.sum(axis=0)
+    # ★ Sparse closed-form path (see _leaf_stats_sparse): bit-identical sumR/sumX/sumBin/AUC, but the
+    #   (n_cells x n_genes) rank matrix is never materialised.  Dense input keeps the original path.
+    _Xc=X.tocsc() if _spx.issparse(X) else None
+    _leaf_of=np.where(valid, cli, K).astype(np.int64)
+    if _Xc is not None:
+        sumR,sumX,sumBin,totX,totBin=_leaf_stats_sparse(_Xc, _leaf_of, K, n_cells)
+    else:
+        ranks=_rankcols(X); binX=(X>0).astype(np.float64)
+        sumR=M@ranks; sumX=M@X; sumBin=M@binX
+        totX=X.sum(axis=0); totBin=binX.sum(axis=0)
     auc_mat=np.zeros((K,n_genes)); mean_in_mat=np.zeros((K,n_genes)); mean_out_mat=np.zeros((K,n_genes))
     for k in range(K):
         ni=n_in_per[k]; no=n_cells-ni
@@ -1869,10 +2742,15 @@ def _profile_leaves(X, genes, leaf_arr, leaves, ont_gene_set, ont_protected,
     if gmu is not None and gsd is not None:
         IDM=_build_ident_maps(octx, genes_arr)
         gmu_arr=np.asarray(gmu,dtype=np.float64); gsd_arr=np.asarray(gsd,dtype=np.float64)
-        sumHI=M@((X>=(gmu_arr+gsd_arr)).astype(np.float64))
+        _thr=gmu_arr+gsd_arr
+        if _Xc is not None:
+            sumHI,_hi_tot=_leaf_hi_sparse(_Xc, _leaf_of, K, n_cells, _thr)
+        else:
+            _HI=(X>=_thr); sumHI=M@_HI.astype(np.float64)
+            _hi_tot=np.asarray(_HI.sum(axis=0),dtype=np.float64).ravel()
         if adaptive_floor:   # ★ global baseline for the data-derived floor (reference-free): global detection rate / strong-expression rate (computed once)
             _gpin_arr=np.asarray(totBin,dtype=np.float64).ravel()/max(n_cells,1)
-            _ghi_arr=np.asarray((X>=(gmu_arr+gsd_arr)).sum(axis=0),dtype=np.float64).ravel()/max(n_cells,1)
+            _ghi_arr=_hi_tot/max(n_cells,1)
             print(f"[adaptive-floor] ON (F={af_F}, Nmin={af_Nmin}) — region-gated positive floor = min(fixed, ambient×F); "
                   f"median gpin={np.median(_gpin_arr):.4f} ghi={np.median(_ghi_arr):.4f}", flush=True)
 
@@ -2009,6 +2887,8 @@ def _profile_leaves(X, genes, leaf_arr, leaves, ont_gene_set, ont_protected,
             _defn=IDM.get("defn",{}); _lab=IDM.get("lab",{}); _root=IDM.get("root",{})
             _lin_root=IDM.get("lin_class",{}).get((entry.get("graph_evidence") or {}).get("lineage"))
             _dfp=[tid for tid,gs in _defn.items() if any(lf[g]>=1.5 and pin[g]>=0.25 for g in gs)]
+            _asg=octx.get("assignable")                            # ★ reference mode: a non-labelable subtype is not a split/relabel signal
+            if _asg is not None: _dfp=[tid for tid in _dfp if tid in _asg]
             if _lin_root is not None:
                 _lr=_root.get(_lin_root,_lin_root); _dfp=[tid for tid in _dfp if _root.get(tid)==_lr]
             entry["df_present"]=sorted({_lab.get(tid,tid) for tid in _dfp})
@@ -2202,8 +3082,9 @@ def _check_input_matrix(adata, force=False):
             print(f"[init][WARN:INPUT_MATRIX] input precondition violated (proceeding because of --force):\n{msg}", flush=True)
         else:
             sys.exit(f"[init][ERROR:INPUT_MATRIX] the input h5ad violates the annotator's preconditions:\n{msg}\n"
-                     f"   -> fix it and rerun, or pass --force to proceed knowing the input is non-standard. "
-                     f"-> the caller should relay the problem above to the user verbatim.")
+                     f"   -> the agent must STOP here and return INPUT_MATRIX_REJECTED to the caller with the "
+                     f"problem above copied VERBATIM; the caller relays it to the user. Do NOT add --force and do "
+                     f"NOT modify the input h5ad — only the user decides to proceed on non-standard input.")
 
 # ===================================================================== init
 def cmd_init(a):
@@ -2275,16 +3156,70 @@ def cmd_init(a):
     idx=_fetch_slim_index(a.out, url, a.ontology)
     if not idx or not _ontology_gene_set(idx):
         sys.exit("[init] FATAL: the ontology (slim-index) is empty — check the server / module. Running ontology-blind is not allowed.")
+    # ★ REFERENCE MODE (annotate-reference-mode): restrict the LABEL SPACE to the user's answer-key.
+    #   Stamped into _ontology_index.json as idx["reference"], so every later round / validate / finalize
+    #   inherits it without extra flags. The graph and all degree statistics stay on the FULL index.
+    if getattr(a,"reference",None) or getattr(a,"reference_h5ad",None):
+        _scope=(getattr(a,"reference_scope",None) or "strict").lower()
+        if _scope not in ("strict","refine"):
+            sys.exit(f"[init][ERROR:REFERENCE] --reference-scope must be strict|refine (got '{_scope}').")
+        _alias=json.load(open(a.reference_alias)) if getattr(a,"reference_alias",None) else None
+        _items=_load_reference_items(getattr(a,"reference",None), getattr(a,"reference_h5ad",None),
+                                     getattr(a,"reference_col",None))
+        _matched,_map,_unmatched=_resolve_reference(idx, _items, _alias)
+        if not _matched:
+            sys.exit(f"[init][ERROR:REFERENCE] none of the {len(_items)} reference labels matched a term in "
+                     f"{idx.get('species')}/{idx.get('organ')}. Check the species/organ, or supply "
+                     f"--reference-alias to bridge the naming. Examples given: {_items[:6]}")
+        _assign=_reference_assignable(idx, _matched, _scope)
+        # ★ label_of: term_id -> the USER'S OWN reference label text. The answer-key is the user's
+        #   vocabulary, so the FINAL annotation must be written in it ("Immune", not the KG's
+        #   "leukocyte"); the KG label is only what the ENGINE reasons with. First item wins when two
+        #   reference labels resolve to the same term.
+        _label_of={}; _collide=[]
+        for _it,_t in _map.items():
+            if not _t: continue
+            if _t in _label_of: _collide.append((_it,_label_of[_t]))
+            else: _label_of[_t]=_it
+        idx["reference"]={"scope":_scope,"anchors":sorted(_matched),
+                          "anchor_labels":sorted(idx["terms"][t].get("L",t) for t in _matched),
+                          "anchor_ref_labels":sorted(_label_of.values()),
+                          "label_of":_label_of,
+                          "assignable":sorted(_assign),"unmatched":_unmatched}
+        with open(os.path.join(a.out,"_ontology_index.json"),"w") as _f:
+            json.dump(idx,_f,separators=(",",":"))
+        json.dump({"scope":_scope,"n_reference_items":len(_items),"n_matched":len(_matched),
+                   "n_assignable":len(_assign),"mapping":{k:(v or None) for k,v in _map.items()},
+                   "matched_labels":sorted(idx["terms"][t].get("L",t) for t in _matched),
+                   "unmatched":_unmatched},
+                  open(os.path.join(a.out,"_reference_report.json"),"w"), ensure_ascii=False, indent=1)
+        st["reference_scope"]=_scope; st["reference_anchors"]=sorted(_matched); _save_state(a.out, st)
+        if _collide:
+            print(f"[init][reference][WARN] {len(_collide)} reference label(s) resolve to a term already claimed by "
+                  f"another label; the first one is used for the output vocabulary: "
+                  f"{[f'{a2} -> already {b2}' for a2,b2 in _collide[:5]]}", flush=True)
+        print(f"[init][reference] scope={_scope}  answer-key {len(_matched)}/{len(_items)} matched -> "
+              f"{len(_assign)} assignable term(s) of {len(idx['terms'])} in the graph", flush=True)
+        if _unmatched:
+            print(f"[init][reference][WARN] {len(_unmatched)} reference label(s) have NO term in this module and "
+                  f"can never be annotated (their cells will fall to Unknown): {_unmatched[:8]}"
+                  f"{'…' if len(_unmatched)>8 else ''}  -> the caller should relay this to the user "
+                  f"(build-mode may be needed for those types).", flush=True)
     ogs=_ontology_gene_set(idx); prot=_ontology_protected(idx); octx=_onto_ctx(idx)
     print(f"[init] ontology markers {len(ogs)} (protected {len(prot)}); lineages {len(octx['lineages'])} "
           f"(derived={'yes' if _derive_lineages(idx) else 'fallback'})", flush=True)
-    X=np.asarray(adata.X.todense() if hasattr(adata.X,"todense") else adata.X)
+    # ★ X stays SPARSE: _profile_leaves / _absent_region_groups read it as-is, so neither the 21.3 GiB
+    #   dense copy nor the 42.6 GiB rank array it fed is ever allocated (see _leaf_stats_sparse).
+    X=adata.X if _spx.issparse(adata.X) else np.asarray(adata.X)
     vf,low=_vf_setup(adata)
     print(f"[init] vf_norm: {'present' if vf is not None else 'absent (density axis disabled)'}", flush=True)
     # ★ Global per-gene statistics (over the full data) are computed once and persisted. Every round's
     #   absolute-identity score reuses this global reference, so identity does not collapse under
     #   fragmentation (no dependence on a local contrast).
-    gmu=np.asarray(X.mean(axis=0)).ravel(); gsd=np.asarray(X.std(axis=0)).ravel()
+    if _spx.issparse(X):
+        gmu,gsd=_global_stats_sparse(X)   # float64 over the nonzeros — strictly more accurate than the float32 dense reduction
+    else:
+        gmu=np.asarray(X.mean(axis=0)).ravel(); gsd=np.asarray(X.std(axis=0)).ravel()
     np.savez(os.path.join(a.out,"_global_stats.npz"), mean=gmu, std=gsd, genes=np.array(list(adata.var_names),dtype=object))
     print(f"[init] global per-gene stats saved (_global_stats.npz, {len(gmu)} genes) — the absolute-identity reference", flush=True)
     dz_terms=_disease_terms(idx, a.disease); st_terms=_state_terms(idx); mt_terms=_mimicry_terms(idx)   # dz/st_terms retired (no tier='state' Terms / disease property) — kept for signature compat
@@ -2406,7 +3341,9 @@ def _hcmd_subcluster(a):
     st["leaves"]=leaves; st["cluster_paths"]=cps.tolist(); st["round"]+=1; _save_state(a.out,st)
     idx=_load_ontology_index(a.out); ogs=_ontology_gene_set(idx); prot=_ontology_protected(idx); octx=_onto_ctx(idx)
     dz_terms=_disease_terms(idx, st.get("disease")); st_terms=_state_terms(idx); mt_terms=_mimicry_terms(idx)   # states are always surfaced (disease is a hint), for sub-leaves too; mt = the transition anchor tiebreaker
-    X=np.asarray(adata.X.todense() if hasattr(adata.X,"todense") else adata.X)
+    # ★ X stays SPARSE: _profile_leaves / _absent_region_groups read it as-is, so neither the 21.3 GiB
+    #   dense copy nor the 42.6 GiB rank array it fed is ever allocated (see _leaf_stats_sparse).
+    X=adata.X if _spx.issparse(adata.X) else np.asarray(adata.X)
     vf,low=_vf_setup(adata)
     # ★ F-B: load the absent region-groups persisted at init (a subset cannot compute them itself, so they are reused)
     _arp=os.path.join(a.out,"_region_presence.json")
@@ -2467,6 +3404,7 @@ def _validate(decisions, st, out):
     _idx_full=_load_ontology_index(out) or {}
     idx=_idx_full.get("terms",{})
     octx=_onto_ctx(_idx_full); LINS=octx["lineages"]; SPEC=octx["specific"]; PAN=octx["pan"]
+    _refassign=octx.get("assignable"); _refmode=octx.get("ref_scope") or "strict"   # ★ reference mode (None = unrestricted)
     def upstrong(p): return {_U(r[0]) for r in (p.get("up") or []) if r[1]>=0.6}
     def lins(gs): return sorted(l for l,s in LINS.items() if gs&s)
     def pool(p):
@@ -2609,6 +3547,13 @@ def _validate(decisions, st, out):
                     f"'{d.get('label')}' is tier='process' (a tissue process) — clustering-based annotation does not label these.",
                     "Detection of processes (neuropil, fiber tract, ...) is not supported in this version — use a celltype label instead.")
                 continue
+            elif _refassign is not None and tid and tid in idx and tid not in _refassign:
+                add(lf,"OUT_OF_REFERENCE","error",
+                    f"'{idx[tid].get('L',tid)}' is not in the reference answer-key ({_refmode} mode) — "
+                    f"reference-restricted annotation may only use a reference label.",
+                    "Use a reference term whose OWN markers are ENRICHED here, or decide Unknown. "
+                    "In strict mode an out-of-reference class/region FLOOR is NOT allowed either — "
+                    "if no reference term is REAL, the honest answer is Unknown.")
             elif not tid or (idx and tid not in idx):
                 add(lf,"BAD_TERM_ID","error",
                     f"The decision is celltype but term_id is empty or absent from the ontology (term_id='{tid}').",
@@ -3173,8 +4118,13 @@ def _finalize_review(decisions, st, out, max_depth=1, large_min_n=1500):
     #   on these (only an explicit `--force` + rationale passes) so a run cannot init→judge→floor→finalize without
     #   a single descend. After a descent that genuinely fails to separate, the sub-leaves are depth≥1 → this no
     #   longer fires → an honest floor is finalizable. Threshold-free, dilution-proof (it does NOT read markers).
+    #   ★ reference mode: only ASSIGNABLE children count. In strict mode a reference term's KG children are
+    #     not labelable, so a descend into them cannot change any label — requiring one would block finalize
+    #     forever. A node still MUST be descended when >=1 of its children IS in the answer-key.
+    _refb=_ref_block(_full_idx); _asg=set((_refb or {}).get("assignable") or ()) if _refb else None
     _kid_parents=set()
-    for _t in idx.values():
+    for _tid_k,_t in idx.items():
+        if _asg is not None and _tid_k not in _asg: continue
         for _pp in (_t.get("P") or []): _kid_parents.add(_pp)
     must_descend=[]
     for lf in st["leaves"]:
@@ -3357,6 +4307,15 @@ def cmd_finalize(a):
     def _state_ok(state_name, base_lins):
         appl=_sa_appl.get(str(state_name).strip().lower())
         return (not appl) or bool(base_lins & appl)      # empty applies_to = GLOBAL state → always ok
+    # ★ REFERENCE MODE — the OUTPUT vocabulary is the ANSWER-KEY's, not the KG's. The engine reasons in KG
+    #   terms (that is what carries the markers and the hierarchy), but "annotate to my reference" means the
+    #   user gets THEIR OWN label text back: obs, the CSV and the rationale all read "Immune", never the
+    #   KG's canonical "leukocyte". Only terms the user actually listed are translated — in `refine` mode a
+    #   DESCENDANT of a reference term is deeper than the answer-key, so the answer-key has no name for it
+    #   and it keeps its KG label (that is the point of refine). Unknown/Background are untouched.
+    _ref_label_of=((_ref_block(_full) or {}).get("label_of") or {}) if _full else {}
+    def _display_label(dec, base_s):
+        return _ref_label_of.get((dec.get("term_id") or "").strip(), base_s)
     # ★ WITHIN-BASE STATE GATE: a program state is kept only when ≥2 of its markers are enriched vs
     #   SIBLING leaves of the SAME final base celltype — not merely vs the whole dataset. auc/lf (vs-rest) cannot
     #   tell a base-lineage-identity gene (macrophage C1q, Apoe) — uniform across the celltype yet high vs the
@@ -3411,7 +4370,7 @@ def cmd_finalize(a):
             if not _state_ok(s, blins): continue          # ★ lineage gate (base+ancestors ∩ applies_to)
             seen.add(s.lower()); keep.append(s)
         keep.sort(key=lambda x:x.lower())                 # ★ canonical order (alphabetical) → no order-dup labels
-        return base_s + "".join(", "+s for s in keep)
+        return _display_label(dec, base_s) + "".join(", "+s for s in keep)   # ★ answer-key vocabulary on output
     for path,dec in decisions.items():
         if path not in st["leaves"]: continue
         lab=dec.get("label","")
@@ -3424,12 +4383,62 @@ def cmd_finalize(a):
     for path in st["leaves"]:
         dec=decisions[path]
         rows.append({"cluster_path":path,"n_cells":int((cps==path).sum()),
-            "decision":dec.get("decision",""),"label":dec.get("label",""),"term_id":dec.get("term_id",""),
+            "decision":dec.get("decision",""),"label":_display_label(dec, dec.get("label","")),
+            "kg_label":dec.get("label",""),"term_id":dec.get("term_id",""),
             "subclass_resolved":dec.get("subclass_resolved",""),"confidence":dec.get("confidence",""),
             "reason_code":dec.get("reason_code",""),"key_markers":";".join(dec.get("key_markers",[]) if isinstance(dec.get("key_markers"),list) else [str(dec.get("key_markers",""))]),
             "rationale":dec.get("rationale",""),"alternatives_considered":dec.get("alternatives_considered",""),
             "open_question_flag":bool(dec.get("open_question_flag",False))})
     sfx="_free" if "free" in col else ""
+    # ★ REFERENCE COVERAGE — how much of the answer-key was recovered, and where the run went outside it.
+    #   hit              : a leaf labelled exactly at a reference term
+    #   refined_to_child : labelled at a KG descendant of a reference term (refine mode only — the deeper call)
+    #   missing_anchors  : reference types no leaf resolved to (absent from the data, or below detection)
+    #   unknown/background/out_of_reference : cells the answer-key could not explain
+    try: _fidx=json.load(open(os.path.join(a.out,"_ontology_index.json")))
+    except Exception: _fidx={}
+    _rb=_ref_block(_fidx)
+    if _rb:
+        _T=_fidx.get("terms",{}); _anch=set(_rb.get("anchors") or []); _asg=set(_rb.get("assignable") or [])
+        _lo=_rb.get("label_of") or {}
+        def _rl(tid, kg=None): return _lo.get(tid, kg if kg is not None else _T.get(tid,{}).get("L",tid))   # ★ answer-key vocabulary
+        def _anc_of(t):
+            seen=set(); stack=[t]
+            while stack:
+                x=stack.pop()
+                if x in seen or x not in _T: continue
+                seen.add(x)
+                for q in (_T.get(x,{}).get("P") or []): stack.append(q)
+            return seen
+        cov={"scope":_rb.get("scope") or _rb.get("mode"),"hit":{},"refined_to_child":{},"out_of_reference":[],
+             "unknown_cells":0,"background_cells":0,"missing_anchors":[],"unmatched_reference":_rb.get("unmatched") or []}
+        for path in st["leaves"]:
+            d=decisions.get(path) or {}; nc=int((cps==path).sum()); t=(d.get("term_id") or "").strip()
+            lb=str(d.get("label",""))
+            if d.get("decision")!="celltype":
+                if lb=="Unknown": cov["unknown_cells"]+=nc
+                elif lb=="Background": cov["background_cells"]+=nc
+                continue
+            if t in _anch:
+                e=cov["hit"].setdefault(_rl(t),{"n_cells":0,"clusters":0,"kg_term":_T[t].get("L",t)})
+                e["n_cells"]+=nc; e["clusters"]+=1
+            elif t in _asg:
+                _par=next((_rl(x) for x in _anc_of(t) if x in _anch), None)
+                e=cov["refined_to_child"].setdefault(_T.get(t,{}).get("L",t),
+                                                     {"n_cells":0,"clusters":0,"reference_parent":_par})
+                e["n_cells"]+=nc; e["clusters"]+=1
+            else:
+                cov["out_of_reference"].append({"cluster_path":path,"label":lb,"term_id":t,"n_cells":nc})
+        _seen_anchor={k for k in cov["hit"]} | {v.get("reference_parent") for v in cov["refined_to_child"].values()}
+        _all_anchor=sorted(_rb.get("anchor_ref_labels") or _rb.get("anchor_labels") or [])
+        cov["missing_anchors"]=sorted(l for l in _all_anchor if l not in _seen_anchor)
+        cov["recovery_rate"]=round((len(_all_anchor)-len(cov["missing_anchors"]))/max(len(_all_anchor),1),3)
+        _cp_path=os.path.join(a.out,f"reference{sfx}_coverage.json")
+        json.dump(cov, open(_cp_path,"w"), ensure_ascii=False, indent=1)
+        print(f"[finalize][reference] recovery {cov['recovery_rate']*100:.0f}% "
+              f"({len(cov['hit'])} hit, {len(cov['refined_to_child'])} refined, "
+              f"{len(cov['missing_anchors'])} missing, {cov['unknown_cells']} Unknown cells) -> {_cp_path}", flush=True)
+
     csv_path=os.path.join(a.out,f"expert_judgment_annotation{sfx}.csv")
     pd.DataFrame(rows).to_csv(csv_path,index=False)
     print(f"[finalize] wrote {csv_path}", flush=True)
@@ -3446,6 +4455,7 @@ def cmd_finalize(a):
     for path in st["leaves"]:
         dec=decisions[path]
         lab=dec.get("label",""); lab=";".join(map(str,lab)) if isinstance(lab,(list,tuple)) else (lab or "")
+        lab=_display_label(dec, lab)                       # ★ answer-key vocabulary
         n=int((cps==path).sum()); deck=dec.get("decision",""); conf=dec.get("confidence","")
         km=dec.get("key_markers",[]); km=km if isinstance(km,list) else [str(km)]
         gm=(_idx.get(dec.get("term_id",""),{}) or {}).get("GM",{}) or {}
@@ -3468,6 +4478,7 @@ def cmd_finalize(a):
     # -> annotation_out: {input}_annotated.h5ad + expert_judgment_annotation.csv (the merge input) +
     #    annotation_artifacts.tar.gz.
     pats=["_global_stats.npz","_annotate_state.json","_annotate_decisions.json","_ontology_index.json","ontology_hits.json",
+          "_reference_report.json",
           "_annotate_recommendation.json","_annotate_violations.json","_annotate_finalize_review.json",
           "cluster_gene_profiles_round*.json","cluster_overview_round*.json","expert_judgment_round*.csv"]
     tmp=[]
@@ -3496,6 +4507,21 @@ def _helper_cli():
     pi.add_argument("--ontology",default=None); pi.add_argument("--output",default=None)
     pi.add_argument("--force",dest="force_input",action="store_true",
                     help="Downgrade the input-matrix checks (X=lognorm / var_names=symbol) to warnings and proceed. Use only when you know the input is non-standard.")
+    pi.add_argument("--reference",default=None,
+                    help="REFERENCE MODE: answer-key file (.json/.csv/.tsv) listing the expected cell types. "
+                         "Labels may ONLY come from this set; anything it cannot explain becomes Unknown.")
+    pi.add_argument("--reference-h5ad",dest="reference_h5ad",default=None,
+                    help="REFERENCE MODE: take the answer-key from an already-annotated reference h5ad "
+                         "(requires --reference-col). Only the LABELS are read — never the expression.")
+    pi.add_argument("--reference-col",dest="reference_col",default=None,
+                    help="obs column of --reference-h5ad holding the annotation (also selects the column of a CSV/TSV answer-key).")
+    pi.add_argument("--reference-scope",dest="reference_scope",default="strict",choices=["strict","refine"],
+                    help="How deep below the answer-key a label may go (this does NOT select the mode — the presence of a reference input does). strict (default) = label ONLY with the reference terms themselves; no reference term "
+                         "REAL here => Unknown (an out-of-reference class floor is not allowed). "
+                         "refine = the reference terms AND their KG descendants are labelable, so a mixed "
+                         "reference term can be resolved finer than the answer-key.")
+    pi.add_argument("--reference-alias",dest="reference_alias",default=None,
+                    help="JSON {reference_label: kg_label_or_term_id} bridging naming differences.")
     pi.add_argument("--disease",default=None,help="(retired hint) Disease context of the input data. Disease/injury/malignant cells are now ordinary class/subclass celltypes judged by their own markers at the same level as normal — not a special fallback; flag kept for backward compatibility.")
     pi.add_argument("--use-rep",dest="use_rep",default="auto",
                     help="obsm key the subcluster kNN is built on, used only when a marker axis cannot be built. "
@@ -3507,9 +4533,9 @@ def _helper_cli():
     #   A subcluster recompute always log-normalizes (+ PCA).
     #   When use_rep resolves to an obsm key, metric is ignored and that embedding is used with euclidean.
     pi.add_argument("--subcluster-metric",dest="sc_metric",default=None,
-                    help="kNN metric for subcluster (correlation|euclidean). Defaults to correlation (assuming log-normalized input).")
+                    help="kNN metric for the subcluster kNN (euclidean|correlation). Resolution order: this flag > uns['cellman_cluster_params'].metric (inherited from the clustering that produced the input h5ad) > euclidean. Supply it only to MATCH an external clustering whose params were not recorded.")
     pi.add_argument("--subcluster-n-neighbors",dest="sc_n_neighbors",type=int,default=None,
-                    help="Number of kNN neighbors for subcluster (n_neighbors). Defaults to 30. Smaller values split fine structure more aggressively; larger values smooth the graph.")
+                    help="Number of kNN neighbours for the subcluster kNN. Resolution order: this flag > uns['cellman_cluster_params'].n_neighbors > 15. Smaller values split fine structure more aggressively; larger values smooth the graph.")
     pi.add_argument("--auc-pos",dest="auc_pos",type=float,default=0.65,
                     help="AUC bar for calling a positive layer/subtype marker ON inside a region-gated leaf (0.85 = the strict default, 0.65 = recovers quiet layers)")
     pi.add_argument("--profile-cap",dest="profile_cap",type=int,default=150000,
@@ -3537,6 +4563,49 @@ def _helper_cli():
     ps.add_argument("--af-F",dest="af_F",type=float,default=3.0); ps.add_argument("--af-Nmin",dest="af_Nmin",type=int,default=10)
     ps.set_defaults(f=_hcmd_subcluster)
     # signal_split has been removed (the Leiden + absolute paradigm): it prevents force-assignment contamination. Splitting is done only by subcluster (Leiden).
+    pm=sp.add_parser("suggest-modules")
+    pm.add_argument("--out",required=True)
+    pm.add_argument("--decisions",default=None,help="decisions JSON; without it, leaves with no top and no anchor are treated as Unknown")
+    pm.add_argument("--species",default=None,
+                    help="normally omit it — the species is taken from the run's own module. Only the ORGAN "
+                         "boundary is crossed by expansion, never the species one; a value contradicting the index is an error.")
+    pm.add_argument("--server-url",dest="server_url",default=None)
+    pm.add_argument("--min-auc",dest="min_auc",type=float,default=0.65,help="vs-rest AUC bar for 'this Unknown leaf expresses that gene'")
+    pm.add_argument("--top",type=int,default=6,help="how many candidate modules to print")
+    pm.set_defaults(f=cmd_suggest_modules)
+    pe=sp.add_parser("expand-modules")
+    pe.add_argument("--out",required=True)
+    pe.add_argument("--add",required=True,
+                    help="comma-separated ORGAN module(s) the USER approved — of the SAME species as the run "
+                         "(mouse skin needing muscle takes MOUSE muscle). Species is read from the index.")
+    pe.add_argument("--paths",default=None,help='JSON list of leaves to re-profile (default: every Unknown leaf)')
+    pe.add_argument("--decisions",default=None); pe.add_argument("--species",default=None)
+    pe.add_argument("--server-url",dest="server_url",default=None)
+    pe.add_argument("--profile-cap",dest="profile_cap",type=int,default=150000)
+    pe.add_argument("--auc-pos",dest="auc_pos",type=float,default=0.65)
+    pe.set_defaults(f=cmd_expand_modules)
+    pr=sp.add_parser("ref-resolve")
+    pr.add_argument("--out",required=True)
+    pr.add_argument("--species",default=None); pr.add_argument("--organ",default=None)
+    pr.add_argument("--server-url",dest="server_url",default=None)
+    pr.add_argument("--ontology-url",dest="ontology_url",default=None); pr.add_argument("--ontology",default=None)
+    pr.add_argument("--reference",default=None)
+    pr.add_argument("--reference-h5ad",dest="reference_h5ad",default=None)
+    pr.add_argument("--reference-col",dest="reference_col",default=None)
+    pr.set_defaults(f=cmd_ref_resolve)
+    pmod=sp.add_parser("modules",
+        help="the canonical (species, organ) list the KG serves. Read-only; no --out, no h5ad. "
+             "Run this BEFORE init — it also reports the server_url every later call must use.")
+    pmod.add_argument("--species",default=None,help="filter to one species (mouse | human | ...; aliases accepted)")
+    pmod.add_argument("--server-url",dest="server_url",default=None)
+    pmod.set_defaults(f=cmd_modules)
+    prt=sp.add_parser("resolve-module",
+        help="free-text tissue -> canonical module(s). status=exact (proceed silently) | candidates "
+             "(the CALLER asks the user; each candidate's `match_type` gives the case) | none (do not annotate).")
+    prt.add_argument("--species",default=None,help="species (may be omitted when --tissue is 'mouse, brain')")
+    prt.add_argument("--tissue",required=True,help="the user's wording, e.g. 'mammary gland' or 'mouse, cerebellum'")
+    prt.add_argument("--server-url",dest="server_url",default=None)
+    prt.set_defaults(f=cmd_resolve_module)
     pc=sp.add_parser("check"); pc.add_argument("--out",required=True); pc.add_argument("--decisions",required=True); pc.set_defaults(f=cmd_check)
     pf=sp.add_parser("finalize"); pf.add_argument("--out",required=True); pf.add_argument("--decisions",required=True)
     pf.add_argument("--output",default=None); pf.add_argument("--force",action="store_true")
@@ -3758,7 +4827,13 @@ def main():
     init/check/finalize = the inlined helper engine (_helper_cli), run IN-PROCESS (no subprocess)."""
     argv = sys.argv[1:]
     if not argv or argv[0] in ("-h", "--help"):
-        print("usage: helper.py {init|descend|subcluster|check|finalize} ...\n"
+        print("usage: helper.py {modules|resolve-module|ref-resolve|init|descend|subcluster|check|finalize} ...\n"
+              "  modules        = the canonical (species, organ) list the KG serves (read-only, no --out).\n"
+              "  resolve-module = free-text tissue -> canonical module(s) + match_type + server_url. Run BEFORE init;\n"
+              "                   status=exact -> proceed, candidates -> the CALLER asks the user, none -> stop.\n"
+              "  ref-resolve = (reference mode) map the reference's labels onto KG term_ids — by name, and by\n"
+              "                MARKER AGREEMENT when the names differ. The reference's expression is read HERE\n"
+              "                AND NOWHERE ELSE, and only a {label: term_id} mapping leaves this step.\n"
               "  init | check | finalize = the inlined annotate engine (reads the user-specified cluster column)\n"
               "  descend    = marker-axis descent into a KG node's children (region->subtype, unconditional)\n"
               "  subcluster = marker-axis split by EXPLICIT named candidates (PCA fallback when 0/1 candidate)")
@@ -3767,7 +4842,7 @@ def main():
     # ★ scoring-based annotation (score-profile/apply/finalize) is not in this release — its fixed-quota
     #   candidates, absence of agent-judgeable material and unjudged auto-subtyping are unresolved, so
     #   annotate-mode provides clustering-based annotation only (development continues out of tree).
-    if cmd in ("score-profile", "score-apply", "score-finalize"):
+    if cmd in ("score-profile", "score-apply", "score-finalize"):  # noqa: retired scoring path
         print(f"[helper] '{cmd}' is not supported in this version — annotate-mode provides clustering-based annotation "
               "only (init/descend/subcluster/check/finalize).\n"
               "         Detection of processes (neuropil, fiber tract, ...) is not supported yet.")
@@ -3787,10 +4862,11 @@ def main():
         ap.add_argument("--auc-pos", dest="auc_pos", type=float, default=0.65)
         a = ap.parse_args(rest)
         (cmd_descend if cmd == "descend" else cmd_subcluster)(a)
-    elif cmd in ("init", "check", "finalize"):
+    elif cmd in ("init", "check", "finalize", "ref-resolve", "suggest-modules", "expand-modules",
+                 "modules", "resolve-module"):
         _helper_cli()   # inlined helper engine's argparse dispatch, in-process (reads sys.argv)
     else:
-        print(f"[helper] unknown command '{cmd}' — use init|subcluster|descend|check|finalize")
+        print(f"[helper] unknown command '{cmd}' — use modules|resolve-module|init|subcluster|descend|check|finalize")
         raise SystemExit(2)
 
 

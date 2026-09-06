@@ -33,6 +33,15 @@ principle in full detail.
 
 ---
 
+> **A REFERENCE (answer-key) was supplied? → this is the wrong SKILL.** If the caller handed a set of
+> expected cell types — a label list, or an annotated reference h5ad + column — the run is
+> **annotate-reference-mode**: read `skills/annotate-reference-mode/SKILL.md` instead. It is this same
+> method with one delta (the label space is restricted to the answer-key, and anything the answer-key
+> cannot explain becomes Unknown rather than an out-of-reference class floor). **The caller declares
+> `mode : reference` when the user invoked `/annotate-reference-mode`**, and the presence of a reference
+> input switches the mode on its own as well — either signal is enough, so a forgotten declaration never
+> silently turns a reference run into an ordinary one.
+
 ## 1b. One mode — clustering-based annotation. Tissue **processes** are out of scope.
 
 This skill has **exactly one method**: marker-axis Leiden → judge each cluster by R1–R8 (REAL/DEEPEST/FLOOR).
@@ -254,8 +263,8 @@ multiplying:
 | actor | responsibility |
 |---|---|
 | **expert agent = you** | Run `helper.py`, read profiles, judge each leaf by R1–R8 (§5), drive the split yourself, write the decisions JSON + per-round CSV. **Never ask the user.** Standard annotation is autonomous. **You own your `--out` directory exclusively.** |
-| **caller (= the manager/main session)** | Spawns **one expert agent per dataset** and then **WAITS** for that agent's final result — nothing else. The caller **does NOT** run `helper.py`, read the agent's `--out` directory, inspect profiles, judge clusters, decide descents, or make any annotation call of its own. Doing so duplicates the agent's work and, if it writes, **corrupts `_annotate_state.json`** (two loops on one directory). Each `--out` is owned by exactly one expert agent. The caller's only jobs: **settle the KG module of every dataset first** (§3 MODULE RESOLUTION — one confirmation round covering the whole batch, before a single agent is spawned), spawn + wait, then relay the finished result to the user and run the post-finalize interactive phase (§8). For a single dataset it may run the expert inline instead of spawning — but still **one owner only**, never a second parallel brain on the same directory. **Everything it says to the user is in English, regardless of the language the user wrote in** (see the rule at the top). |
-| **`helper.py`** | The **single, self-contained backend** — all compute (profiling, the identity engine, gates), the marker-axis split, and the final h5ad write, in one script. **Validates** your decisions (`check`/`finalize`) and returns violations — it **never silently changes a decision**. Every command (`init`/`subcluster`/`descend`/`check`/`finalize`) runs in this one file; it does not call any other helper. |
+| **caller (= the manager/main session)** | Spawns **one expert agent per dataset** and then **WAITS** for that agent's final result — nothing else. The caller runs **exactly two** `helper.py` commands, both read-only and both BEFORE any agent exists: `modules` and `resolve-module` (§3 MODULE RESOLUTION — they take no `--out`, touch no h5ad and write nothing). Beyond those it **does NOT** run `helper.py`, read the agent's `--out` directory, inspect profiles, judge clusters, decide descents, or make any annotation call of its own. Doing so duplicates the agent's work and, if it writes, **corrupts `_annotate_state.json`** (two loops on one directory). Each `--out` is owned by exactly one expert agent. The caller's only jobs: **settle the KG module of every dataset first** (§3 MODULE RESOLUTION — one confirmation round covering the whole batch, before a single agent is spawned), **translate the invoked skill into a mode and pass it on** — the user declares the mode by choosing `/annotate-mode` or `/annotate-reference-mode`, not by a prompt field, and the caller carries that choice to the agent as `mode : reference` in the **spawn prompt** (the agent is a separate process and does not inherit the skill the caller loaded), spawn + wait, then relay the finished result to the user and run the post-finalize interactive phase (§8). For a single dataset it may run the expert inline instead of spawning — but still **one owner only**, never a second parallel brain on the same directory. **Everything it says to the user is in English, regardless of the language the user wrote in** (see the rule at the top). |
+| **`helper.py`** | The **single, self-contained backend** — all compute (profiling, the identity engine, gates), the marker-axis split, and the final h5ad write, in one script. **Validates** your decisions (`check`/`finalize`) and returns violations — it **never silently changes a decision**. Every command (`modules`/`resolve-module`/`init`/`subcluster`/`descend`/`check`/`finalize`) runs in this one file; it does not call any other helper. `modules`/`resolve-module` are the read-only pre-`init` pair the CALLER runs (§3); everything else belongs to the one agent that owns `--out`. |
 
 ---
 
@@ -268,7 +277,14 @@ ontology server is automatic — pass `--species`/`--organ`; the helper writes `
 
 **INPUTS the caller gathers from the user's prompt BEFORE `init` (clustering is the user's job — done in their
 notebook — so the h5ad arrives already clustered):**
-- **`{input_h5ad}`** — path to the h5ad to annotate.
+- **`{input_h5ad}`** — path to the h5ad to annotate. **Preconditions `init` enforces before anything
+  else:** `adata.X` is **log-normalised** (not raw counts, not scaled/z-scored/Pearson residuals) and
+  `adata.var_names` are **gene symbols** (not Ensembl IDs). Violate either and `init` exits with
+  `[init][ERROR:INPUT_MATRIX]`, writing nothing — the agent stops and returns `INPUT_MATRIX_REJECTED`
+  with the engine's diagnosis, and **you relay that diagnosis to the user verbatim**. It is not advisory:
+  the run would otherwise complete and produce garbage labels (markers are matched by symbol; the
+  marker-axis statistics assume lognorm). `--force` downgrades it to a warning — pass it **only** when
+  the user has explicitly asked to proceed on non-standard input, never to get past the gate yourself.
 - **`{cluster_col}`** — the **obs column holding the clusters/annotation to annotate** (e.g. `leiden`). The user
   names it in the prompt (*"cluster column: leiden"* / *"annotate the `seurat_clusters` column"*). It is a
   REQUIRED input — `init --cluster-col {cluster_col}` reads exactly that column, and every distinct value in it
@@ -276,26 +292,61 @@ notebook — so the h5ad arrives already clustered):**
   must resolve up front); do not guess `leiden` when the h5ad has several candidate columns.
 - **`{species}` / `{organ}`** — the KG module, resolved by the **MODULE RESOLUTION** protocol below before
   `init` is run. The user's tissue is free text; `--organ` takes the **canonical** module name.
+- **`mode`** — **not a field in the user's prompt; it comes from WHICH SKILL they invoked.** The user
+  declares the mode by choosing `/annotate-mode` or `/annotate-reference-mode`; you translate that choice
+  into `mode : reference` in the **spawn prompt**, because the agent is a separate process and does not
+  inherit the skill you loaded. Set it whenever the reference variant was invoked, or whenever you pass
+  any reference input. (The reference input switches the mode on its own too — either signal alone is
+  enough, so a forgotten declaration cannot silently downgrade a reference run to an ordinary one.)
+- **reference inputs** *(reference runs only)* — `reference` (a label-list file) **OR**
+  `reference h5ad` + `reference column`; optionally `reference scope` (`strict` default / `refine` —
+  label-space depth, **not** the mode switch) and `reference alias`. Relay the user's paths verbatim.
+  Passing `mode : reference` with **no** reference input makes the agent stop with
+  `REFERENCE_INPUT_MISSING` — an answer-key cannot be invented, so ask the user for it before spawning.
 
 **MODULE RESOLUTION (the caller does this BEFORE spawning the agent — it is the caller that talks to the user):**
 
-1. `GET {server}/modules` → the canonical `(species, organ)` list the KG actually serves, with `n_terms`.
-2. Normalise the user's tissue for comparison: lowercase, spaces ↔ underscores, drop a leading article.
-   Compare against that list.
-3. **EXACT match → use it silently.** `brain` → `brain`, `Large Intestine` → `large_intestine`. No question is
-   asked; a name that already IS a module is never second-guessed.
-4. **Otherwise → ASK the user and WAIT.** "Otherwise" is every one of these:
-   - **different name** — a synonym (`mammary gland` → `breast`, `colon` → `large_intestine`),
-   - **finer than the KG (subtype → parent)** — the user names a part, the KG serves only the whole
+1. **Ask the KG — do not do this by hand.** One call turns the user's wording into the vocabulary the KG
+   actually serves, and reports the server it resolved against. **The MCP tool is the default path:**
+
+   ```
+   mcp__cellman-kg__resolve_module(tissue="{the user's wording}", species="{species}")
+   mcp__cellman-kg__list_modules(species="mouse")     # the full served list, to show coverage
+   ```
+
+   **Fallback — use it whenever the `cellman-kg` tools are not present in this host** (the server was not
+   registered; nothing else about the run changes):
+
+   ```bash
+   {python} {HELPER} resolve-module --species {species} --tissue "{the user's wording}"
+   #   (or, in the SKILL's own "mouse, brain" form:  resolve-module --tissue "mouse, brain")
+   #   {python} {HELPER} modules [--species mouse]
+   ```
+
+   **The two are the same code** — the MCP server shells out to that very command — so they return the
+   same answer against the same server. Pick whichever is available; never run both to compare.
+   It returns `{status, organ|candidates[{organ,n_terms,match_type}], can_serve_together, server_url, served_organs}`.
+   The normalisation (lowercase, separators, articles, `brain tissue` → `brain`) and the synonym /
+   parent / umbrella / ambiguous tables are **in the command**, so you, the agent and the engine cannot
+   drift apart. An MCP host may expose the same thing as `resolve_module` — identical answer, same code.
+2. **`status="exact"` → use it silently.** `brain` → `brain`, `Large Intestine` → `large_intestine`. No
+   question is asked; a name that already IS a module is never second-guessed.
+3. **RECORD `server_url` and pass it to the agent**, which passes it to `init --server-url`. The built-in
+   default and a deployment's `$CELLONTO_SERVER_URL` are often different addresses; without this the
+   module you confirmed and the wing the engine fetches can come from **different servers**, silently.
+4. **`status="candidates"` → ASK the user and WAIT.** Each candidate's `match_type` says which case it is —
+   these are the four, and `resolve-module` has already picked the right one for you:
+   - **different name** (`match_type=synonym`) — `mammary gland` → `breast`, `colon` → `large_intestine`,
+   - **finer than the KG (`match_type=parent_of_subtype`)** — the user names a part, the KG serves only the whole
      (`cerebellum`/`hippocampus` → `brain`, `white adipose tissue` → `adipose_tissue`). One candidate:
      confirm that the parent module is acceptable for this sample.
-   - **coarser than the KG (umbrella → children)** — the user names a region the KG has **split into
+   - **coarser than the KG (`match_type=umbrella_children`, `can_serve_together=true`)** — a region the KG **split into
      several modules** (`intestine` → `small_intestine` + `large_intestine`; `CNS` → `brain` +
      `spinal_cord`; `immune` → `blood` + `bone_marrow` + `lymph_node` + `spleen` + `thymus`). List
      **every** child module and offer both readings explicitly: **one of them**, or **all of them served
      together**. Say which way you would lean and why — all of them when the sample genuinely spans the
      parts (a whole gut roll, whole CNS section), one of them when the user probably has a single part.
-   - **plainly ambiguous** — the word maps to different organs depending on intent (`gut` may be either
+   - **plainly ambiguous** (`match_type=ambiguous`) — the word maps to different organs by intent (`gut` may be either
      intestine; `throat` → `trachea`/`tonsil`/`mouth`).
    Present the candidate module(s) with one line of WHY each was proposed, and state plainly that the KG has
    no module under the name the user wrote. Never start `init` on an unconfirmed module.
@@ -306,8 +357,10 @@ notebook — so the h5ad arrives already clustered):**
      label set then spans those organs — say so, since a wider candidate set makes cross-organ force-fit easier.
    - **names a module you did not propose** → use the user's module verbatim. Do not argue it back to your own
      candidate. Only if that name 404s do you report it and ask again (the helper's error lists the served modules).
-6. **No plausible module at all** (the KG has no such tissue) → tell the user and stop. Never annotate from
-   guesswork, and never silently substitute a "close" organ.
+6. **`status="none"`** (the KG has no such tissue) → tell the user and stop. Never annotate from
+   guesswork, and never silently substitute a "close" organ. A `match_type=token` candidate is the
+   weakest kind (a served name appeared as a word of the input, e.g. `left kidney` → `kidney`) — treat
+   it as a question, never as a match.
 
 The agent re-validates whatever `(species, organ)` it is handed. If it is not an exact served module and the
 caller did not record a user confirmation, the agent **stops and returns `MODULE_CONFIRM_REQUIRED` + candidates**
@@ -316,8 +369,8 @@ instead of guessing — the caller then asks the user and re-spawns it with the 
 **BATCH RULE — several datasets: resolve ALL modules first, then start ALL agents.** Module resolution is a
 **barrier**, not a per-dataset step. With N datasets the caller:
 
-1. Runs steps 1–3 above for **every** dataset first, and spawns **nothing** yet. Datasets whose tissue is an
-   exact module name are settled silently; the rest collect candidates.
+1. Runs `resolve-module` for **every** dataset first, and spawns **nothing** yet. Datasets that come back
+   `status="exact"` are settled silently; the rest collect candidates.
 2. If **any** dataset needs confirmation, asks **one** question covering them all — never one question per
    dataset, and never a question after some agents are already running. Show the whole plan so the user sees
    what is settled and what is being asked:
@@ -354,6 +407,14 @@ location (`--out {base_out}/annotation_out`; `mkdir -p` it before `init`). All a
 land there. Pass the same `--out` to every round.
 
 ```bash
+# modules / resolve-module — the ONLY commands that run BEFORE init (no --out, no h5ad, read-only).
+#   Normally you reach these through the MCP tools (mcp__cellman-kg__resolve_module / list_modules);
+#   this is the fallback form for a host where the cellman-kg server is not registered.
+#   resolve-module turns free text into the served vocabulary and reports the server_url it used;
+#   pass that server_url to init --server-url so the LLM and the engine read the SAME KG.
+{python} {HELPER} modules [--species {species}]
+{python} {HELPER} resolve-module --species {species} --tissue "{free text}"
+
 mkdir -p {out}
 # The input h5ad ALREADY carries a cluster/annotation column (leiden or any obs column the user names —
 #   clustering is the user's job, done in their notebook). You annotate that column directly:
@@ -772,8 +833,54 @@ relays your helper calls. The user is engaged **only after finalize**.
    yields no new separation** (all sub-groups re-judge to the same parent class — a genuine detection floor) →
    keep the parent label honestly. Never force-fit. Descend even clear-looking leaves so a hidden minority /
    diluted region is not missed.
-4. `helper.py check` → fix any flagged leaves → `finalize` → writes `obs['cellman_annotation']`. **This
-   ends standard annotation.** Report the outcome to the caller.
+4. **MODULE EXPANSION — the one pause before finalize (skip when nothing is Unknown).** A tissue does not
+   stop at the module boundary: mouse skin carries panniculus carnosus, and the mouse/skin wing has no muscle
+   term at all, so a real skin section leaves a 5,771-cell `Ttn`-top cluster at `lineage=None` / `top=None`
+   → Unknown, purely because `Ttn` is absent from the skin index. When Unknown leaves remain, ask whether
+   another wing explains them — but **never add one on your own**:
+
+   ```bash
+   {python} {HELPER} suggest-modules --out {out} --decisions {out}/_annotate_decisions.json --species {species}
+   ```
+   It reads what the Unknown leaves EXPRESS (from the profiles — no data is re-read), sweeps the other
+   modules the KG serves, and ranks the ones whose terms could name them.
+
+   > **SAME SPECIES, ALWAYS — expansion crosses the ORGAN boundary, never the SPECIES one.** A *mouse* skin
+   > run that needs muscle takes **mouse** muscle, never human muscle: the markers are that organism's gene
+   > symbols, so a cross-species wing would be nonsense on this panel. The species is taken from the module
+   > the run was confirmed on — **omit `--species`**; passing one that contradicts the index is a hard error
+   > (`SPECIES_MISMATCH`), and the merge refuses a species mix as well. Only the organ varies. A candidate term
+   counts only when (a) it is **not already in your index**, (b) ≥1 of the markers carrying it is a gene your
+   module could not even see, and (c) its OWN required/defining markers are ON (one is enough when the panel
+   measures only one, and it is a DEFINING marker). Ranking is by **marker specificity KG-wide**, not by
+   cluster size — a broad marker on a big cluster must not outrank a narrow one.
+
+   **Then JUDGE the output — it is evidence, not an answer.** A marker can be shared between organs for real
+   biological reasons: on that same skin run the top-ranked candidate was `thymus` via `FOXN1`, on a
+   `Krt1`-high keratinocyte cluster — `Foxn1` is a hair-follicle gene too, and the proposal is simply wrong.
+   The `muscle` candidate underneath it (`skeletal muscle cell` via `Ttn`, auc 0.88, claimed by ONE term in
+   the whole KG) is the real one. Discard what your module knowledge rejects.
+
+   **Ask the caller, then WAIT — do not finalize.** Emit, and stay alive for the answer:
+   ```
+   MODULE_EXPANSION_PROPOSED
+   unknown: <n leaves, n cells>
+   propose: [{organ, why, unknown_leaves, evidence_markers}]     # one or several modules
+   ```
+   The caller puts it to the user ("*…so I recommend also serving the muscle module; shall I proceed?*").
+   - **approved** (possibly a subset) → `helper.py expand-modules --out {out} --add muscle[,…]` — the
+     organ name only; the species is the run's own → it merges
+     the wing (your primary module keeps its hierarchy and its marker degrees) and **re-profiles ONLY the
+     Unknown leaves** — every decided leaf is FROZEN, so an expansion can add answers but never rewrite a
+     call your module already earned. Re-judge just those leaves by R1–R8 (descend as usual), then finalize.
+     A leaf the added wing still cannot name **stays Unknown** — that is a result, not a failure.
+   - **declined** → finalize as is, with those leaves Unknown. Record it and never ask again.
+
+   Propose only when it is worth a question: no Unknown, or only a scatter of tiny fragments with no
+   candidate clearing the gate → skip this step entirely and finalize.
+
+5. `helper.py check` → fix any flagged leaves → `finalize` → writes `obs['cellman_annotation']`. **This
+   ends standard annotation.** Report the outcome to the caller, naming every module that was served.
 
 ### Interactive phase (after finalize — the only user touchpoint)
 The caller presents the finalized outcome (table + explanation) and offers **① done** or **②

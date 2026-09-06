@@ -90,6 +90,46 @@ Common:
 
 ---
 
+## Reference runs (annotate to an answer-key)
+
+When you have an expected set of cell types — a label list, or an already-annotated h5ad — invoke
+`/annotate-reference-mode`. Identity is judged exactly as before (the same R1–R8 test against the full
+Cell-Ontology graph); the answer-key only restricts which terms may become a **label**, and anything it
+cannot explain becomes `Unknown`.
+
+```
+/annotate-reference-mode Annotate the h5ad below using the annotate-expert agent.
+
+- input            : /path/mouse_kidney.h5ad
+- tissue           : mouse, kidney
+- virtual env      : /path/to/your/.venv
+- cluster column   : leiden
+- reference h5ad   : /path/ref.h5ad
+- reference column : celltype_plot
+- reference scope  : strict
+```
+
+**You declare the mode by which skill you invoke, not by a field in the prompt.** `/annotate-mode` and
+`/annotate-reference-mode` are the two declarations. Your caller translates that choice into
+`mode : reference` when it spawns the expert agent, because the agent is a separate process and does not
+inherit the skill you loaded.
+
+| field | meaning |
+|---|---|
+| `reference` **or** `reference h5ad` + `reference column` | the answer-key. Only the LABELS are read — the reference's expression never becomes evidence for the target data. |
+| `reference scope` | `strict` (default) = label only with the answer-key's own terms; `refine` = its KG descendants become labelable too, so a lumped reference term can be resolved finer. It sets the label-space **depth**, not the mode. |
+| `reference alias` | only when the answer-key's names differ from the KG's — and normally you do not write it: the agent builds it with `helper.py ref-resolve`, matching by marker agreement, and asks you only about the genuinely ambiguous ones. |
+
+Belt and braces: the reference input switches the mode on its own too, so a caller that forgets to pass
+the declaration still runs in reference-mode. The one combination that stops the run is a declared
+reference-mode with **no** answer-key at all — it cannot be invented, so you are asked for it rather
+than quietly annotated without one.
+
+`finalize` additionally writes `reference_coverage.json`: how much of the answer-key was reproduced
+(`recovery_rate`), what resolved deeper than it (`refine` only), and what it could not explain.
+
+---
+
 ## Which module gets used
 
 The KG serves one module per `(species, organ)` — see the table in the [README](README.md). Your
@@ -140,6 +180,16 @@ substituted silently.
 
 ## Requirements (per input h5ad)
 
-- `adata.X` = **log-normalised** (not raw counts).
+- `adata.X` = **log-normalised** (not raw counts, and not scaled / z-scored / Pearson residuals).
 - `adata.var_names` = **gene symbols** (not Ensembl IDs).
 - `adata.obs` has the **cluster column**.
+
+The first two are checked before anything else runs. If either fails, annotation **stops immediately**
+and you are told exactly what was detected — for example *"63% of the non-zero values are whole numbers
+(max=412)"* or *"row sums equal obs['total_counts'] — the rows are still that cell's transcript counts"* —
+together with the fix (`sc.pp.normalize_total(adata, target_sum=1e4)` then `sc.pp.log1p(adata)`).
+
+This is deliberately a hard stop rather than a warning: a run on raw counts or Ensembl IDs completes
+normally and returns labels that are meaningless, which is far worse than failing in the first minute.
+Nothing is written and no time is spent. If your matrix really is non-standard and you want to proceed
+anyway, say so — that is the only way `--force` is used.

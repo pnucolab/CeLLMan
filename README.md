@@ -29,6 +29,11 @@ Then register the skill and the expert agent with your LLM host.
 mkdir -p .claude/skills .claude/agents
 cp -r CeLLMan/skills/annotate-mode .claude/skills/
 cp CeLLMan/agents/annotate-expert.md .claude/agents/
+
+# the read-only KG lookup as native tools — the path the skill takes by default
+claude mcp add cellman-kg \
+  --env CELLMAN_PYTHON="$(pwd)/.venv/bin/python" \
+  -- python3 "$(pwd)/CeLLMan/mcp/cellman_kg_mcp.py"
 ```
 
 ```bash
@@ -37,10 +42,23 @@ mkdir -p .agents/skills .codex/agents
 cp -r CeLLMan/skills/annotate-mode .agents/skills/
 cp CeLLMan/agents/annotate-expert.toml .codex/agents/
 printf '\n[sandbox_workspace_write]\nnetwork_access = true\n' >> .codex/config.toml
+
+cat >> ~/.codex/config.toml <<EOF
+
+[mcp_servers.cellman-kg]
+command = "python3"
+args = ["$(pwd)/CeLLMan/mcp/cellman_kg_mcp.py"]
+env = { CELLMAN_PYTHON = "$(pwd)/.venv/bin/python" }
+EOF
 ```
 
 The agent locates the backend by name, so keep the clone directory called `CeLLMan`:
 `find . -path '*CeLLMan/scripts/helper.py'`.
+
+`cellman-kg` is how the KG module lookup is reached **by default** — see [`mcp/README.md`](mcp/README.md)
+for what it exposes and how to verify it. **Skipping it breaks nothing**: it only wraps
+`helper.py resolve-module` / `helper.py modules`, and the skill falls back to those commands whenever the
+tools are absent. Same code, same answer, one extra shell call.
 
 ---
 
@@ -54,6 +72,14 @@ Give the tissue in any wording you like: an exact module name runs straight away
 (`mammary gland`, `cerebellum`, `gut`) is turned into a question before annotation starts — see
 [`CALLER_PROMPT_GUIDE.md`](CALLER_PROMPT_GUIDE.md). Ask for several modules at once and they are
 served together.
+
+The table below is a snapshot. The live list — and what any wording resolves to — comes from the
+server:
+
+```bash
+{python} CeLLMan/scripts/helper.py modules --species mouse
+{python} CeLLMan/scripts/helper.py resolve-module --species mouse --tissue "mammary gland"
+```
 
 ### Human
 

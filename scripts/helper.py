@@ -2521,13 +2521,33 @@ def _identity_scores(fon, lf, M, pin=None, frac=0.30, lf_high=2.0, lf_on=1.5, pi
     #   disease_candidates path is retired. Base-agnostic PROGRAMS live in `sa` (state_axis) and are appended
     #   only in the interactive phase.) is_state is kept False for backward-compatible readers.
     for c in cand: c["is_state"]=False
-    lin_idx=M["lin_idx"]; lin_class=M["lin_class"]; linbest=None
-    for lx,idxs in lin_idx.items():
-        c=sum(1 for g in idxs if _on(g))
-        if c>=1 and (linbest is None or c>linbest[1]): linbest=(lx,c)   # >=1 lineage marker → class fallback
-    classfb=({"term_id":lin_class[linbest[0]],"label":linbest[0]} if linbest and linbest[0] in lin_class else None)
+    # ★ CLASS FALLBACK — the floor used when `top` is None. It must name the SAME lineage the rest of this
+    #   function already decided (`dom_root`, scored from the candidate terms' `spec`). The old code ran a
+    #   SECOND, cruder lineage vote here — the raw COUNT of ON markers in each root's own required set — and it
+    #   disagreed with `dom_root` on 29% of leaves, systematically:
+    #     · a root whose R is EMPTY is not in `lin_idx` at all (`_derive_lineages` skips it, deliberately —
+    #       see its docstring), so `epithelial cell` (R=[]) could NEVER be the fallback: kidney tubule leaves
+    #       floored to `mesenchymal cell` because VIM alone outvoted every root that happened to be registered;
+    #     · counting favours marker-rich / promiscuous roots (mesenchymal VIM, muscle, endothelial) over
+    #       marker-poor ones (leukocyte = CD52 only) regardless of what the leaf actually is;
+    #     · ties were broken by dict insertion order (strict `>`), so a 1e-5 shift in gsd could flip the floor.
+    #   The GATE is unchanged (>=1 lineage marker ON somewhere ⇒ a class floor exists at all), so the Unknown
+    #   rate does not move. The marker-count answer is still reported, as `class_fallback_by_markers` — an
+    #   INDEPENDENT second opinion on the lineage: when the two disagree, one of the signals is being hijacked
+    #   and the leaf is worth a look. The real fix for the R=[] roots belongs in the KG (give them a genuinely
+    #   shared required set); this only stops the fallback from contradicting the call the engine already made.
+    lin_idx=M["lin_idx"]; lin_class=M["lin_class"]
+    _hit={lx:c for lx,c in ((lx, sum(1 for g in idxs if _on(g))) for lx,idxs in lin_idx.items()) if c>=1}
+    _bymk=None
+    if _hit:
+        # strength PER MARKER (not the raw count), then the count, then the label — fully deterministic
+        _pick=max(_hit, key=lambda lx:(sum(fon[g] for g in lin_idx[lx] if _on(g))/len(lin_idx[lx]), _hit[lx], lx))
+        if _pick in lin_class: _bymk={"term_id":lin_class[_pick],"label":_pick}
+    if not _hit:               classfb=None
+    elif dom_root is not None: classfb={"term_id":dom_root,"label":lab.get(dom_root,dom_root)}
+    else:                      classfb=_bymk
     for c in cand: c.pop("_root",None)
-    return {"top":top,"ranked":ranked,"class_fallback":classfb,
+    return {"top":top,"ranked":ranked,"class_fallback":classfb,"class_fallback_by_markers":_bymk,
             "mixed":bool(len(codom)>=2),"n_strong_lineages":len(rs),
             "dominant_lineage":(lab.get(dom_root,dom_root) if dom_root else None),
             "codominant_lineages":[lab.get(r,r) for r in codom]}

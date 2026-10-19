@@ -52,7 +52,7 @@ Replace R4-DEEPEST / R8-FLOOR **targets** with this; every other rule is unchang
 > 3. else **Unknown**.
 >
 > **A class / region FLOOR is only permitted when that class or region node is itself in the answer-key.**
-> "정답이 없으면 Unknown" — an out-of-reference floor is a violation, not an honest floor.
+> **No answer-key term fits, no label**: an out-of-reference floor is a violation, not an honest floor.
 
 **R3 is NOT relaxed.** A reference term still has to earn its label: its OWN low-share markers ENRICHED,
 negatives clean. *"It is the only reference term left"* is **never** evidence. The narrower candidate set makes

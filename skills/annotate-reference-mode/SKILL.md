@@ -13,6 +13,12 @@ reasoning. This file documents only the **three deltas**.
 
 Everything runs through the same `scripts/helper.py`; there is no second backend and no companion script.
 
+> **NOT ENSEMBLED.** annotate-mode's default 3-judge consensus (its SKILL §8b) does **not** apply here.
+> The output is written in the ANSWER-KEY's vocabulary (§5), not the KG's, so a consensus over the KG
+> hierarchy would read those labels as unknown terms and collapse the run to Unknown —
+> `helper.py consensus-round` refuses a reference run by design (`ERROR:REFERENCE_RUN`). A reference run
+> is **one** `annotate-expert`; `annotate-lead` returns `REFERENCE_NOT_ENSEMBLED` if it is handed one.
+
 ---
 
 ## 1. What the reference does (and does NOT do)

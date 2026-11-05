@@ -22,13 +22,15 @@ source .venv/bin/activate
 uv pip install -r CeLLMan/requirements.txt
 ```
 
-Then register the skill and the expert agent with your LLM host.
+Then register the skill and both agents with your LLM host. **Both** are needed: annotation runs as a
+3-judge ensemble by default — the `annotate-lead` owns the run and adjudicates, and three
+`annotate-expert` judges supply the independent judgments it merges.
 
 ```bash
 # claude code
 mkdir -p .claude/skills .claude/agents
 cp -r CeLLMan/skills/annotate-mode .claude/skills/
-cp CeLLMan/agents/annotate-expert.md .claude/agents/
+cp CeLLMan/agents/annotate-expert.md CeLLMan/agents/annotate-lead.md .claude/agents/
 
 # the read-only KG lookup as native tools — the path the skill takes by default
 claude mcp add cellman-kg \
@@ -40,7 +42,7 @@ claude mcp add cellman-kg \
 # codex
 mkdir -p .agents/skills .codex/agents
 cp -r CeLLMan/skills/annotate-mode .agents/skills/
-cp CeLLMan/agents/annotate-expert.toml .codex/agents/
+cp CeLLMan/agents/annotate-expert.toml CeLLMan/agents/annotate-lead.toml .codex/agents/
 printf '\n[sandbox_workspace_write]\nnetwork_access = true\n' >> .codex/config.toml
 
 cat >> ~/.codex/config.toml <<EOF

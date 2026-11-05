@@ -3,6 +3,10 @@ anndata>=0.10
 scanpy>=1.10
 igraph>=0.11
 leidenalg>=0.10
+# PINNED, not incidental: with scanpy 1.11, pynndescent >= 0.6 returns a scipy sparse ARRAY with no
+# .getnnz(), so `descend` crashes on duplicate-heavy marker axes. Without the pin every agent invents
+# its own workaround shim, and that shim is itself a source of run-to-run variance.
+pynndescent<0.6
 numpy
 scipy
 pandas

@@ -29,7 +29,15 @@ import scipy.sparse as _spx
 # and are connected here automatically.
 # Precedence: --server-url flag > CELLONTO_SERVER_URL env var > this default.
 # If you run your own server, point CELLONTO_SERVER_URL at it.
-DEFAULT_ONTOLOGY_SERVER = "https://cellman.pnucolab.com"
+#
+# The path carries the API VERSION. Everything below appends to this base
+# (`{base}/modules`, `{base}/module/{species}/{organ}/slim-index`, ...), so the version is
+# fixed in one place. It is versioned for two reasons: the host also serves a KG explorer
+# that owns `/module/{species}/{organ}` as a page, and a breaking change to this API has to
+# become a NEW PATH rather than a silent change under the old one — clients we cannot reach
+# keep reading the contract they were built against. Unversioned URLs are still served for
+# clients released before the move; new ones should not use them.
+DEFAULT_ONTOLOGY_SERVER = "https://cellman.pnucolab.com/kg/v1"
 def _resolve_server(server_url=None):
     return (server_url or os.environ.get("CELLONTO_SERVER_URL") or DEFAULT_ONTOLOGY_SERVER).rstrip("/")
 
@@ -4397,6 +4405,36 @@ def cmd_finalize(a):
         base=";".join(map(str,lab)) if isinstance(lab,(list,tuple)) else lab
         ann[cps==path]=_synth(path, base, dec)
     adata.obs[col]=ann                            # only the key column is added (the helper never demotes or alters anything)
+    # ENSEMBLE provenance: when the run was judged by N judges + a lead (consensus-round wrote
+    #   _consensus_round{k}.json each round), carry the agreement onto the cells. Per LEAF, taken from
+    #   the LAST round the leaf appears in -- that is the round its final decision was made in. These
+    #   columns are the per-cell uncertainty map: low support or a *_resolved status marks exactly the
+    #   cells a human should look at. A single-judge run writes none of them (fully additive), and the
+    #   interactive free column never rewrites them.
+    _cons_leaf={}; _cons_meta={}
+    if col=="cellman_annotation":
+        for _f in sorted(glob.glob(os.path.join(a.out,"_consensus_round*.json")),
+                         key=lambda x:int(re.sub(r"\D","",os.path.basename(x)) or 0)):
+            try: _cj=json.load(open(_f))
+            except Exception: continue
+            _cons_meta={"n_judges":_cj.get("n_judges"),"need":_cj.get("need"),"judges":_cj.get("judges") or []}
+            for _p,_e in (_cj.get("leaves") or {}).items(): _cons_leaf[_p]=_e      # later round overwrites
+    if _cons_leaf:
+        _jn=_cons_meta.get("judges") or []
+        sup=np.zeros(adata.n_obs,dtype=np.int16); sst=np.full(adata.n_obs,"",dtype=object)
+        jl=[np.full(adata.n_obs,"",dtype=object) for _ in _jn]
+        for _p,_e in _cons_leaf.items():
+            m=(cps==_p)
+            if not m.any(): continue
+            _c=_e.get("consensus") or {}
+            sup[m]=int(_c.get("support") or 0); sst[m]=str(_c.get("status") or "")
+            for _i,_row in enumerate(_e.get("judges") or []):
+                if _i<len(jl): jl[_i][m]=str(_row.get("label") or _row.get("decision") or "")
+        adata.obs["cellman_consensus_support"]=sup
+        adata.obs["cellman_consensus_status"]=pd.Categorical(sst)
+        for _i,_nm in enumerate(_jn): adata.obs[f"cellman_{_nm}"]=pd.Categorical(jl[_i])
+        print(f"[finalize] ensemble: wrote cellman_consensus_support/_status + "
+              f"{len(_jn)} per-judge label column(s) ({'/'.join(_jn)})", flush=True)
     adata.write_h5ad(out_h5ad)
     print(f"[finalize] wrote {out_h5ad} (input copy + obs['{col}'])", flush=True)
     rows=[]
@@ -4493,6 +4531,82 @@ def cmd_finalize(a):
     rat_path=os.path.join(a.out,f"annotation{sfx}_rationale.md")
     open(rat_path,"w").write("\n".join(rl))
     print(f"[finalize] wrote {rat_path} (per-cluster natural-language rationale + PMIDs)", flush=True)
+    # celltype_confidence.csv — ONE confidence per final celltype. Leaves that share a label merge into one
+    #   celltype, so their per-leaf high/medium/low are pooled (cell-weighted) into a composition and the
+    #   LARGEST share wins. A tie resolves to the LOWER confidence (conservative). Only decision=='celltype'
+    #   leaves with a valid confidence count; Unknown/Background have no celltype confidence.
+    _rank={"high":2,"medium":1,"low":0}; _agg={}
+    for r in rows:
+        c=str(r.get("confidence","")).strip().lower()
+        if r.get("decision")!="celltype" or c not in _rank: continue
+        e=_agg.setdefault(r["label"],{"high":0,"medium":0,"low":0,"n_leaves":0}); e[c]+=int(r["n_cells"]); e["n_leaves"]+=1
+    crow=[]
+    for lb,e in _agg.items():
+        tot=e["high"]+e["medium"]+e["low"]
+        if tot<=0: continue
+        fr={k:e[k]/tot for k in _rank}
+        best=max(_rank, key=lambda k:(fr[k], -_rank[k]))      # max share; tie -> lower confidence
+        crow.append({"celltype":lb,"confidence":best,"n_cells":tot,"n_leaves":e["n_leaves"],
+                     "frac_high":round(fr["high"],4),"frac_medium":round(fr["medium"],4),"frac_low":round(fr["low"],4)})
+    if crow:
+        crow.sort(key=lambda x:-x["n_cells"])
+        cc_path=os.path.join(a.out,f"celltype_confidence{sfx}.csv")
+        pd.DataFrame(crow).to_csv(cc_path,index=False)
+        _cnt={k:sum(1 for x in crow if x["confidence"]==k) for k in _rank}
+        print(f"[finalize] wrote {cc_path} (per-celltype confidence: {_cnt['high']} high / {_cnt['medium']} medium / {_cnt['low']} low)", flush=True)
+    # consensus_report.md — the ensemble's own deliverable: what the judges agreed on, and the
+    #   UNCERTAINTY LIST (the biggest groups of cells where they did not). The user's review of an
+    #   ensemble run should start at the top of that list, not at the top of the label table.
+    if _cons_leaf and col=="cellman_annotation":
+        _jn=_cons_meta.get("judges") or []
+        _fin={r["cluster_path"]:r for r in rows}
+        _st={}; _lab={}
+        for _p,_e in _cons_leaf.items():
+            if _p not in _fin: continue                      # a leaf that was later split: its children carry the call
+            _c=_e.get("consensus") or {}; _n=int(_fin[_p]["n_cells"])
+            _k=str(_c.get("status") or "")
+            _st[_k]=_st.get(_k,0)+_n
+            _L=str(_fin[_p].get("label") or "")
+            _d=_lab.setdefault(_L,{"cells":0,"leaves":0,"sup":0,"unan":0})
+            _d["cells"]+=_n; _d["leaves"]+=1; _d["sup"]+=int(_c.get("support") or 0)*_n
+            _d["unan"]+=_n if _k=="unanimous" else 0
+        _tot=sum(_st.values()) or 1
+        _ml=[f"# Consensus report — {_cons_meta.get('n_judges')} judges, {_cons_meta.get('need')} votes required",
+             "",f"Judges: {', '.join(_jn) or 'n/a'}. Rounds merged: {int(st.get('round',1))}. "
+             f"Cells with a final decision: {_tot:,}.","",
+             "Every label below is the LEAD's call on the judges' independent judgments; `support` is how many "
+             "judges' label paths carried the chosen term. Per-cell columns in the h5ad: "
+             "`cellman_consensus_support`, `cellman_consensus_status`, "
+             f"{', '.join('`cellman_'+n+'`' for n in _jn) or '(none)'}.","",
+             "## Agreement","","| status | cells | share |","|---|---:|---:|"]
+        for _k in sorted(_st,key=lambda x:-_st[x]):
+            _ml.append(f"| {_k} | {_st[_k]:,} | {100.0*_st[_k]/_tot:.1f}% |")
+        _ml+=["","## Per label","","| celltype | cells | leaves | mean support | unanimous |","|---|---:|---:|---:|---:|"]
+        for _L,_d in sorted(_lab.items(),key=lambda x:-x[1]["cells"]):
+            _ml.append(f"| {_L} | {_d['cells']:,} | {_d['leaves']} | {_d['sup']/max(_d['cells'],1):.2f} | "
+                       f"{100.0*_d['unan']/max(_d['cells'],1):.0f}% |")
+        # the uncertainty list: group by (status, the tuple of judge labels) and show the biggest
+        _grp={}
+        for _p,_e in _cons_leaf.items():
+            if _p not in _fin: continue
+            _c=_e.get("consensus") or {}
+            if str(_c.get("status") or "") in ("unanimous",""): continue
+            _key=(str(_c.get("status")),tuple(str(r.get("label") or r.get("decision") or "?")
+                                              for r in (_e.get("judges") or [])),str(_fin[_p].get("label") or ""))
+            _g=_grp.setdefault(_key,{"cells":0,"leaves":[]})
+            _g["cells"]+=int(_fin[_p]["n_cells"]); _g["leaves"].append(_p)
+        _ml+=["","## Uncertainty list — where the judges disagreed","",
+              "Largest first. `judges` is each judge's own label, in order; `->` is the lead's call.",""]
+        if not _grp: _ml.append("No disagreement: every leaf was unanimous.")
+        for _key,_g in sorted(_grp.items(),key=lambda x:-x[1]["cells"])[:40]:
+            _ml.append(f"- **{_g['cells']:,} cells** ({_key[0]}): {' / '.join(_key[1])} -> **{_key[2] or 'Unknown'}** "
+                       f"  _leaves: {', '.join(_g['leaves'][:8])}{' ...' if len(_g['leaves'])>8 else ''}_")
+        _ml+=["","---","",f"Per-round detail: `_consensus_round{{k}}.json` and each judge's "
+              "`judge{i}/_decisions_round{k}.json`, both inside `annotation_artifacts.tar.gz`. "
+              "Per-leaf reasoning: `annotation_rationale.md`."]
+        _rp2=os.path.join(a.out,"consensus_report.md"); open(_rp2,"w").write("\n".join(_ml)+"\n")
+        print(f"[finalize] wrote {_rp2} ({len(_grp)} disagreement group(s); "
+              f"{100.0*_st.get('unanimous',0)/_tot:.1f}% of cells unanimous)", flush=True)
     # every working artifact other than the h5ad and the final CSV (state, decisions, ontology, profiles,
     # global stats, ...) goes into a single archive.
     # -> annotation_out: {input}_annotated.h5ad + expert_judgment_annotation.csv (the merge input) +
@@ -4500,17 +4614,200 @@ def cmd_finalize(a):
     pats=["_global_stats.npz","_annotate_state.json","_annotate_decisions.json","_ontology_index.json","ontology_hits.json",
           "_reference_report.json",
           "_annotate_recommendation.json","_annotate_violations.json","_annotate_finalize_review.json",
+          "_consensus_round*.json",
           "cluster_gene_profiles_round*.json","cluster_overview_round*.json","expert_judgment_round*.csv"]
     tmp=[]
     for pat in pats: tmp+=glob.glob(os.path.join(a.out,pat))
+    # an ensemble run also leaves judge{i}/_decisions_round{k}.json — the audit trail of who judged
+    #   what. Archived under their own subdirectory, since the basenames collide between judges.
+    tmp+=sorted(glob.glob(os.path.join(a.out,"judge*","_decisions_round*.json")))
     if tmp:
         arc=os.path.join(a.out,"annotation_artifacts.tar.gz")
         with tarfile.open(arc,"w:gz") as tar:
-            for f in tmp: tar.add(f,arcname=os.path.basename(f))
+            for f in tmp: tar.add(f,arcname=os.path.relpath(f,a.out))
         for f in tmp:
             try: os.remove(f)
             except OSError: pass
         print(f"[finalize] archived {len(tmp)} artifacts -> {arc} (annotation_out keeps only the h5ad + the archive)", flush=True)
+        for d in sorted(glob.glob(os.path.join(a.out,"judge*"))):
+            if os.path.isdir(d) and not os.listdir(d):
+                try: os.rmdir(d)
+                except OSError: pass
+
+# ===================================================================== consensus (ensemble)
+# N judge agents judge the SAME round's profiles independently and each writes its own decisions
+#   file; this computes the MECHANICAL part of the merge and nothing else. It does not decide a
+#   label: it counts votes over the KG, classifies each leaf's disagreement and hands the lead the
+#   disputed list. The lead judges those leaves (with the profile in front of it) and sets the
+#   confidence. Keeping the arithmetic here and the judgment there is deliberate -- a lead that is
+#   handed a ranked answer tends to accept it, and a vote is not evidence.
+_KG_ANC_MEMO={}; _KG_DEPTH_MEMO={}
+
+def _kg_ancestors(terms, tid):
+    """{tid} + every ancestor reachable through P (IS_A u REFINES), transitively.
+
+    P is a LIST -- a term can have several parents (mouse/brain's 'neutrophil class' sits under both
+    'myeloid cell' and 'granulocyte'), so following the first parent only would silently shorten the
+    path and let a vote miss a shared ancestor. Cycle-guarded: a malformed wing must not hang the run."""
+    key=(id(terms),tid)
+    if key in _KG_ANC_MEMO: return _KG_ANC_MEMO[key]
+    seen=set(); stack=[tid]
+    while stack:
+        t=stack.pop()
+        if t in seen or t not in terms: continue
+        seen.add(t)
+        for p in (terms[t].get("P") or []):
+            if p in terms and p not in seen: stack.append(p)
+    _KG_ANC_MEMO[key]=seen
+    return seen
+
+def _kg_depth(terms, tid):
+    """LONGEST root->tid path length (a root is 1). Longest, not shortest: with several parents the
+    shortest path would make a deep term look shallow and lose a depth comparison it should win."""
+    key=(id(terms),tid)
+    if key in _KG_DEPTH_MEMO: return _KG_DEPTH_MEMO[key]
+    _KG_DEPTH_MEMO[key]=1                                    # cycle guard: reserve before recursing
+    if tid not in terms: return 0
+    ps=[p for p in (terms[tid].get("P") or []) if p in terms]
+    d=1 if not ps else 1+max(_kg_depth(terms,p) for p in ps)
+    _KG_DEPTH_MEMO[key]=d
+    return d
+
+_CONS_BG="__Background__"; _CONS_UNK="__Unknown__"; _CONS_DESC="__descend__"
+
+def _consensus_leaf(terms, votes, need):
+    """One leaf: N judges' (kind, term_id) -> (pick, status, support).
+
+    kind is 'celltype' (term_id voted through its ancestor closure), 'Background'/'Unknown' (no KG
+    path -- they vote only for themselves) or 'descend'. Rule: the DEEPEST term carried by >= need
+    judges' paths wins; ties by term_id so the result never depends on dict order. A real identity
+    outranks Background/Unknown, which are only reached when no term clears the bar."""
+    n=len(votes)
+    desc=sum(1 for k,_ in votes if k==_CONS_DESC)
+    if desc>=need: return _CONS_DESC,"descend_consensus",desc
+    cnt={}
+    for kind,tid in votes:
+        if kind=="celltype" and tid in terms:
+            for t in _kg_ancestors(terms,tid): cnt[t]=cnt.get(t,0)+1
+        elif kind in (_CONS_BG,_CONS_UNK): cnt[kind]=cnt.get(kind,0)+1
+    sup=[t for t,c in cnt.items() if c>=need and t in terms]
+    if not sup:
+        for tok in (_CONS_BG,_CONS_UNK):
+            if cnt.get(tok,0)>=need: return tok,("unanimous" if cnt[tok]==n else "majority"),cnt[tok]
+        return _CONS_UNK,"no_majority",0
+    pick=max(sup,key=lambda t:(_kg_depth(terms,t),t))
+    # how the judges got there -- the status is what tells the lead whether to look
+    own=[tid for k,tid in votes if k=="celltype"]
+    same=sum(1 for t in own if t==pick)
+    if same==n: status="unanimous"
+    # a descend vote is reported BEFORE any term majority. "One judge wanted to split this leaf" is
+    #   actionable on its own -- a judge that saw a mixture usually saw something -- and if the status
+    #   were 'majority' the lead would take the label and never learn that anyone disagreed about
+    #   whether this is one cell type at all. The mechanical pick stays the term that got the votes;
+    #   the status is what sends the lead to look.
+    elif desc>0: status="descend_disagreement"
+    elif same>=need: status="majority"
+    else:
+        # depth fork vs contradiction. A FORK is pairwise COMPARABLE: every pair of terms the judges
+        #   named is an ancestor/descendant pair, so they disagreed only about how deep to go, and the
+        #   deepest term with the votes is simply the majority depth. ONE incomparable pair (CA1 vs
+        #   CA3) makes it a CONTRADICTION, and the pick is then their common ancestor -- a weaker
+        #   result that the lead should look at, which is why the two carry different confidences.
+        ts=[t for t in own if t in terms]
+        chain=all(a in _kg_ancestors(terms,b) or b in _kg_ancestors(terms,a)
+                  for i,a in enumerate(ts) for b in ts[i+1:])
+        status="depth_fork" if chain else "ancestor_resolved"
+    return pick,status,cnt[pick]
+
+def cmd_consensus_round(a):
+    """Merge N judge decision files for ONE round -> {out}/_consensus_round{k}.json (+ a summary).
+
+    Read-only on every judge directory. Writes nothing the engine reads, so it cannot corrupt state."""
+    out=a.out
+    idx=_load_ontology_index(out) or {}
+    terms=idx.get("terms",{}) or {}
+    if not terms: sys.exit(f"[consensus-round] no ontology index in {out} — run init first")
+    if idx.get("reference"):
+        sys.exit("[consensus-round][ERROR:REFERENCE_RUN] this run is reference-mode: its labels are the "
+                 "answer-key's vocabulary, not the KG's, so a KG-path consensus would read them as unknown "
+                 "terms and collapse everything to Unknown. Ensembling reference-mode is not supported.")
+    st=_load_state(out)
+    ncnt={}
+    for p in (st.get("cluster_paths") or []): ncnt[p]=ncnt.get(p,0)+1
+    files=[f.strip() for f in str(a.decisions).split(",") if f.strip()]
+    if len(files)<2: sys.exit("[consensus-round] --decisions needs >= 2 judge files (comma-separated)")
+    names=[n.strip() for n in str(a.names).split(",") if n.strip()] if a.names else []
+    if names and len(names)!=len(files): sys.exit("[consensus-round] --names must have one name per --decisions file")
+    if not names: names=[f"judge{i+1}" for i in range(len(files))]
+    dec=[]
+    for f in files:
+        if not os.path.exists(f): sys.exit(f"[consensus-round] missing judge decisions: {f}")
+        dec.append(json.load(open(f)))
+    n=len(dec); need=a.need if a.need else n//2+1
+    # the leaves to merge: the round's OPEN leaves if the state names them, else whatever the judges judged
+    leaves=[p for p in (st.get("leaves") or []) if any(p in d for d in dec)]
+    extra=sorted({p for d in dec for p in d} - set(leaves))
+    leaves=list(leaves)+extra
+    by_label={}
+    for tid,v in terms.items(): by_label.setdefault(str(v.get("L","")),[]).append(tid)
+    res={}; summary={}; bad=[]
+    for p in leaves:
+        votes=[]; rows=[]
+        for nm,d in zip(names,dec):
+            e=d.get(p)
+            if e is None:
+                votes.append((_CONS_UNK,"")); rows.append({"judge":nm,"decision":"<missing>","label":"","term_id":"","confidence":""})
+                continue
+            dk=str(e.get("decision","")).strip(); lb=str(e.get("label","")).strip()
+            tid=str(e.get("term_id","")).strip()
+            if dk=="celltype":
+                if tid not in terms:
+                    # a label without a usable term_id: recover it from the index when the name is
+                    #   unambiguous, otherwise refuse to guess and report the leaf.
+                    cand=by_label.get(lb) or []
+                    if len(cand)==1: tid=cand[0]
+                    else:
+                        bad.append({"leaf":p,"judge":nm,"label":lb,"term_id":str(e.get("term_id","")),
+                                    "why":"term_id not in the index and the label is "+("ambiguous" if cand else "unknown")})
+                        votes.append((_CONS_UNK,"")); rows.append({"judge":nm,"decision":dk,"label":lb,"term_id":tid,"confidence":str(e.get("confidence",""))})
+                        continue
+                votes.append(("celltype",tid))
+            elif dk=="Background": votes.append((_CONS_BG,""))
+            elif dk=="needs_subclustering": votes.append((_CONS_DESC,""))
+            else: votes.append((_CONS_UNK,""))
+            rows.append({"judge":nm,"decision":dk,"label":lb,"term_id":tid,"confidence":str(e.get("confidence",""))})
+        pick,status,support=_consensus_leaf(terms,votes,need)
+        lab=({_CONS_BG:"Background",_CONS_UNK:"Unknown",_CONS_DESC:""}.get(pick)
+             if pick in (_CONS_BG,_CONS_UNK,_CONS_DESC) else str(terms[pick].get("L",pick)))
+        vc={}
+        for k,t in votes:
+            if k=="celltype" and t in terms:
+                for x in _kg_ancestors(terms,t): vc[x]=vc.get(x,0)+1
+        res[p]={"n_cells":ncnt.get(p,0),"judges":rows,
+                "consensus":{"term_id":("" if pick.startswith("__") else pick),"label":lab,
+                             "decision":("needs_subclustering" if pick==_CONS_DESC else
+                                         "Background" if pick==_CONS_BG else
+                                         "Unknown" if pick==_CONS_UNK else "celltype"),
+                             "support":support,"n_judges":n,"status":status},
+                "term_votes":{t:c for t,c in sorted(vc.items(),key=lambda x:-x[1]) if c>=2},
+                "disputed":status not in ("unanimous","descend_consensus")}
+        summary[status]=summary.get(status,0)+1
+    disputed=sorted([p for p in res if res[p]["disputed"]],key=lambda p:-res[p]["n_cells"])
+    rp=os.path.join(out,f"_consensus_round{a.round}.json")
+    json.dump({"round":a.round,"n_judges":n,"need":need,"judges":names,"decision_files":files,
+               "n_leaves":len(res),"summary":summary,"term_id_problems":bad,
+               "disputed":disputed,"leaves":res},open(rp,"w"),indent=1)
+    tot=sum(v["n_cells"] for v in res.values()) or 1
+    dc=sum(res[p]["n_cells"] for p in disputed)
+    print(f"[consensus-round] round {a.round}: {len(res)} leaves, {n} judges, need {need} -> {rp}", flush=True)
+    for k in sorted(summary,key=lambda x:-summary[x]):
+        nc=sum(v["n_cells"] for v in res.values() if v["consensus"]["status"]==k)
+        print(f"  {k:<22} {summary[k]:>4} leaves  {nc:>8,} cells ({100.0*nc/tot:.1f}%)", flush=True)
+    print(f"  DISPUTED               {len(disputed):>4} leaves  {dc:>8,} cells ({100.0*dc/tot:.1f}%) "
+          f"-> judge these yourself, largest first", flush=True)
+    if bad:
+        print(f"  [warn] {len(bad)} judge decision(s) had an unusable term_id — counted as Unknown; see "
+              f"'term_id_problems' in the JSON", flush=True)
 
 # ===================================================================== main
 def _helper_cli():
@@ -4627,6 +4924,17 @@ def _helper_cli():
     prt.add_argument("--server-url",dest="server_url",default=None)
     prt.set_defaults(f=cmd_resolve_module)
     pc=sp.add_parser("check"); pc.add_argument("--out",required=True); pc.add_argument("--decisions",required=True); pc.set_defaults(f=cmd_check)
+    pcr=sp.add_parser("consensus-round",
+        help="merge N judge decision files for ONE round: vote over the KG, classify each leaf's "
+             "disagreement, list the disputed leaves. Computes the arithmetic only — the LEAD judges "
+             "the disputed leaves and sets the confidence.")
+    pcr.add_argument("--out",required=True)
+    pcr.add_argument("--decisions",required=True,
+                     help="comma-separated judge decision files (>=2), e.g. {out}/judge1/_decisions_round3.json,...")
+    pcr.add_argument("--round",required=True,help="the round number these decisions belong to")
+    pcr.add_argument("--names",default=None,help="comma-separated judge names (default judge1..judgeN)")
+    pcr.add_argument("--need",type=int,default=None,help="votes required (default floor(N/2)+1)")
+    pcr.set_defaults(f=cmd_consensus_round)
     pf=sp.add_parser("finalize"); pf.add_argument("--out",required=True); pf.add_argument("--decisions",required=True)
     pf.add_argument("--output",default=None); pf.add_argument("--force",action="store_true")
     pf.add_argument("--accept-large",dest="accept_large",action="store_true")
@@ -4856,7 +5164,9 @@ def main():
               "                AND NOWHERE ELSE, and only a {label: term_id} mapping leaves this step.\n"
               "  init | check | finalize = the inlined annotate engine (reads the user-specified cluster column)\n"
               "  descend    = marker-axis descent into a KG node's children (region->subtype, unconditional)\n"
-              "  subcluster = marker-axis split by EXPLICIT named candidates (PCA fallback when 0/1 candidate)")
+              "  subcluster = marker-axis split by EXPLICIT named candidates (PCA fallback when 0/1 candidate)\n"
+              "  consensus-round = (ensemble) merge N judge decision files for one round: KG vote per leaf,\n"
+              "                   disagreement classes and the disputed list. The LEAD judges those leaves.")
         return
     cmd, rest = argv[0], argv[1:]
     # scoring-based annotation (score-profile/apply/finalize) is not in this release — its fixed-quota
@@ -4883,7 +5193,7 @@ def main():
         a = ap.parse_args(rest)
         (cmd_descend if cmd == "descend" else cmd_subcluster)(a)
     elif cmd in ("init", "check", "finalize", "ref-resolve", "suggest-modules", "expand-modules",
-                 "modules", "resolve-module"):
+                 "modules", "resolve-module", "consensus-round"):
         _helper_cli()   # inlined helper engine's argparse dispatch, in-process (reads sys.argv)
     else:
         print(f"[helper] unknown command '{cmd}' — use modules|resolve-module|init|subcluster|descend|check|finalize")

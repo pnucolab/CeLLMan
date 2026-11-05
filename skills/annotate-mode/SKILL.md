@@ -262,9 +262,11 @@ multiplying:
 
 | actor | responsibility |
 |---|---|
-| **expert agent = you** | Run `helper.py`, read profiles, judge each leaf by R1–R8 (§5), drive the split yourself, write the decisions JSON + per-round CSV. **Never ask the user.** Standard annotation is autonomous. **You own your `--out` directory exclusively.** |
-| **caller (= the manager/main session)** | Spawns **one expert agent per dataset** and then **WAITS** for that agent's final result — nothing else. The caller runs **exactly two** `helper.py` commands, both read-only and both BEFORE any agent exists: `modules` and `resolve-module` (§3 MODULE RESOLUTION — they take no `--out`, touch no h5ad and write nothing). Beyond those it **does NOT** run `helper.py`, read the agent's `--out` directory, inspect profiles, judge clusters, decide descents, or make any annotation call of its own. Doing so duplicates the agent's work and, if it writes, **corrupts `_annotate_state.json`** (two loops on one directory). Each `--out` is owned by exactly one expert agent. The caller's only jobs: **settle the KG module of every dataset first** (§3 MODULE RESOLUTION — one confirmation round covering the whole batch, before a single agent is spawned), **translate the invoked skill into a mode and pass it on** — the user declares the mode by choosing `/annotate-mode` or `/annotate-reference-mode`, not by a prompt field, and the caller carries that choice to the agent as `mode : reference` in the **spawn prompt** (the agent is a separate process and does not inherit the skill the caller loaded), spawn + wait, then relay the finished result to the user and run the post-finalize interactive phase (§8). For a single dataset it may run the expert inline instead of spawning — but still **one owner only**, never a second parallel brain on the same directory. **Everything it says to the user is in English, regardless of the language the user wrote in** (see the rule at the top). |
-| **`helper.py`** | The **single, self-contained backend** — all compute (profiling, the identity engine, gates), the marker-axis split, and the final h5ad write, in one script. **Validates** your decisions (`check`/`finalize`) and returns violations — it **never silently changes a decision**. Every command (`modules`/`resolve-module`/`init`/`subcluster`/`descend`/`check`/`finalize`) runs in this one file; it does not call any other helper. `modules`/`resolve-module` are the read-only pre-`init` pair the CALLER runs (§3); everything else belongs to the one agent that owns `--out`. |
+| **expert agent** | Run `helper.py`, read profiles, judge each leaf by R1–R8 (§5), drive the split yourself, write the decisions JSON + per-round CSV. **Never ask the user.** Standard annotation is autonomous. **You own your `--out` directory exclusively.** — This is the whole run when `replicates: 1`. In the **default ensemble** (`replicates: 3`) the same method is split between a lead and three judges below. |
+| **lead = `annotate-lead`** (default) | Owns `--out` and is the ONLY actor that runs the engine (`init`/`descend`/`check`/`finalize`) and writes `_annotate_state.json` / `_annotate_decisions.json` / the outputs. Spawns the judges, runs `consensus-round`, **adjudicates every disputed leaf against the profile** and **sets each leaf's `confidence`** (§8b). Writes `celltype_markers.yaml` for the consensus label set, and runs the interactive phase alone. |
+| **judge ×N = `annotate-expert` with `mode : judge`** | One **independent** replicate judgment. Reads the round's profile + the index from the lead's `--out` **read-only**, judges its leaves by R1–R8, writes **only** `{out}/judge{i}/_decisions_round{k}.json`. **Runs no `helper.py` command**, writes no deliverable, never reads a sibling judge. Independence is what the ensemble averages — a judge that peeks destroys the only thing it contributes. |
+| **caller (= the manager/main session)** | Spawns **one `annotate-lead` per dataset** (the lead spawns its own judges — the caller never does) and then **WAITS** for that lead's final result — nothing else. The caller runs **exactly two** `helper.py` commands, both read-only and both BEFORE any agent exists: `modules` and `resolve-module` (§3 MODULE RESOLUTION — they take no `--out`, touch no h5ad and write nothing). Beyond those it **does NOT** run `helper.py`, read the agent's `--out` directory, inspect profiles, judge clusters, decide descents, or make any annotation call of its own. Doing so duplicates the agent's work and, if it writes, **corrupts `_annotate_state.json`** (two loops on one directory). Each `--out` is owned by exactly one lead (or, at `replicates: 1`, one expert agent) — the judges that read it write only their own subdirectory. The caller's only jobs: **settle the KG module of every dataset first** (§3 MODULE RESOLUTION — one confirmation round covering the whole batch, before a single agent is spawned), **translate the invoked skill into a mode and pass it on** — the user declares the mode by choosing `/annotate-mode` or `/annotate-reference-mode`, not by a prompt field, and the caller carries that choice to the agent as `mode : reference` in the **spawn prompt** (the agent is a separate process and does not inherit the skill the caller loaded), spawn + wait, then relay the finished result to the user and run the post-finalize interactive phase (§8). For a single dataset at `replicates: 1` it may run the expert inline instead of spawning — but still **one owner only**, never a second parallel brain on the same directory. It does **not** orchestrate the ensemble's rounds: spawning judges, merging their judgments and setting confidence all belong to the lead, which has the profiles in front of it. **Everything it says to the user is in English, regardless of the language the user wrote in** (see the rule at the top). |
+| **`helper.py`** | The **single, self-contained backend** — all compute (profiling, the identity engine, gates), the marker-axis split, and the final h5ad write, in one script. **Validates** your decisions (`check`/`finalize`) and returns violations — it **never silently changes a decision**. Every command (`modules`/`resolve-module`/`init`/`subcluster`/`descend`/`consensus-round`/`check`/`finalize`) runs in this one file; it does not call any other helper. **`consensus-round` computes the ensemble's arithmetic only** — votes over the KG, a disagreement class per leaf, the disputed list — and deliberately stops short of choosing a label, because a lead handed a ranked answer accepts it. `modules`/`resolve-module` are the read-only pre-`init` pair the CALLER runs (§3); everything else belongs to the one agent that owns `--out`. |
 
 ---
 
@@ -808,6 +810,11 @@ gated signals (`verdict`/`excl_on`/`neg_strong`/anchor `path`), so it never flag
 profiles and chain rounds until every leaf is celltype / Background / Unknown, then finalize. The caller only
 relays your helper calls. The user is engaged **only after finalize**.
 
+> **BY DEFAULT THIS RUNS AS A 3-JUDGE ENSEMBLE (§8b).** The steps below are the method either way — what
+> changes is **who judges**: at `replicates: 1` one expert agent judges and runs the engine; by default a
+> **lead** runs the engine and **three judges judge each round independently**, and the lead adjudicates
+> their three judgments per leaf. Read §8b before step 2 if you are the lead or a judge.
+
 > **THE ITERATION IS THE JOB — round 1 is NEVER the end.** `init` gives you round-1 profiles of the *input*
 > Leiden clusters; those are almost always COARSE (a whole cortex in one cluster, all glia in another). Judging
 > round 1 and finalizing is the failure mode this skill exists to prevent — it buries every subtype (L5/L6
@@ -882,9 +889,115 @@ relays your helper calls. The user is engaged **only after finalize**.
 5. `helper.py check` → fix any flagged leaves → `finalize` → writes `obs['cellman_annotation']`. **This
    ends standard annotation.** Report the outcome to the caller, naming every module that was served.
 
+## 8b. Reproducible mode — the 3-judge ensemble (the DEFAULT)
+
+**The problem it solves.** The engine is deterministic: seeded Leiden, fixed statistics. **Every bit of
+run-to-run variance comes from the agent's biological judgment** — and that judgment is also where the
+accuracy comes from. Three alternatives were measured on a mouse-brain patch (11,718 bins, 48 input
+clusters): replacing the judgment with fixed scoring rules made runs agree with each other far more
+(exact-term agreement 74% → 86%) while **halving** their agreement with independent annotations (76% →
+45%) — the runs converged on wrong answers. **Averaging independent judgments does not pay that price:**
+three-run consensus raised exact-term reproducibility 73.7% → 81.7%, no-contradiction 88.1% → 94.2%,
+9-class 89.7% → 94.1%, with every quality proxy unchanged. So the judgment stays free — three times —
+and a lead adjudicates. Do **not** "fix" reproducibility by writing more rules into this file; that road
+was measured and it loses.
+
+> **What was measured, and what this is.** Those numbers come from runs that stayed independent to the
+> end and were merged **once, per cell**. What runs here is **lockstep**: the judges share one state and
+> are merged **every round, per leaf**. That is a different estimator — it should be at least as good
+> (one engine run, no diverging leaf trees, and a wrong turn is caught at the next round instead of
+> poisoning the rest of a run), but it has **not** been measured against ground truth, and neither has
+> the fully independent form: every quality figure above is agreement with other LLM annotations, not
+> accuracy. Treat the reproducibility gain as established and the accuracy as unmeasured.
+
+### The round loop
+
+```
+k = 1:  lead:   helper.py init ...                  ->  cluster_gene_profiles_round1.json
+k > 1:  lead:   helper.py descend --node <node> ...  ->  cluster_gene_profiles_round{k}.json
+        judges: (spawn at k=1, MESSAGE at k>1 — never re-spawn) each judges the SAME profile
+                ->  {out}/judge{i}/_decisions_round{k}.json
+        lead:   helper.py consensus-round --out {out} --round {k} --decisions <judge files>
+                ->  {out}/_consensus_round{k}.json
+        lead:   ADJUDICATE every disputed leaf -> {out}/_annotate_decisions.json  (the canonical file)
+                descend what the consensus says to descend  ->  k+1
+```
+
+`init` is deterministic, so **every judge sees byte-identical profiles**. Round-1 disagreement is pure
+judgment variance — report it.
+
+**One `--out`, one state, one engine run.** This is why the ensemble costs ~3× the judging tokens but
+**1× the engine compute**, and why none of the usual merge preconditions (same cells, same ontology
+index, same leaf tree) can be violated: there is only ever one of each. It also means **a wrong turn
+cannot compound** — a bad descend is caught at the next round's consensus instead of poisoning one run's
+remaining ten rounds.
+
+### What `consensus-round` gives the lead
+
+Per leaf: every judge's decision, the vote count of each term carried by ≥2 judges' **ancestor paths**
+(`P` transitively — multi-parent terms included), the mechanical pick (**the deepest term carried by
+≥`need` = ⌊N/2⌋+1 judges**, ties by `term_id`), a **status**, and a **`disputed`** flag. It does **not**
+choose a label.
+
+| status | meaning | the lead's call |
+|---|---|---|
+| `unanimous` | all N named the same term | take it |
+| `descend_consensus` | ≥`need` said `needs_subclustering` | descend it |
+| `majority` | ≥`need` named exactly the same term | take it **unless R3 fails on the profile** — two judges agreeing on a term whose OWN markers are not ENRICHED is still a force-fit |
+| `depth_fork` | every pair of named terms is ancestor/descendant: they differed only on DEPTH | the deepest with the votes **if it passes R3**, else the shallower one |
+| `ancestor_resolved` | an incomparable pair (CA1 vs CA3) — a real contradiction; the pick is their common ancestor | usually right and honest, but if ONE judge's term passes R3 cleanly and the others' do not, that term is the answer and the ancestor is a needless floor |
+| `descend_disagreement` | some judge wanted to split, others gave a terminal call | **prefer the descend** — a judge that saw a mixture usually saw something, and descending a pure leaf costs one round (R6) |
+| `no_majority` | no term reached `need` | **descend first.** Three judges naming three unrelated lineages is the signature of a mixture, not of an unknowable cell. Unknown only after the descent fails |
+
+**The lead opens the profile of every `disputed` leaf, largest first, and judges it.** The mechanical
+pick is a starting point; the lead has what a vote does not — the evidence. On a measured run ~66% of
+cells were unanimous and **the disputed set was 8.7% of cells**, so this is affordable and it is where
+all the value is.
+
+> **The failure mode: a lead that becomes a vote counter.** Copying the mechanical pick for every leaf
+> turns a three-judgment ensemble into judge1 with extra steps. `consensus-round` stops short of a label
+> on purpose.
+
+### Confidence — the lead sets it, every leaf
+
+`unanimous` + R3 passes → `high` · `majority` → `medium` · `depth_fork` resolved → `medium` ·
+`ancestor_resolved` → `low` · lead overrode the pick → `medium` (`low` if the evidence was thin) ·
+Unknown / Background → `low`.
+
+**Lower it when the evidence is thin even if the judges agreed** — they read the same profile, so a
+shared misreading is unanimous too. The rubric is a floor on the lead's attention, not a substitute for
+it. The per-leaf value flows into `celltype_confidence.csv` through the existing roll-up (§10.4), so
+nothing else changes.
+
+### Module expansion, finalize, outputs
+
+**Module expansion (step 4 above) is the lead's**, unchanged — except that the Unknown leaves it
+proposes on are the **consensus** Unknowns, which is better evidence than any single run's. Approved →
+`expand-modules` → the judges re-judge **only** the Unknown leaves (one more turn of the same loop) →
+`consensus-round` → finalize.
+
+**One final result, one of each output.** The judges write **no deliverables at all** — no h5ad, no
+marker tree, no confidence table, no rationale. `finalize` (run once, by the lead) adds
+`cellman_consensus_support`, `cellman_consensus_status` and `cellman_judge{i}` to the h5ad and writes
+`consensus_report.md` (the agreement table plus the **uncertainty list** — the biggest groups of cells
+where the judges disagreed, which is where the user's review should start). Each judge's decisions and
+each round's `_consensus_round{k}.json` are archived inside `annotation_artifacts.tar.gz` as the audit
+trail.
+
+**`replicates: 1`** turns all of this off: one expert agent, no judges, no `consensus-round`, no
+consensus columns and no report — byte-for-byte the previous behaviour. **2 is not allowed** (no
+majority exists); an even number rounds up to the next odd one.
+
+**Reference-mode is NOT ensembled.** Its labels are the answer-key's vocabulary, not the KG's, so a
+KG-path consensus reads them as unknown terms and collapses the run to Unknown. `consensus-round`
+refuses such a run (`ERROR:REFERENCE_RUN`); run a single `annotate-expert` in reference-mode instead.
+
 ### Interactive phase (after finalize — the only user touchpoint)
 The caller presents the finalized outcome (table + explanation) and offers **① done** or **②
-user-directed exploration**. This is free-form — the user asks in their own words, in **any** language, and
+user-directed exploration**. **In an ensemble run this phase is the LEAD's, alone** — the judges are
+done at finalize, the cluster column is the consensus `cellman_annotation`, and the caller presents
+**the uncertainty list from `consensus_report.md` alongside the label table**, so the user's review
+starts where the judges disagreed rather than at the biggest cluster. This is free-form — the user asks in their own words, in **any** language, and
 **every reply is still English** (top rule): read their language, answer in English. You translate the request
 into targeted work and answer **honestly** (BIAS GUARD: the data decides, never manufacture a positive
 to satisfy the user; never editorialize the *sample* as normal/diseased from the absence of a state label —
@@ -970,6 +1083,11 @@ vascular/immune anchor but you labeled parenchymal — re-weigh, glia may be KDE
   "open_question_flag": false
 }}
 ```
+**In an ensemble run (§8b) every judge writes this same schema** to
+`{out}/judge{i}/_decisions_round{k}.json` — its own leaves only, nothing else, nowhere else. The
+**canonical** `_annotate_decisions.json` is written by the LEAD, from its adjudication of those files;
+`confidence` there is the lead's (§8b), not a copy of any judge's.
+
 **Label hygiene (hard):** clean literature name only — no `(n=…)`, `"?"`, `"possible"`, reason text, or `+`.
 Unknown→"Unknown", Background→"Background". Reasoning goes in `rationale`. (**Never emit a `tier='process'`
 term — neuropil / fiber tract / … — as a celltype decision; this version does not annotate processes, §1b.**)
@@ -1032,9 +1150,23 @@ of the 27 mouse-kidney entries and stop discriminating anything. The tree says i
 ### 10.4 Final layout after `finalize`
 Helper writes `{input}_annotated.h5ad` (input copy + `obs['cellman_annotation']`), packs every other artifact
 into `annotation_artifacts.tar.gz`, and leaves `annotation_out/` with exactly: the annotated h5ad,
-`expert_judgment_annotation.csv` (loose), `celltype_markers.yaml` (loose, §10.3), and the tarball. `finalize` also writes `annotation_rationale.md`
+`expert_judgment_annotation.csv` (loose), `celltype_markers.yaml` (loose, §10.3), and the tarball.
+
+**Ensemble runs add, to the SAME single result** (§8b): `consensus_report.md` (loose) and the obs columns
+`cellman_consensus_support` (k/N), `cellman_consensus_status` and `cellman_judge{i}` (each judge's own
+label, for audit). Each judge's `judge{i}/_decisions_round{k}.json` and each `_consensus_round{k}.json`
+go **into the tarball** and their directories are removed. There is **no per-judge h5ad, marker tree,
+confidence table or rationale** — the judges produce no deliverables, only judgments. `finalize` also writes `annotation_rationale.md`
 (English, one paragraph per leaf: the rule path that fired, the markers ON, competing terms rejected, and the
 chosen term's grounding PMIDs from `GM`).
+
+**Per-celltype confidence (`celltype_confidence.csv`, automatic at `finalize`).** Leaves that share a final label
+merge into one celltype, so the per-leaf `confidence` is rolled up to **one confidence per celltype**: pool the
+leaves' `n_cells` by `high`/`medium`/`low` into a cell-weighted composition and take the **largest share**; a tie
+resolves to the **lower** confidence. Only `decision=="celltype"` leaves with a valid confidence count (Unknown /
+Background get no row). Columns: `celltype, confidence, n_cells, n_leaves, frac_high, frac_medium, frac_low`
+(`celltype_confidence_free.csv` for the free column). Do not write it yourself, and do not re-grade per-leaf
+confidence to move the roll-up — the roll-up only reads the leaf values you already set (§5 Step 2 criteria).
 
 ---
 

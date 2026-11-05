@@ -1,15 +1,25 @@
 # Caller Prompt Guide
 
 Give your LLM (the **caller**) a command like the ones below. The caller spawns **one
-`annotate-expert` agent per dataset, in parallel**, each with its **own `out` directory**, and each
+`annotate-lead` agent per dataset, in parallel**, each with its **own `out` directory**, and each
 runs `init → judge → finalize` autonomously to write `obs['cellman_annotation']`.
+
+**By default each dataset is annotated three times and merged.** The lead spawns **three
+`annotate-expert` judges**, hands all three the same round's profiles, and adjudicates their three
+independent judgments per cell type — the deepest Cell-Ontology term that a majority of them support —
+setting each label's confidence from how much they agreed. This is why annotation is reproducible
+without making it rigid: the expert judgment stays free, and disagreement becomes a measurement instead
+of a coin flip. You get **one** result either way — one annotated h5ad, one marker tree, one confidence
+table — plus `consensus_report.md`, which lists exactly where the three disagreed. It costs about 3× the
+tokens of a single run and roughly the same wall-clock (the judges run in parallel, and the heavy
+compute runs once). Set `replicates : 1` to turn it off.
 
 - **`tissue`** is `species, organ`. It may be free text — it is resolved to a KG module before
   annotation starts (see [Which module gets used](#which-module-gets-used)).
 
-> The caller's ONLY job is
-> to **spawn one agent per dataset and wait** for each agent's final result. The caller must **not**
-> annotate anything itself.
+> The caller's ONLY job is to **spawn one lead per dataset and wait** for each lead's final result. The
+> caller must **not** annotate anything itself, and must **not** spawn or manage the judges — the lead
+> does that, because it is the one holding the profiles.
 
 ---
 
@@ -20,7 +30,7 @@ Invoke the skill with `/annotate-mode`:
 > For a **single** dataset:
 
 ```
-/annotate-mode Annotate the h5ad file below using the annotate-expert agent.
+/annotate-mode Annotate the h5ad file below using the annotate-lead agent.
 
 - input  : /path/mouse_brain.h5ad
 - tissue : mouse, brain
@@ -31,7 +41,7 @@ Invoke the skill with `/annotate-mode`:
 
 > For **multiple** datasets:
 ```
-/annotate-mode Annotate the h5ad files below using the annotate-expert agent.
+/annotate-mode Annotate the h5ad files below using the annotate-lead agent.
 Run each dataset as an INDEPENDENT agent IN PARALLEL — one agent per dataset, each with its
 OWN --out directory.
 Do NOT annotate, read any out directory, or run helper.py yourself — only spawn the agents and
@@ -53,11 +63,11 @@ Common:
 
 ## Codex
 
-Invoke the skill with `$annotate-mode`; the expert agent is `annotate_expert`:
+Invoke the skill with `$annotate-mode`; the lead agent is `annotate_lead` and its judges are `annotate_expert`:
 
 > For a **single** dataset:
 ```
-$annotate-mode Annotate the h5ad file below using the annotate_expert agent.
+$annotate-mode Annotate the h5ad file below using the annotate_lead agent.
 
 - input  : /path/mouse_brain.h5ad
 - tissue : mouse, brain
@@ -68,7 +78,7 @@ $annotate-mode Annotate the h5ad file below using the annotate_expert agent.
 
 > For **multiple** datasets:
 ```
-$annotate-mode Annotate the h5ad files below using the annotate_expert agent.
+$annotate-mode Annotate the h5ad files below using the annotate_lead agent.
 Run each dataset as an INDEPENDENT agent IN PARALLEL — one agent per dataset, each with its
 OWN --out directory.
 Do NOT annotate, read any out directory, or run helper.py yourself — only spawn the agents and
@@ -96,6 +106,10 @@ When you have an expected set of cell types — a label list, or an already-anno
 `/annotate-reference-mode`. Identity is judged exactly as before (the same R1–R8 test against the full
 Cell-Ontology graph); the answer-key only restricts which terms may become a **label**, and anything it
 cannot explain becomes `Unknown`.
+
+Reference runs are **not** ensembled — their labels are your answer-key's words, not the
+Cell-Ontology's, so a consensus over the ontology hierarchy cannot read them. A reference run is one
+`annotate-expert`, as before.
 
 ```
 /annotate-reference-mode Annotate the h5ad below using the annotate-expert agent.
@@ -174,6 +188,7 @@ substituted silently.
 
 | field | meaning |
 |---|---|
+| `replicates` | how many independent judges annotate the dataset before they are merged. **Default 3.** `1` = a single run, no consensus, no `consensus_report.md` (the previous behaviour). An even number is rounded up, because a majority has to exist. Raising it above 3 costs proportionally more tokens for a small further gain. |
 | `disease` | disease context (e.g. `glioblastoma`).|
 | `output` | save path. Default {out}/{input}_annotated.h5ad |
 | `use-rep` | embedding the neighbour graph is rebuilt on when a cluster is subdivided: an `obsm` key (e.g. `X_scVI`).|

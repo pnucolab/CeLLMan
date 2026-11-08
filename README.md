@@ -122,12 +122,6 @@ server:
 
 Full documentation is in preparation and will be published on Read the Docs.
 
-Until then, `notebooks/` holds a worked example:
-
-| notebook | modality |
-|---|---|
-| [`notebooks/TS_lung.ipynb`](notebooks/TS_lung.ipynb) | scRNA-seq |
-
 For spatial transcriptomics — array-based and imaging-based worked examples, where CeLLMan annotates
 a segmentation-free vector field — see [SSAF-T](https://github.com/pnucolab/SSAF-T).
 
